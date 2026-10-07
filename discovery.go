@@ -85,12 +85,15 @@ type discovery struct {
 
 func defaultBlocklist() map[common.Address]struct{} {
 	return map[common.Address]struct{}{
-		MorphoBlueAddress: {},
-		AaveV3PoolAddress: {},
-		// Add known Base routers here as config is confirmed:
-		//  - Uniswap Universal Router
-		//  - Aerodrome Router
+		MorphoBlueAddress:          {},
+		AaveV3PoolAddress:          {},
+		AerodromePoolFactory:       {},
+		AerodromeRouter:            {},
+		AerodromeSlipstreamFactory: {},
+		// Add more routers as discovered:
+		//  - Uniswap Universal Router (Base)
 		//  - BaseSwap Router
+		//  - SushiSwap Router (Base)
 	}
 }
 
