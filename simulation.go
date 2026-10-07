@@ -31,11 +31,27 @@ const (
 
 // Uniswap V2 / V2-fork packed reserves.
 // Layout: [reserve0:112][reserve1:112][blockTimestampLast:32] at slot 8.
-var slotUniswapV2Reserves = common.BigToHash(big.NewInt(SlotUniswapV2Reserves))
-var slotUniswapV3Slot0 = common.BigToHash(big.NewInt(SlotUniswapV3Slot0))
-var slotAerodromeV2Reserve0 = common.BigToHash(big.NewInt(SlotAerodromeV2Reserve0))
-var slotAerodromeV2Reserve1 = common.BigToHash(big.NewInt(SlotAerodromeV2Reserve1))
-var slotAerodromeSlipstreamSlot0 = common.BigToHash(big.NewInt(SlotAerodromeSlipstreamSlot0))
+// ---------- Storage slots (sourced from config.go) ----------
+
+var slotUniswapV2Reserves = common.BigToHash(
+	big.NewInt(int64(SlotUniswapV2Reserves)),
+)
+
+var slotUniswapV3Slot0 = common.BigToHash(
+	big.NewInt(int64(SlotUniswapV3Slot0)),
+)
+
+var slotAerodromeV2Reserve0 = common.BigToHash(
+	big.NewInt(int64(SlotAerodromeV2Reserve0)),
+)
+
+var slotAerodromeV2Reserve1 = common.BigToHash(
+	big.NewInt(int64(SlotAerodromeV2Reserve1)),
+)
+
+var slotAerodromeSlipstreamSlot0 = common.BigToHash(
+	big.NewInt(int64(SlotAerodromeSlipstreamSlot0)),
+)
 // Aerodrome Slipstream slot0.
 //
 // Slipstream CLPool.sol is adapted from Uniswap V3 but drops
