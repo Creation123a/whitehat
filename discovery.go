@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"math/big"
+	"sort"
 	"sync"
 
 	"github.com/ethereum/go-ethereum"
@@ -111,9 +113,16 @@ func (d *discovery) aaveUnderlyings(ctx context.Context) ([]common.Address, erro
 // ---------- Morpho enumeration ----------
 
 func (d *discovery) morphoUnderlyings(ctx context.Context) ([]common.Address, error) {
-	from := uint64(0)
-	if d.head > BlockWindowSize {
+	// Floor logic: if MorphoDeployBlock is set, scan from deployment.
+	// Otherwise bound to the BlockWindowSize window for RPC safety.
+	var from uint64
+	switch {
+	case MorphoDeployBlock > 0:
+		from = MorphoDeployBlock
+	case d.head > BlockWindowSize:
 		from = d.head - BlockWindowSize
+	default:
+		from = 0
 	}
 
 	q := ethereum.FilterQuery{
@@ -247,9 +256,21 @@ func (d *discovery) filterAndEmit(ctx context.Context) []Candidate {
 		}()
 	}
 
-	go func() {
+		go func() {
 		defer close(in)
-		for _, c := range d.seen {
+		// Sort keys so the pipeline is deterministic across runs at the
+		// same block. Without this, map iteration order randomizes which
+		// findings arrive first, and sortProtocols only breaks ties by
+		// TVL — equal-TVL findings would reorder between runs.
+		keys := make([]common.Address, 0, len(d.seen))
+		for k := range d.seen {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			return bytes.Compare(keys[i][:], keys[j][:]) < 0
+		})
+		for _, k := range keys {
+			c := d.seen[k]
 			select {
 			case in <- c:
 			case <-ctx.Done():
