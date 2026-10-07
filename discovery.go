@@ -34,7 +34,7 @@ var morphoCreateMarketTopic = common.HexToHash(
 	"0xac4b2400f169220b0c0afdde7a0b32e775ba727ea1cb30b35f935cdaab8683ac",
 )
 
-const discoverWorkers = 16
+const discoverWorkers = 1
 
 // ---------- Public entry point ----------
 
