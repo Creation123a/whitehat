@@ -131,7 +131,7 @@ func (d *discovery) morphoUnderlyings(ctx context.Context) ([]common.Address, er
 		Addresses: []common.Address{MorphoBlueAddress},
 		Topics:    [][]common.Hash{{morphoCreateMarketTopic}},
 	}
-	logs, err := d.client.FilterLogs(ctx, q)
+	logs, err := d.filterLogsChunked(ctx, q)  // was: d.client.FilterLogs(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("CreateMarket filter: %w", err)
 	}
@@ -201,7 +201,7 @@ func (d *discovery) scanTransfers(
 		Addresses: tokens,
 		Topics:    [][]common.Hash{{transferTopic}},
 	}
-	logs, err := d.client.FilterLogs(ctx, q)
+	logs, err := d.filterLogsChunked(ctx, q)  // was: d.client.FilterLogs(ctx, q)
 	if err != nil {
 		return fmt.Errorf("Transfer filter: %w", err)
 	}
@@ -313,4 +313,44 @@ func decodeAddressArray(raw []byte) ([]common.Address, error) {
 		out = append(out, common.BytesToAddress(raw[base+12:base+32]))
 	}
 	return out, nil
+}
+// ---------- Chunked log filter ----------
+
+// filterLogsChunked splits a log query into chunk-sized ranges and merges
+// results. Required for RPC providers that cap eth_getLogs ranges
+// (Alchemy free tier caps at 10 blocks per call).
+func (d *discovery) filterLogsChunked(
+	ctx context.Context,
+	q ethereum.FilterQuery,
+) ([]types.Log, error) {
+
+	from := q.FromBlock.Uint64()
+	to := q.ToBlock.Uint64()
+
+	chunk := LogChunkSize
+	if chunk == 0 {
+		chunk = 10
+	}
+
+	var all []types.Log
+	for start := from; start <= to; start += chunk {
+		if err := ctx.Err(); err != nil {
+			return all, err
+		}
+		end := start + chunk - 1
+		if end > to {
+			end = to
+		}
+
+		sub := q
+		sub.FromBlock = new(big.Int).SetUint64(start)
+		sub.ToBlock = new(big.Int).SetUint64(end)
+
+		logs, err := d.client.FilterLogs(ctx, sub)
+		if err != nil {
+			return nil, fmt.Errorf("chunk [%d,%d]: %w", start, end, err)
+		}
+		all = append(all, logs...)
+	}
+	return all, nil
 }
