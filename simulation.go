@@ -31,35 +31,11 @@ const (
 
 // Uniswap V2 / V2-fork packed reserves.
 // Layout: [reserve0:112][reserve1:112][blockTimestampLast:32] at slot 8.
-var slotUniswapV2Reserves = common.BigToHash(big.NewInt(8))
-
-// Uniswap V3 slot0 at slot 0.
-// Layout: [sqrtPriceX96:160][tick:24][observationIndex:16]
-//         [observationCardinality:16][observationCardinalityNext:16]
-//         [feeProtocol:8][unlocked:8]
-var slotUniswapV3Slot0 = common.BigToHash(big.NewInt(0))
-
-// Aerodrome V2 (Solidly fork) packed reserves.
-//
-// Aerodrome Pool.sol is not a Uniswap V2 clone at the storage level:
-// it uses uint256 reserve0 and uint256 reserve1 in separate slots,
-// plus stable/decimals/fees state ahead of them. The actual slot is
-// determined by the Solidity layout of:
-//
-//	contract Pool {
-//	    address public token0;   // slot 0
-//	    address public token1;   // slot 1
-//	    bool    public stable;   // slot 2 (packed)
-//	    ...
-//	    uint256 public reserve0; // slot N
-//	    uint256 public reserve1; // slot N+1
-//	}
-//
-// VERIFY by reading Pool.sol storage layout from the deployed
-// implementation on BaseScan before trusting the mutation.
-var slotAerodromeV2Reserve0 = common.BigToHash(big.NewInt(12)) // TODO: verify
-var slotAerodromeV2Reserve1 = common.BigToHash(big.NewInt(13)) // TODO: verify
-
+var slotUniswapV2Reserves = common.BigToHash(big.NewInt(SlotUniswapV2Reserves))
+var slotUniswapV3Slot0 = common.BigToHash(big.NewInt(SlotUniswapV3Slot0))
+var slotAerodromeV2Reserve0 = common.BigToHash(big.NewInt(SlotAerodromeV2Reserve0))
+var slotAerodromeV2Reserve1 = common.BigToHash(big.NewInt(SlotAerodromeV2Reserve1))
+var slotAerodromeSlipstreamSlot0 = common.BigToHash(big.NewInt(SlotAerodromeSlipstreamSlot0))
 // Aerodrome Slipstream slot0.
 //
 // Slipstream CLPool.sol is adapted from Uniswap V3 but drops
