@@ -45,7 +45,7 @@ var slotAerodromeSlipstreamSlot0 = common.BigToHash(big.NewInt(SlotAerodromeSlip
 //	[observationCardinality:16][observationCardinalityNext:16][unlocked:8]
 //
 // The slot itself is still slot 0 (slot0 is the first declared state var).
-var slotAerodromeSlipstreamSlot0 = common.BigToHash(big.NewInt(0))
+
 
 // ---------- Shift factors ----------
 
@@ -115,9 +115,10 @@ func simulateOne(
 		return false, ""
 	}
 	defer func() {
-		revertSnapshot(context.Background(), rpcClient, snap)
-	}()
-
+    if err := revertSnapshot(context.Background(), rpcClient, snap); err != nil {
+        log.Printf("simulate %s: revert snapshot %s failed: %v", f.Vault.Hex(), snap, err)
+    }
+}()
 	// Dispatch on AMM kind. Each branch returns the mutated slot
 	// and value, or an error if the original state is unusable.
 	var (
