@@ -23,10 +23,13 @@ var AaveV3PoolAddress = common.HexToAddress(
 // =============================================================
 // Discovery window
 // =============================================================
-
+// LogChunkSize is the maximum block range per eth_getLogs call.
+// Alchemy free tier caps this at 10. PAYG and most other providers
+// allow much larger ranges (1_000–10_000). Set to 0 to disable chunking.
+var LogChunkSize = uint64(10)
 // BlockWindowSize bounds the Transfer-log scan in discovery.go.
 // 50,000 blocks ≈ 27.7 hours on Base (2 s blocks).
-var BlockWindowSize = uint64(50_000)
+var BlockWindowSize = uint64(500)
 
 // MorphoDeployBlock is the block Morpho Blue was deployed on Base.
 // Used as the lower bound for CreateMarket replay when non-zero.
