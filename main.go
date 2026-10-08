@@ -162,19 +162,26 @@ func run() int {
 	suspected := AnalyzeCandidates(runCtx, client, candidates)
 	log.Printf("scanner: %d SPOT_DEPENDENT (suspected)", len(suspected))
 
-	confirmed := Simulate(runCtx, client, rpcClient, suspected)
-	log.Printf("scanner: %d confirmed via simulation", len(confirmed))
+		results := Simulate(runCtx, client, rpcClient, suspected)
+
+	confirmedCount := 0
+	for _, f := range results {
+		if f.Verified {
+			confirmedCount++
+		}
+	}
+	log.Printf("scanner: %d suspected, %d confirmed", len(suspected), confirmedCount)
 
 	meta := RunMetadata{
 		ChainID:        chainID.Int64(),
 		BlockNumber:    blockNum,
 		CandidateCount: len(candidates),
-		FalsePositives: len(suspected) - len(confirmed),
+		FalsePositives: len(suspected) - confirmedCount,
 	}
 
 	ops := DefaultOperationalProperties(opsF.toPresent())
 
-	rep, err := BuildReport(runCtx, client, meta, confirmed, ops)
+	rep, err := BuildReport(runCtx, client, meta, results, ops)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scanner: build report: %v\n", err)
 		return 2
