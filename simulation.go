@@ -96,12 +96,13 @@ func simulateOne(
 		var pool common.Address
 	var kind string
 
-	if m.TracedPool != (common.Address{}) {
-		// The trace already found the AMM pool the oracle reads.
+		if m.TracedPool != (common.Address{}) {
+		// Trace gave us the exact pool the oracle calls getReserves()/slot0() on.
 		pool = m.TracedPool
 		kind = detectAMMKind(ctx, client, pool)
 		if kind == "" {
-			return ConfirmedMarket{}, "unknown_amm_kind_at_traced_pool", false
+			return ConfirmedMarket{},
+				"traced_pool_does_not_respond_to_getReserves_or_slot0", false
 		}
 	} else {
 		var err error
