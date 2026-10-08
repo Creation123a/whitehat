@@ -71,21 +71,9 @@ func (f *FlexString) UnmarshalJSON(b []byte) error {
 type gqlOracle struct {
 	Address string `json:"address"`
 	Type    string `json:"type"`
-	// Data is only returned for ChainlinkOracle and ChainlinkOracleV2 types.
-	// See: https://docs.morpho.org/tools/offchain/api/morpho/ [citation:1]
-	Data *gqlOracleData `json:"data,omitempty"`
-}
-
-// gqlOracleData contains feed composition for Chainlink-type oracles.
-// We query it to detect misconfigured Chainlink feeds (e.g., wrong decimals).
-type gqlOracleData struct {
-	// On MorphoChainlinkOracleV2Data
-	BaseFeed1         *string `json:"baseFeed1,omitempty"`
-	BaseFeed2         *string `json:"baseFeed2,omitempty"`
-	QuoteFeed1        *string `json:"quoteFeed1,omitempty"`
-	QuoteFeed2        *string `json:"quoteFeed2,omitempty"`
-	BaseTokenDecimals *int    `json:"baseTokenDecimals,omitempty"`
-	QuoteTokenDecimals *int   `json:"quoteTokenDecimals,omitempty"`
+	// Do NOT query 'data' here. OracleData is an interface.
+	// Its fields are only accessible via inline fragments on concrete types.
+	// Bytecode triage in analysis.go inspects the implementation directly.
 }
 
 type gqlWarning struct {
@@ -134,7 +122,7 @@ const morphoMarketsQuery = `query($first: Int!, $skip: Int!) {
       marketId
       lltv
       listed
-      oracle { address type data { baseFeed1 baseFeed2 quoteFeed1 quoteFeed2 baseTokenDecimals quoteTokenDecimals } }
+      oracle { address type }
       warnings { type level }
       loanAsset { address symbol decimals }
       collateralAsset { address symbol decimals }
