@@ -60,7 +60,17 @@ type ConfirmedMarket struct {
 }
 
 // Simulate runs the fork test on each shortlisted market. Returns only
-// markets where oracle.price() moved more than MinDeltaPct.
+// SuspectedMarket is a shortlisted market that passed bytecode triage
+// but did not confirm in the fork simulation.
+type SuspectedMarket struct {
+	Market MorphoMarket
+	Reason string // why confirmation failed
+}
+
+// Simulate runs the fork test on each shortlisted market. Returns two
+// slices: markets where oracle.price() moved more than MinDeltaPct,
+// and markets that failed confirmation (with the reason). The suspected
+// list is not a failure — it is the manual-review queue.
 //
 // Serial by design: Anvil state is global, and parallel mutations of
 // shared pools would corrupt each other's baselines.
@@ -69,19 +79,24 @@ func Simulate(
 	client *ethclient.Client,
 	rpcClient *rpc.Client,
 	shortlist []MorphoMarket,
-) []ConfirmedMarket {
+) ([]ConfirmedMarket, []SuspectedMarket) {
 
 	var confirmed []ConfirmedMarket
+	var suspected []SuspectedMarket
+
 	for i := range shortlist {
-		cm, ok := simulateOne(ctx, client, rpcClient, shortlist[i])
-		if !ok {
+		cm, reason, ok := simulateOne(ctx, client, rpcClient, shortlist[i])
+		if ok {
+			confirmed = append(confirmed, cm)
 			continue
 		}
-		confirmed = append(confirmed, cm)
+		suspected = append(suspected, SuspectedMarket{
+			Market: shortlist[i],
+			Reason: reason,
+		})
 	}
-	return confirmed
+	return confirmed, suspected
 }
-
 func simulateOne(
 	ctx context.Context,
 	client *ethclient.Client,
