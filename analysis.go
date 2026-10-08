@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -32,8 +34,10 @@ type OracleTraceVerdict struct {
 const triageWorkers = 2
 
 // TriageOracles traces each market's oracle price() call via
-// debug_traceCall, walks the entire execution tree, and scans every
-// downstream contract's bytecode for spot AMM selectors.
+// debug_traceCall, walks the entire execution tree, and inspects the
+// actual calldata of every frame. A frame whose input starts with the
+// getReserves() or slot0() selector is ground truth — the oracle really
+// called that function on that contract.
 //
 // This catches ChainlinkOracleV2 instances that read spot AMM state
 // through an intermediate adapter contract — the exact pattern that
@@ -123,53 +127,83 @@ func traceOneOracle(
 		return fallbackBytecodeScan(ctx, client, oracle)
 	}
 
+	// Record every address the trace touched (for the report / debug).
 	targets := make(map[common.Address]struct{})
 	collectTargets(frame, targets)
-
 	for a := range targets {
 		v.TracedAddrs = append(v.TracedAddrs, a)
 	}
 
-	// Scan every downstream contract for spot AMM selectors. A contract
-	// that implements getReserves() or slot0() is an AMM pool. If the
-	// oracle's price() path reaches one, the oracle reads spot state.
-	for addr := range targets {
-		code, cerr := client.CodeAt(ctx, addr, nil)
-		if cerr != nil || len(code) == 0 {
-			continue
+	// Ground-truth detection: read the calldata of every frame. A frame
+	// whose input starts with 0x0902f1ac means the oracle (or something
+	// in its subtree) actually invoked getReserves() on frame.To. Same
+	// for 0x3850c7bd and slot0().
+	//
+	// A robust feed (latestRoundData / observe) anywhere in the path
+	// whitelists the market.
+	hasRobust := false
+	walkFrames(frame, func(f *CallFrame) {
+		if f.To == "" {
+			return
 		}
-		if containsPUSH4(code, SelGetReserves) {
+		to := common.HexToAddress(f.To)
+		switch {
+		case hasSelectorPrefix(f.Input, SelLatestRound),
+			hasSelectorPrefix(f.Input, SelObserve):
+			hasRobust = true
+		case hasSelectorPrefix(f.Input, SelGetReserves):
 			v.HasSpotRead = true
-			v.Selectors = append(v.Selectors, "getReserves()@"+addr.Hex())
+			v.Selectors = append(v.Selectors,
+				"getReserves()@"+to.Hex())
 			if v.Pool == (common.Address{}) {
-				v.Pool = addr
+				v.Pool = to
+			}
+		case hasSelectorPrefix(f.Input, SelSlot0):
+			v.HasSpotRead = true
+			v.Selectors = append(v.Selectors,
+				"slot0()@"+to.Hex())
+			if v.Pool == (common.Address{}) {
+				v.Pool = to
 			}
 		}
-		if containsPUSH4(code, SelSlot0) {
-			v.HasSpotRead = true
-			v.Selectors = append(v.Selectors, "slot0()@"+addr.Hex())
-			if v.Pool == (common.Address{}) {
-				v.Pool = addr
-			}
-		}
-	}
+	})
 
-	// Robust feeds anywhere in the tree whitelist the market.
-	for addr := range targets {
-		code, cerr := client.CodeAt(ctx, addr, nil)
-		if cerr != nil || len(code) == 0 {
-			continue
-		}
-		if containsPUSH4(code, SelLatestRound) || containsPUSH4(code, SelObserve) {
-			v.HasSpotRead = false
-			v.Selectors = nil
-			v.Pool = common.Address{}
-			break
-		}
+	if hasRobust {
+		v.HasSpotRead = false
+		v.Selectors = nil
+		v.Pool = common.Address{}
 	}
 
 	v.Shortlisted = v.HasSpotRead
 	return v
+}
+
+// hasSelectorPrefix reports whether a hex-encoded calldata string starts
+// with the given 4-byte selector.
+func hasSelectorPrefix(input string, sel []byte) bool {
+	if len(input) < 10 {
+		return false
+	}
+	if input[0] == '0' && (input[1] == 'x' || input[1] == 'X') {
+		input = input[2:]
+	}
+	if len(input) < 8 {
+		return false
+	}
+	got := input[:8]
+	want := fmt.Sprintf("%02x%02x%02x%02x", sel[0], sel[1], sel[2], sel[3])
+	return strings.EqualFold(got, want)
+}
+
+// walkFrames visits every frame in the call tree, root first.
+func walkFrames(f *CallFrame, visit func(*CallFrame)) {
+	if f == nil {
+		return
+	}
+	visit(f)
+	for i := range f.Calls {
+		walkFrames(&f.Calls[i], visit)
+	}
 }
 
 // tracePriceCall runs debug_traceCall with callTracer against the
