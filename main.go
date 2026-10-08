@@ -177,6 +177,7 @@ func run() int {
 	}
 
 	return WriteReport(*outPath, *format, rep)
+}
 // ---------- RPC readiness ----------
 
 func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
