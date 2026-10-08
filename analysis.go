@@ -6,59 +6,77 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
-// CollateralVerdict is the static analysis result for one collateral asset.
-type CollateralVerdict struct {
-	Collateral    common.Address
-	HasSpotRead   bool
-	HasRobustFeed bool
-	Selectors     []string
-	Whitelisted   bool
-	Shortlisted   bool
+// CallFrame is one node in a callTracer execution tree.
+type CallFrame struct {
+	From   string      `json:"from"`
+	To     string      `json:"to"`
+	Input  string      `json:"input"`
+	Output string      `json:"output"`
+	Error  string      `json:"error,omitempty"`
+	Calls  []CallFrame `json:"calls,omitempty"`
 }
 
-const triageWorkers = 1
+// OracleTraceVerdict is the trace-based analysis result for one oracle.
+type OracleTraceVerdict struct {
+	Oracle      common.Address
+	HasSpotRead bool
+	Selectors   []string
+	Pool        common.Address
+	TracedAddrs []common.Address
+	Shortlisted bool
+}
 
-// TriageCollateral scans each market's collateral asset bytecode, keeps
-// only markets whose collateral reads spot AMM state and has no robust
-// Chainlink/TWAP feed in its valuation path.
-func TriageCollateral(
+const triageWorkers = 2
+
+// TriageOracles traces each market's oracle price() call via
+// debug_traceCall, walks the entire execution tree, and scans every
+// downstream contract's bytecode for spot AMM selectors.
+//
+// This catches ChainlinkOracleV2 instances that read spot AMM state
+// through an intermediate adapter contract — the exact pattern that
+// bytecode-only scanning misses.
+func TriageOracles(
 	ctx context.Context,
 	client *ethclient.Client,
+	rpcClient *rpc.Client,
 	markets []MorphoMarket,
 ) []MorphoMarket {
 
-	verdicts := scanUniqueCollaterals(ctx, client, UniqueCollaterals(markets))
+	verdicts := traceUniqueOracles(ctx, client, rpcClient, UniqueOracles(markets))
 
 	var out []MorphoMarket
 	for _, m := range markets {
-		v, ok := verdicts[m.CollateralAsset.Address]
+		v, ok := verdicts[m.Oracle]
 		if !ok || !v.Shortlisted {
 			continue
 		}
-		m.CollateralSelectors = v.Selectors
+		m.Selectors = v.Selectors
+		m.TracedPool = v.Pool
 		out = append(out, m)
 	}
 	return out
 }
 
-func scanUniqueCollaterals(
+func traceUniqueOracles(
 	ctx context.Context,
 	client *ethclient.Client,
-	collaterals []common.Address,
-) map[common.Address]CollateralVerdict {
+	rpcClient *rpc.Client,
+	oracles []common.Address,
+) map[common.Address]OracleTraceVerdict {
 
 	in := make(chan common.Address)
-	out := make(chan CollateralVerdict)
+	out := make(chan OracleTraceVerdict)
 
 	var wg sync.WaitGroup
 	for i := 0; i < triageWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for c := range in {
-				v := triageOneCollateral(ctx, client, c)
+			for o := range in {
+				v := traceOneOracle(ctx, client, rpcClient, o)
 				select {
 				case out <- v:
 				case <-ctx.Done():
@@ -70,9 +88,9 @@ func scanUniqueCollaterals(
 
 	go func() {
 		defer close(in)
-		for _, c := range collaterals {
+		for _, o := range oracles {
 			select {
-			case in <- c:
+			case in <- o:
 			case <-ctx.Done():
 				return
 			}
@@ -84,54 +102,138 @@ func scanUniqueCollaterals(
 		close(out)
 	}()
 
-	m := make(map[common.Address]CollateralVerdict)
+	m := make(map[common.Address]OracleTraceVerdict)
 	for v := range out {
-		m[v.Collateral] = v
+		m[v.Oracle] = v
 	}
 	return m
 }
 
-// triageOneCollateral scans the collateral asset's runtime bytecode for
-// spot AMM selectors. If it finds getReserves() or slot0(), or
-// balanceOf()+totalSupply(), the collateral computes its own value from
-// spot AMM state — that is the vulnerability we hunt.
-//
-// If it finds latestRoundData() or observe(), the collateral uses a
-// robust external feed and is discarded.
-func triageOneCollateral(
+func traceOneOracle(
 	ctx context.Context,
 	client *ethclient.Client,
-	collateral common.Address,
-) CollateralVerdict {
+	rpcClient *rpc.Client,
+	oracle common.Address,
+) OracleTraceVerdict {
 
-	v := CollateralVerdict{Collateral: collateral}
-	code, err := client.CodeAt(ctx, collateral, nil)
+	v := OracleTraceVerdict{Oracle: oracle}
+
+	frame, err := tracePriceCall(ctx, rpcClient, oracle)
+	if err != nil || frame == nil {
+		return fallbackBytecodeScan(ctx, client, oracle)
+	}
+
+	targets := make(map[common.Address]struct{})
+	collectTargets(frame, targets)
+
+	for a := range targets {
+		v.TracedAddrs = append(v.TracedAddrs, a)
+	}
+
+	// Scan every downstream contract for spot AMM selectors. A contract
+	// that implements getReserves() or slot0() is an AMM pool. If the
+	// oracle's price() path reaches one, the oracle reads spot state.
+	for addr := range targets {
+		code, cerr := client.CodeAt(ctx, addr, nil)
+		if cerr != nil || len(code) == 0 {
+			continue
+		}
+		if containsPUSH4(code, SelGetReserves) {
+			v.HasSpotRead = true
+			v.Selectors = append(v.Selectors, "getReserves()@"+addr.Hex())
+			if v.Pool == (common.Address{}) {
+				v.Pool = addr
+			}
+		}
+		if containsPUSH4(code, SelSlot0) {
+			v.HasSpotRead = true
+			v.Selectors = append(v.Selectors, "slot0()@"+addr.Hex())
+			if v.Pool == (common.Address{}) {
+				v.Pool = addr
+			}
+		}
+	}
+
+	// Robust feeds anywhere in the tree whitelist the market.
+	for addr := range targets {
+		code, cerr := client.CodeAt(ctx, addr, nil)
+		if cerr != nil || len(code) == 0 {
+			continue
+		}
+		if containsPUSH4(code, SelLatestRound) || containsPUSH4(code, SelObserve) {
+			v.HasSpotRead = false
+			v.Selectors = nil
+			v.Pool = common.Address{}
+			break
+		}
+	}
+
+	v.Shortlisted = v.HasSpotRead
+	return v
+}
+
+// tracePriceCall runs debug_traceCall with callTracer against the
+// oracle's price() function at the latest block.
+func tracePriceCall(
+	ctx context.Context,
+	rpcClient *rpc.Client,
+	oracle common.Address,
+) (*CallFrame, error) {
+
+	callArg := map[string]interface{}{
+		"to":   oracle.Hex(),
+		"data": "0xa035b1fe", // price()
+	}
+	traceCfg := map[string]interface{}{
+		"tracer": "callTracer",
+	}
+
+	var frame CallFrame
+	if err := rpcClient.CallContext(ctx, &frame, "debug_traceCall",
+		callArg, "latest", traceCfg); err != nil {
+		return nil, err
+	}
+	return &frame, nil
+}
+
+func collectTargets(frame *CallFrame, out map[common.Address]struct{}) {
+	if frame == nil || frame.To == "" {
+		return
+	}
+	out[common.HexToAddress(frame.To)] = struct{}{}
+	for i := range frame.Calls {
+		collectTargets(&frame.Calls[i], out)
+	}
+}
+
+// fallbackBytecodeScan is used when debug_traceCall is unavailable or
+// the oracle reverts. Scans the oracle's own bytecode only — less
+// accurate but better than dropping the market.
+func fallbackBytecodeScan(
+	ctx context.Context,
+	client *ethclient.Client,
+	oracle common.Address,
+) OracleTraceVerdict {
+
+	v := OracleTraceVerdict{Oracle: oracle}
+	code, err := client.CodeAt(ctx, oracle, nil)
 	if err != nil || len(code) == 0 {
 		return v
 	}
 
-	has := func(sel []byte) bool { return containsPUSH4(code, sel) }
+	hasSpot := false
+	if containsPUSH4(code, SelGetReserves) {
+		hasSpot = true
+		v.Selectors = append(v.Selectors, "getReserves()@self")
+	}
+	if containsPUSH4(code, SelSlot0) {
+		hasSpot = true
+		v.Selectors = append(v.Selectors, "slot0()@self")
+	}
+	hasRobust := containsPUSH4(code, SelLatestRound) || containsPUSH4(code, SelObserve)
 
-	if has(SelGetReserves) {
-		v.HasSpotRead = true
-		v.Selectors = append(v.Selectors, "getReserves()")
-	}
-	if has(SelSlot0) {
-		v.HasSpotRead = true
-		v.Selectors = append(v.Selectors, "slot0()")
-	}
-	if has(SelLatestRound) {
-		v.HasRobustFeed = true
-	}
-	if has(SelObserve) {
-		v.HasRobustFeed = true
-	}
-
-	if v.HasRobustFeed && !v.HasSpotRead {
-		v.Whitelisted = true
-	}
-
-	v.Shortlisted = v.HasSpotRead && !v.HasRobustFeed && !v.Whitelisted
+	v.HasSpotRead = hasSpot
+	v.Shortlisted = hasSpot && !hasRobust
 	return v
 }
 
