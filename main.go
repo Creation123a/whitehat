@@ -150,7 +150,7 @@ func run() int {
 	log.Printf("scanner: %d unique collateral assets", uniqueCollaterals)
 
 	// Stage 2: bytecode triage on collateral assets.
-	shortlist := TriageCollateral(runCtx, client, markets)
+		shortlist := TriageOracles(runCtx, client, rpcClient, markets)
 	log.Printf("scanner: %d shortlisted markets", len(shortlist))
 
 	// Stage 3: fork confirmation. Scans oracle AND collateral for pool refs.
