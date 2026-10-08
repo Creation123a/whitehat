@@ -11,16 +11,12 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
-// ---------- AMM kinds ----------
-
 const (
 	ammUniswapV2        = "uniswap-v2"
 	ammUniswapV3        = "uniswap-v3"
 	ammAerodromeV2      = "aerodrome-v2"
 	ammAerodromeSlipstr = "aerodrome-slipstream"
 )
-
-// ---------- Storage slots (sourced from config.go) ----------
 
 var (
 	slotUniswapV2Reserves        = common.BigToHash(big.NewInt(int64(SlotUniswapV2Reserves)))
@@ -29,24 +25,18 @@ var (
 	slotAerodromeSlipstreamSlot0 = common.BigToHash(big.NewInt(int64(SlotAerodromeSlipstreamSlot0)))
 )
 
-// ---------- Shift factors ----------
-
 var (
-	shiftV2Num = big.NewInt(110) // +10%
+	shiftV2Num = big.NewInt(110)
 	shiftV2Den = big.NewInt(100)
 
-	shiftV3Num = big.NewInt(95) // -5% sqrtPriceX96 (≈ -10% spot)
+	shiftV3Num = big.NewInt(95)
 	shiftV3Den = big.NewInt(100)
 )
-
-// ---------- Bit masks ----------
 
 var (
 	mask112 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 112), big.NewInt(1))
 	mask160 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 160), big.NewInt(1))
 )
-
-// ---------- ConfirmedMarket ----------
 
 // ConfirmedMarket carries the fork-verified evidence for one market.
 type ConfirmedMarket struct {
@@ -59,21 +49,19 @@ type ConfirmedMarket struct {
 	Evidence    string
 }
 
-// Simulate runs the fork test on each shortlisted market. Returns only
-// SuspectedMarket is a shortlisted market that passed bytecode triage
-// but did not confirm in the fork simulation.
+// SuspectedMarket is a shortlisted market that didn't confirm.
 type SuspectedMarket struct {
 	Market MorphoMarket
-	Reason string // why confirmation failed
+	Reason string
 }
 
-// Simulate runs the fork test on each shortlisted market. Returns two
-// slices: markets where oracle.price() moved more than MinDeltaPct,
-// and markets that failed confirmation (with the reason). The suspected
-// list is not a failure — it is the manual-review queue.
+// Simulate runs the fork test on each shortlisted market.
 //
-// Serial by design: Anvil state is global, and parallel mutations of
-// shared pools would corrupt each other's baselines.
+// The pipeline is now collateral-aware: pool resolution scans both the
+// oracle's bytecode AND the collateral asset's bytecode. If a spot-
+// dependent collateral wrapper is present, its AMM pool reference will
+// be found, the pool mutated, and oracle.price() — which reads the
+// collateral's valuation — will register the shift.
 func Simulate(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -97,8 +85,7 @@ func Simulate(
 	}
 	return confirmed, suspected
 }
-// simulateOne returns (confirmed, reason, ok). ok=true means confirmed.
-// ok=false means suspected, and reason explains why.
+
 func simulateOne(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -106,7 +93,9 @@ func simulateOne(
 	m MorphoMarket,
 ) (ConfirmedMarket, string, bool) {
 
-	pool, kind, err := locateAMMPool(ctx, client, m.Oracle)
+	// Pool resolution: scan both oracle and collateral for PUSH20 constants.
+	pool, kind, err := locateAMMPoolDual(ctx, client, m.Oracle,
+		m.CollateralAsset.Address)
 	if err != nil {
 		return ConfirmedMarket{}, "pool_not_resolved: " + err.Error(), false
 	}
@@ -206,8 +195,10 @@ func simulateOne(
 	}
 
 	evidence := fmt.Sprintf(
-		"oracle.price() moved %.2f%% (%s → %s) when %s shifted (%s pool %s)",
-		pct, base.String(), after.String(), label, kind, pool.Hex())
+		"oracle.price() moved %.2f%% (%s → %s) when %s shifted (%s pool %s); "+
+			"collateral wrapper at %s uses spot AMM state internally",
+		pct, base.String(), after.String(), label, kind, pool.Hex(),
+		m.CollateralAsset.Address.Hex())
 
 	return ConfirmedMarket{
 		Market:      m,
@@ -219,33 +210,43 @@ func simulateOne(
 		Evidence:    evidence,
 	}, "", true
 }
-	
-func locateAMMPool(
+
+// ---------- AMM pool discovery ----------
+
+// locateAMMPoolDual scans both the oracle and the collateral asset for
+// PUSH20 constants. Either may reference the AMM pool:
+//   - The oracle, if it directly reads spot reserves.
+//   - The collateral, if it computes its own value from spot reserves.
+func locateAMMPoolDual(
 	ctx context.Context,
 	client *ethclient.Client,
-	oracle common.Address,
+	oracle, collateral common.Address,
 ) (common.Address, string, error) {
 
-	code, err := client.CodeAt(ctx, oracle, nil)
-	if err != nil {
-		return common.Address{}, "", err
-	}
-
-	for _, addr := range extractPUSH20Candidates(code) {
-		if _, err := callBig(ctx, client, addr, SelGetReserves); err == nil {
-			if _, err := callBig(ctx, client, addr, SelStable); err == nil {
-				return addr, ammAerodromeV2, nil
-			}
-			return addr, ammUniswapV2, nil
+	for _, target := range []common.Address{oracle, collateral} {
+		if target == (common.Address{}) {
+			continue
 		}
-		if _, err := callBig(ctx, client, addr, SelSlot0); err == nil {
-			if _, err := callBig(ctx, client, addr, SelFeeProtocol); err == nil {
-				return addr, ammUniswapV3, nil
+		code, err := client.CodeAt(ctx, target, nil)
+		if err != nil || len(code) == 0 {
+			continue
+		}
+		for _, addr := range extractPUSH20Candidates(code) {
+			if _, err := callBig(ctx, client, addr, SelGetReserves); err == nil {
+				if _, err := callBig(ctx, client, addr, SelStable); err == nil {
+					return addr, ammAerodromeV2, nil
+				}
+				return addr, ammUniswapV2, nil
 			}
-			return addr, ammAerodromeSlipstr, nil
+			if _, err := callBig(ctx, client, addr, SelSlot0); err == nil {
+				if _, err := callBig(ctx, client, addr, SelFeeProtocol); err == nil {
+					return addr, ammUniswapV3, nil
+				}
+				return addr, ammAerodromeSlipstr, nil
+			}
 		}
 	}
-	return common.Address{}, "", fmt.Errorf("no AMM pool resolved")
+	return common.Address{}, "", fmt.Errorf("no AMM pool resolved in oracle or collateral")
 }
 
 func extractPUSH20Candidates(code []byte) []common.Address {
@@ -271,11 +272,8 @@ func extractPUSH20Candidates(code []byte) []common.Address {
 // ---------- Storage mutations ----------
 
 func shiftV2ReservesPacked(
-	old common.Hash,
-	mask *big.Int,
-	width uint,
+	old common.Hash, mask *big.Int, width uint,
 ) (common.Hash, string, error) {
-
 	v := new(big.Int).SetBytes(old.Bytes())
 	reserve0 := new(big.Int).And(v, mask)
 	if reserve0.Sign() == 0 {
@@ -305,11 +303,8 @@ func shiftAerodromeV2Reserve0(old common.Hash) (common.Hash, string, error) {
 }
 
 func shiftV3Slot0(
-	old common.Hash,
-	mask *big.Int,
-	width uint,
+	old common.Hash, mask *big.Int, width uint,
 ) (common.Hash, string, error) {
-
 	v := new(big.Int).SetBytes(old.Bytes())
 	sqrtPrice := new(big.Int).And(v, mask)
 	if sqrtPrice.Sign() == 0 {
@@ -331,12 +326,9 @@ func shiftSlipstreamSlot0(old common.Hash) (common.Hash, string, error) {
 // ---------- RPC helpers ----------
 
 func readSlot(
-	ctx context.Context,
-	client *ethclient.Client,
-	addr common.Address,
-	slot common.Hash,
+	ctx context.Context, client *ethclient.Client,
+	addr common.Address, slot common.Hash,
 ) (common.Hash, error) {
-
 	raw, err := client.StorageAt(ctx, addr, slot, nil)
 	if err != nil {
 		return common.Hash{}, err
@@ -348,12 +340,9 @@ func readSlot(
 }
 
 func setStorage(
-	ctx context.Context,
-	c *rpc.Client,
-	addr common.Address,
-	slot, value common.Hash,
+	ctx context.Context, c *rpc.Client,
+	addr common.Address, slot, value common.Hash,
 ) error {
-
 	var res interface{}
 	err := c.CallContext(ctx, &res, "anvil_setStorageAt",
 		addr.Hex(), slot.Hex(), value.Hex())
