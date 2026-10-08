@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       fork_block:
-        description: 'Base block number to fork at'
-        required: true
-        default: '30000000'
+        description: 'Override fork block (leave empty to auto-fetch latest)'
+        required: false
+        default: ''
       format:
         description: 'Output format'
         required: true
@@ -66,10 +66,30 @@ jobs:
       - name: Mask RPC URL
         run: echo "::add-mask::${{ secrets.BASE_FORK_URL }}"
 
+      - name: Resolve fork block
+        id: fork
+        env:
+          BASE_FORK_URL: ${{ secrets.BASE_FORK_URL }}
+          OVERRIDE: ${{ inputs.fork_block }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${OVERRIDE:-}" ]; then
+            BLOCK="$OVERRIDE"
+            echo "Using explicit override block: $BLOCK"
+          else
+            HEAD=$(cast block-number --rpc-url "$BASE_FORK_URL")
+            # Back off 100 blocks to avoid reorg edge cases.
+            BLOCK=$((HEAD - 100))
+            echo "Fetched head: $HEAD, using: $BLOCK"
+          fi
+
+          echo "block=$BLOCK" >> "$GITHUB_OUTPUT"
+
       - name: Run scan
         env:
           BASE_FORK_URL: ${{ secrets.BASE_FORK_URL }}
-          FORK_BLOCK:    ${{ inputs.fork_block }}
+          FORK_BLOCK:    ${{ steps.fork.outputs.block }}
           FORMAT:        ${{ inputs.format }}
           TIMEOUT:       ${{ inputs.timeout }}
         run: |
@@ -93,7 +113,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scan-report-${{ inputs.fork_block }}
+          name: scan-report-${{ steps.fork.outputs.block }}
           path: |
             report.json
             report.txt
