@@ -191,12 +191,12 @@ func toSuspectedReport(sm SuspectedMarket) SuspectedMarketReport {
 		CollateralSymbol:    m.CollateralAsset.Symbol,
 		CollateralName:      m.CollateralAsset.Name,
 		CollateralAddress:   m.CollateralAsset.Address.Hex(),
-		CollateralSelectors: m.CollateralSelectors,
+				CollateralSelectors:  m.Selectors,
 		LLTV:                m.LLTV,
 		SupplyUSD:           m.SupplyUSD,
 		BorrowUSD:           m.BorrowUSD,
 		CollateralUSD:       m.CollateralUSD,
-		Selectors:           m.CollateralSelectors,
+				Selectors:            m.Selectors,
 		Reason:              sm.Reason,
 	}
 }
@@ -254,8 +254,7 @@ func RenderText(w io.Writer, r *Report) {
 		}
 		fmt.Fprintf(w, "     LLTV:        %s\n", m.LLTV)
 		fmt.Fprintf(w, "     Pool:        %s (%s)\n", m.PoolAddress, m.PoolKind)
-		fmt.Fprintf(w, "     Selectors:   %s\n",
-			strings.Join(m.CollateralSelectors, ", "))
+				fmt.Fprintf(w, "     Selectors:  %s\n", strings.Join(m.Selectors, ", "))
 		fmt.Fprintf(w, "     Delta:       %.2f%%\n", m.DeltaPct)
 		fmt.Fprintf(w, "     Evidence:    %s\n", m.Evidence)
 		fmt.Fprintf(w, "     Remediate:   %s\n", m.Remediation)
@@ -275,8 +274,7 @@ func RenderText(w io.Writer, r *Report) {
 			if len(m.Warnings) > 0 {
 				fmt.Fprintf(w, "     Warnings:    %s\n", strings.Join(m.Warnings, ", "))
 			}
-			fmt.Fprintf(w, "     Selectors:   %s\n",
-				strings.Join(m.CollateralSelectors, ", "))
+						fmt.Fprintf(w, "     Selectors:  %s\n", strings.Join(m.Selectors, ", "))
 			fmt.Fprintf(w, "     Reason:      %s\n", m.Reason)
 		}
 	}
