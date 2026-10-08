@@ -93,11 +93,23 @@ func simulateOne(
 	m MorphoMarket,
 ) (ConfirmedMarket, string, bool) {
 
-	// Pool resolution: scan both oracle and collateral for PUSH20 constants.
-	pool, kind, err := locateAMMPoolDual(ctx, client, m.Oracle,
-		m.CollateralAsset.Address)
-	if err != nil {
-		return ConfirmedMarket{}, "pool_not_resolved: " + err.Error(), false
+		var pool common.Address
+	var kind string
+
+	if m.TracedPool != (common.Address{}) {
+		// The trace already found the AMM pool the oracle reads.
+		pool = m.TracedPool
+		kind = detectAMMKind(ctx, client, pool)
+		if kind == "" {
+			return ConfirmedMarket{}, "unknown_amm_kind_at_traced_pool", false
+		}
+	} else {
+		var err error
+		pool, kind, err = locateAMMPoolDual(ctx, client, m.Oracle,
+			m.CollateralAsset.Address)
+		if err != nil {
+			return ConfirmedMarket{}, "pool_not_resolved: " + err.Error(), false
+		}
 	}
 
 	base, err := callBig(ctx, client, m.Oracle, SelPrice)
