@@ -97,28 +97,28 @@ func Simulate(
 	}
 	return confirmed, suspected
 }
+// simulateOne returns (confirmed, reason, ok). ok=true means confirmed.
+// ok=false means suspected, and reason explains why.
 func simulateOne(
 	ctx context.Context,
 	client *ethclient.Client,
 	rpcClient *rpc.Client,
 	m MorphoMarket,
-) (ConfirmedMarket, bool) {
+) (ConfirmedMarket, string, bool) {
 
 	pool, kind, err := locateAMMPool(ctx, client, m.Oracle)
 	if err != nil {
-		log.Printf("simulate %s: locate AMM pool: %v", m.Oracle.Hex(), err)
-		return ConfirmedMarket{}, false
+		return ConfirmedMarket{}, "pool_not_resolved: " + err.Error(), false
 	}
 
 	base, err := callBig(ctx, client, m.Oracle, SelPrice)
 	if err != nil || base.Sign() == 0 {
-		return ConfirmedMarket{}, false
+		return ConfirmedMarket{}, "oracle_call_failed", false
 	}
 
 	snap, err := takeSnapshot(ctx, rpcClient)
 	if err != nil {
-		log.Printf("simulate %s: snapshot: %v", m.Oracle.Hex(), err)
-		return ConfirmedMarket{}, false
+		return ConfirmedMarket{}, "snapshot_failed: " + err.Error(), false
 	}
 	defer func() {
 		if err := revertSnapshot(context.Background(), rpcClient, snap); err != nil {
@@ -137,58 +137,57 @@ func simulateOne(
 		slot = slotUniswapV2Reserves
 		original, err := readSlot(ctx, client, pool, slot)
 		if err != nil {
-			return ConfirmedMarket{}, false
+			return ConfirmedMarket{}, "read_slot_failed", false
 		}
 		mutated, label, err = shiftV2ReservesPacked(original, mask112, 112)
 		if err != nil {
-			return ConfirmedMarket{}, false
+			return ConfirmedMarket{}, "mutation_failed: " + err.Error(), false
 		}
 
 	case ammUniswapV3:
 		slot = slotUniswapV3Slot0
 		original, err := readSlot(ctx, client, pool, slot)
 		if err != nil {
-			return ConfirmedMarket{}, false
+			return ConfirmedMarket{}, "read_slot_failed", false
 		}
 		mutated, label, err = shiftV3Slot0(original, mask160, 160)
 		if err != nil {
-			return ConfirmedMarket{}, false
+			return ConfirmedMarket{}, "mutation_failed: " + err.Error(), false
 		}
 
 	case ammAerodromeV2:
 		slot = slotAerodromeV2Reserve0
 		original, err := readSlot(ctx, client, pool, slot)
 		if err != nil {
-			return ConfirmedMarket{}, false
+			return ConfirmedMarket{}, "read_slot_failed", false
 		}
 		mutated, label, err = shiftAerodromeV2Reserve0(original)
 		if err != nil {
-			return ConfirmedMarket{}, false
+			return ConfirmedMarket{}, "mutation_failed: " + err.Error(), false
 		}
 
 	case ammAerodromeSlipstr:
 		slot = slotAerodromeSlipstreamSlot0
 		original, err := readSlot(ctx, client, pool, slot)
 		if err != nil {
-			return ConfirmedMarket{}, false
+			return ConfirmedMarket{}, "read_slot_failed", false
 		}
 		mutated, label, err = shiftSlipstreamSlot0(original)
 		if err != nil {
-			return ConfirmedMarket{}, false
+			return ConfirmedMarket{}, "mutation_failed: " + err.Error(), false
 		}
 
 	default:
-		return ConfirmedMarket{}, false
+		return ConfirmedMarket{}, "unknown_amm_kind", false
 	}
 
 	if err := setStorage(ctx, rpcClient, pool, slot, mutated); err != nil {
-		log.Printf("simulate %s: setStorageAt: %v", m.Oracle.Hex(), err)
-		return ConfirmedMarket{}, false
+		return ConfirmedMarket{}, "storage_write_failed: " + err.Error(), false
 	}
 
 	after, err := callBig(ctx, client, m.Oracle, SelPrice)
 	if err != nil {
-		return ConfirmedMarket{}, false
+		return ConfirmedMarket{}, "oracle_call_after_failed", false
 	}
 
 	delta := new(big.Int).Sub(after, base)
@@ -201,7 +200,9 @@ func simulateOne(
 	pct, _ := pctF.Float64()
 
 	if pct < MinDeltaPct {
-		return ConfirmedMarket{}, false
+		return ConfirmedMarket{},
+			fmt.Sprintf("delta_below_threshold: %.4f%% < %.2f%%", pct, MinDeltaPct),
+			false
 	}
 
 	evidence := fmt.Sprintf(
@@ -216,13 +217,9 @@ func simulateOne(
 		PriceAfter:  after,
 		DeltaPct:    pct,
 		Evidence:    evidence,
-	}, true
+	}, "", true
 }
-
-// ---------- AMM pool discovery ----------
-
-// locateAMMPool scans the oracle's runtime bytecode for PUSH20 constants
-// and probes each. Returns the first AMM pool that responds.
+	
 func locateAMMPool(
 	ctx context.Context,
 	client *ethclient.Client,
