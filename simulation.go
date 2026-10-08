@@ -84,6 +84,18 @@ var (
 
 // ---------- Entry point ----------
 
+// Simulate attempts to confirm each SPOT_DEPENDENT finding by shifting
+// the underlying AMM pool's reserves in Anvil state and observing
+// whether the vault's totalAssets() responds.
+//
+// All input findings are returned. Findings that confirmed are marked
+// Verified=true with Evidence populated. Findings that did not confirm
+// (no AMM pool resolvable, no totalAssets(), or totalAssets() stable
+// under reserve shift) pass through unmodified — the report classifies
+// them as SUSPECTED.
+//
+// Serial by design: Anvil state is global, and parallel mutations of
+// shared pools would corrupt each other's baselines.
 func Simulate(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -91,20 +103,18 @@ func Simulate(
 	suspected []Finding,
 ) []Finding {
 
-	confirmed := make([]Finding, 0, len(suspected))
+	out := make([]Finding, 0, len(suspected))
 	for i := range suspected {
 		f := suspected[i]
 		ok, ev := simulateOne(ctx, client, rpcClient, f)
-		if !ok {
-			continue
+		if ok {
+			f.Verified = true
+			f.Evidence = ev
 		}
-		f.Verified = true
-		f.Evidence = ev
-		confirmed = append(confirmed, f)
+		out = append(out, f)
 	}
-	return confirmed
+	return out
 }
-
 // ---------- Per-finding simulation ----------
 
 func simulateOne(
