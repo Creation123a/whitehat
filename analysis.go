@@ -120,10 +120,6 @@ func triageOneCollateral(
 		v.HasSpotRead = true
 		v.Selectors = append(v.Selectors, "slot0()")
 	}
-	if has(SelBalanceOf) && has(SelTotalSupply) {
-		v.HasSpotRead = true
-		v.Selectors = append(v.Selectors, "balanceOf()+totalSupply()")
-	}
 	if has(SelLatestRound) {
 		v.HasRobustFeed = true
 	}
