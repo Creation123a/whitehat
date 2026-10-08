@@ -401,3 +401,23 @@ func revertSnapshot(ctx context.Context, c *rpc.Client, id string) error {
 	}
 	return c.CallContext(ctx, &ok, "evm_revert", id)
 }
+// detectAMMKind probes a pool address and returns its AMM kind.
+func detectAMMKind(
+	ctx context.Context,
+	client *ethclient.Client,
+	pool common.Address,
+) string {
+	if _, err := callBig(ctx, client, pool, SelGetReserves); err == nil {
+		if _, err := callBig(ctx, client, pool, SelStable); err == nil {
+			return ammAerodromeV2
+		}
+		return ammUniswapV2
+	}
+	if _, err := callBig(ctx, client, pool, SelSlot0); err == nil {
+		if _, err := callBig(ctx, client, pool, SelFeeProtocol); err == nil {
+			return ammUniswapV3
+		}
+		return ammAerodromeSlipstr
+	}
+	return ""
+}
