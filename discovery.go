@@ -201,16 +201,29 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 // VERIFY the exact warning type strings against the live API before
 // trusting this filter. If the API uses different casing or separators,
 // no market will match and the pipeline will return zero candidates.
+// isSuspiciousOracle returns true when the oracle is not a
+// Chainlink-composed reference implementation, or when Morpho's own
+// risk engine flags it.
+//
+// Matching is case- and separator-insensitive so it tolerates any of:
+//   "unrecognized_oracle", "UNRECOGNIZED_ORACLE", "oracle-unrecognized"
+//   "hardcoded_oracle_feed", "HARDCODED_FEED", "hardcodedFeed"
+// Substring matching is used because the exact API taxonomy may change
+// without notice. If the API introduces a new suspicious warning that
+// contains "unrecognized" / "hardcoded" / "incompatible", it will be
+// caught automatically.
 func isSuspiciousOracle(oracleType string, warnings []gqlWarning) bool {
-	if oracleType == "Custom" {
+	// Oracle type: any variant of "Custom" (case-insensitive).
+	if strings.EqualFold(oracleType, "Custom") {
 		return true
 	}
 	for _, w := range warnings {
-		switch w.Type {
-		case "hardcoded_oracle_feed",
-			"unrecognized_oracle",
-			"unrecognized_oracle_feed",
-			"incompatible_oracle_feeds":
+		t := strings.ToLower(w.Type)
+		t = strings.ReplaceAll(t, "-", "_")
+		t = strings.ReplaceAll(t, " ", "_")
+		if strings.Contains(t, "unrecognized") ||
+			strings.Contains(t, "hardcoded") ||
+			strings.Contains(t, "incompatible") {
 			return true
 		}
 	}
