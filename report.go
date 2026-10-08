@@ -19,49 +19,53 @@ import (
 // ---------- Types ----------
 
 type MarketReport struct {
-	Rank              int      `json:"rank"`
-	MarketID          string   `json:"market_id"`
-	Oracle            string   `json:"oracle"`
-	OracleType        string   `json:"oracle_type"`
-	Warnings          []string `json:"warnings,omitempty"`
-	Listed            bool     `json:"listed"`
-	LoanSymbol        string   `json:"loan_symbol"`
-	LoanAddress       string   `json:"loan_address"`
-	CollateralSymbol  string   `json:"collateral_symbol"`
-	CollateralAddress string   `json:"collateral_address"`
-	LLTV              string   `json:"lltv"`
-	SupplyUSD         float64  `json:"supply_usd"`
-	BorrowUSD         float64  `json:"borrow_usd"`
-	CollateralUSD     float64  `json:"collateral_usd"`
-	PoolAddress       string   `json:"pool_address"`
-	PoolKind          string   `json:"pool_kind"`
-	PriceBefore       string   `json:"price_before"`
-	PriceAfter        string   `json:"price_after"`
-	DeltaPct          float64  `json:"delta_pct"`
-	Selectors         []string `json:"selectors"`
-	Evidence          string   `json:"evidence"`
-	Remediation       string   `json:"remediation"`
+	Rank                 int      `json:"rank"`
+	MarketID             string   `json:"market_id"`
+	Oracle               string   `json:"oracle"`
+	OracleType           string   `json:"oracle_type"`
+	Warnings             []string `json:"warnings,omitempty"`
+	Listed               bool     `json:"listed"`
+	LoanSymbol           string   `json:"loan_symbol"`
+	LoanAddress          string   `json:"loan_address"`
+	CollateralSymbol     string   `json:"collateral_symbol"`
+	CollateralName       string   `json:"collateral_name"`
+	CollateralAddress    string   `json:"collateral_address"`
+	CollateralSelectors  []string `json:"collateral_selectors"`
+	LLTV                 string   `json:"lltv"`
+	SupplyUSD            float64  `json:"supply_usd"`
+	BorrowUSD            float64  `json:"borrow_usd"`
+	CollateralUSD        float64  `json:"collateral_usd"`
+	PoolAddress          string   `json:"pool_address"`
+	PoolKind             string   `json:"pool_kind"`
+	PriceBefore          string   `json:"price_before"`
+	PriceAfter           string   `json:"price_after"`
+	DeltaPct             float64  `json:"delta_pct"`
+	Selectors            []string `json:"selectors"`
+	Evidence             string   `json:"evidence"`
+	Remediation          string   `json:"remediation"`
 }
 
 // SuspectedMarketReport is a shortlisted market that failed fork
 // confirmation. Not a finding — a manual-review queue entry.
 type SuspectedMarketReport struct {
-	Rank              int      `json:"rank"`
-	MarketID          string   `json:"market_id"`
-	Oracle            string   `json:"oracle"`
-	OracleType        string   `json:"oracle_type"`
-	Warnings          []string `json:"warnings,omitempty"`
-	Listed            bool     `json:"listed"`
-	LoanSymbol        string   `json:"loan_symbol"`
-	LoanAddress       string   `json:"loan_address"`
-	CollateralSymbol  string   `json:"collateral_symbol"`
-	CollateralAddress string   `json:"collateral_address"`
-	LLTV              string   `json:"lltv"`
-	SupplyUSD         float64  `json:"supply_usd"`
-	BorrowUSD         float64  `json:"borrow_usd"`
-	CollateralUSD     float64  `json:"collateral_usd"`
-	Selectors         []string `json:"selectors"`
-	Reason            string   `json:"reason"`
+	Rank                 int      `json:"rank"`
+	MarketID             string   `json:"market_id"`
+	Oracle               string   `json:"oracle"`
+	OracleType           string   `json:"oracle_type"`
+	Warnings             []string `json:"warnings,omitempty"`
+	Listed               bool     `json:"listed"`
+	LoanSymbol           string   `json:"loan_symbol"`
+	LoanAddress          string   `json:"loan_address"`
+	CollateralSymbol     string   `json:"collateral_symbol"`
+	CollateralName       string   `json:"collateral_name"`
+	CollateralAddress    string   `json:"collateral_address"`
+	CollateralSelectors  []string `json:"collateral_selectors"`
+	LLTV                 string   `json:"lltv"`
+	SupplyUSD            float64  `json:"supply_usd"`
+	BorrowUSD            float64  `json:"borrow_usd"`
+	CollateralUSD        float64  `json:"collateral_usd"`
+	Selectors            []string `json:"selectors"`
+	Reason               string   `json:"reason"`
 }
 
 type OperationalProperty struct {
@@ -89,10 +93,10 @@ type RunMetadata struct {
 }
 
 type Report struct {
-	Metadata              RunMetadata              `json:"metadata"`
-	ConfirmedMarkets      []MarketReport           `json:"confirmed_markets"`
-	SuspectedMarkets      []SuspectedMarketReport  `json:"suspected_markets"`
-	OperationalProperties []OperationalProperty    `json:"operational_properties"`
+	Metadata              RunMetadata             `json:"metadata"`
+	ConfirmedMarkets      []MarketReport          `json:"confirmed_markets"`
+	SuspectedMarkets      []SuspectedMarketReport `json:"suspected_markets"`
+	OperationalProperties []OperationalProperty   `json:"operational_properties"`
 }
 
 // ---------- Entry point ----------
@@ -130,7 +134,7 @@ func BuildReport(
 		suspectedReports[i].Rank = i + 1
 	}
 
-	meta.SchemaVersion = "3.1"
+	meta.SchemaVersion = "4.0"
 	meta.Timestamp = time.Now().UTC().Format(time.RFC3339)
 
 	return &Report{
@@ -144,50 +148,56 @@ func BuildReport(
 func toReport(cm ConfirmedMarket) MarketReport {
 	m := cm.Market
 	return MarketReport{
-		MarketID:          m.MarketID,
-		Oracle:            m.Oracle.Hex(),
-		OracleType:        m.OracleType,
-		Warnings:          m.Warnings,
-		Listed:            m.Listed,
-		LoanSymbol:        m.LoanAsset.Symbol,
-		LoanAddress:       m.LoanAsset.Address.Hex(),
-		CollateralSymbol:  m.CollateralAsset.Symbol,
-		CollateralAddress: m.CollateralAsset.Address.Hex(),
-		LLTV:              m.LLTV,
-		SupplyUSD:         m.SupplyUSD,
-		BorrowUSD:         m.BorrowUSD,
-		CollateralUSD:     m.CollateralUSD,
-		PoolAddress:       cm.Pool.Hex(),
-		PoolKind:          cm.PoolKind,
-		PriceBefore:       cm.PriceBefore.String(),
-		PriceAfter:        cm.PriceAfter.String(),
-		DeltaPct:          cm.DeltaPct,
-		Selectors:         m.Selectors,
-		Evidence:          cm.Evidence,
+		MarketID:            m.MarketID,
+		Oracle:              m.Oracle.Hex(),
+		OracleType:          m.OracleType,
+		Warnings:            m.Warnings,
+		Listed:              m.Listed,
+		LoanSymbol:          m.LoanAsset.Symbol,
+		LoanAddress:         m.LoanAsset.Address.Hex(),
+		CollateralSymbol:    m.CollateralAsset.Symbol,
+		CollateralName:      m.CollateralAsset.Name,
+		CollateralAddress:   m.CollateralAsset.Address.Hex(),
+		CollateralSelectors: m.CollateralSelectors,
+		LLTV:                m.LLTV,
+		SupplyUSD:           m.SupplyUSD,
+		BorrowUSD:           m.BorrowUSD,
+		CollateralUSD:       m.CollateralUSD,
+		PoolAddress:         cm.Pool.Hex(),
+		PoolKind:            cm.PoolKind,
+		PriceBefore:         cm.PriceBefore.String(),
+		PriceAfter:          cm.PriceAfter.String(),
+		DeltaPct:            cm.DeltaPct,
+		Selectors:           m.CollateralSelectors,
+		Evidence:            cm.Evidence,
 		Remediation: fmt.Sprintf(
-			"replace oracle at %s with a TWAP or Chainlink composite; AMM pool %s is manipulable",
-			m.Oracle.Hex(), cm.Pool.Hex()),
+			"replace collateral wrapper at %s with a version that uses a "+
+				"TWAP or Chainlink feed for internal valuation; AMM pool %s "+
+				"is manipulable",
+			m.CollateralAsset.Address.Hex(), cm.Pool.Hex()),
 	}
 }
 
 func toSuspectedReport(sm SuspectedMarket) SuspectedMarketReport {
 	m := sm.Market
 	return SuspectedMarketReport{
-		MarketID:          m.MarketID,
-		Oracle:            m.Oracle.Hex(),
-		OracleType:        m.OracleType,
-		Warnings:          m.Warnings,
-		Listed:            m.Listed,
-		LoanSymbol:        m.LoanAsset.Symbol,
-		LoanAddress:       m.LoanAsset.Address.Hex(),
-		CollateralSymbol:  m.CollateralAsset.Symbol,
-		CollateralAddress: m.CollateralAsset.Address.Hex(),
-		LLTV:              m.LLTV,
-		SupplyUSD:         m.SupplyUSD,
-		BorrowUSD:         m.BorrowUSD,
-		CollateralUSD:     m.CollateralUSD,
-		Selectors:         m.Selectors,
-		Reason:            sm.Reason,
+		MarketID:            m.MarketID,
+		Oracle:              m.Oracle.Hex(),
+		OracleType:          m.OracleType,
+		Warnings:            m.Warnings,
+		Listed:              m.Listed,
+		LoanSymbol:          m.LoanAsset.Symbol,
+		LoanAddress:         m.LoanAsset.Address.Hex(),
+		CollateralSymbol:    m.CollateralAsset.Symbol,
+		CollateralName:      m.CollateralAsset.Name,
+		CollateralAddress:   m.CollateralAsset.Address.Hex(),
+		CollateralSelectors: m.CollateralSelectors,
+		LLTV:                m.LLTV,
+		SupplyUSD:           m.SupplyUSD,
+		BorrowUSD:           m.BorrowUSD,
+		CollateralUSD:       m.CollateralUSD,
+		Selectors:           m.CollateralSelectors,
+		Reason:              sm.Reason,
 	}
 }
 
@@ -219,10 +229,10 @@ func callBig(
 // ---------- Rendering ----------
 
 func RenderText(w io.Writer, r *Report) {
-	fmt.Fprintf(w, "=== MORPHO SPOT-AMM ORACLE SCAN ===\n")
+	fmt.Fprintf(w, "=== MORPHO COLLATERAL WRAPPER SCAN ===\n")
 	fmt.Fprintf(w, "Chain %d  Block %d  %s\n",
 		r.Metadata.ChainID, r.Metadata.BlockNumber, r.Metadata.Timestamp)
-	fmt.Fprintf(w, "API markets: %d   suspicious oracles: %d   unique: %d   shortlisted: %d   confirmed: %d   suspected: %d\n\n",
+	fmt.Fprintf(w, "API markets: %d   suspicious: %d   unique collateral: %d   shortlisted: %d   confirmed: %d   suspected: %d\n\n",
 		r.Metadata.MarketsFromAPI, r.Metadata.SuspiciousOracles,
 		r.Metadata.UniqueOracles, r.Metadata.MarketsShortlisted,
 		r.Metadata.ConfirmedCount, r.Metadata.SuspectedCount)
@@ -234,18 +244,21 @@ func RenderText(w io.Writer, r *Report) {
 	for _, m := range r.ConfirmedMarkets {
 		fmt.Fprintf(w, "\n[%d] %s / %s   supply=$%.0f  borrow=$%.0f\n",
 			m.Rank, m.CollateralSymbol, m.LoanSymbol, m.SupplyUSD, m.BorrowUSD)
-		fmt.Fprintf(w, "     Market:     %s\n", m.MarketID)
-		fmt.Fprintf(w, "     Oracle:     %s  (%s, listed=%v)\n",
+		fmt.Fprintf(w, "     Market:      %s\n", m.MarketID)
+		fmt.Fprintf(w, "     Collateral:  %s (%s) at %s\n",
+			m.CollateralName, m.CollateralSymbol, m.CollateralAddress)
+		fmt.Fprintf(w, "     Oracle:      %s  (%s, listed=%v)\n",
 			m.Oracle, m.OracleType, m.Listed)
 		if len(m.Warnings) > 0 {
-			fmt.Fprintf(w, "     Warnings:   %s\n", strings.Join(m.Warnings, ", "))
+			fmt.Fprintf(w, "     Warnings:    %s\n", strings.Join(m.Warnings, ", "))
 		}
-		fmt.Fprintf(w, "     LLTV:       %s\n", m.LLTV)
-		fmt.Fprintf(w, "     Pool:       %s (%s)\n", m.PoolAddress, m.PoolKind)
-		fmt.Fprintf(w, "     Selectors:  %s\n", strings.Join(m.Selectors, ", "))
-		fmt.Fprintf(w, "     Delta:      %.2f%%\n", m.DeltaPct)
-		fmt.Fprintf(w, "     Evidence:   %s\n", m.Evidence)
-		fmt.Fprintf(w, "     Remediate:  %s\n", m.Remediation)
+		fmt.Fprintf(w, "     LLTV:        %s\n", m.LLTV)
+		fmt.Fprintf(w, "     Pool:        %s (%s)\n", m.PoolAddress, m.PoolKind)
+		fmt.Fprintf(w, "     Selectors:   %s\n",
+			strings.Join(m.CollateralSelectors, ", "))
+		fmt.Fprintf(w, "     Delta:       %.2f%%\n", m.DeltaPct)
+		fmt.Fprintf(w, "     Evidence:    %s\n", m.Evidence)
+		fmt.Fprintf(w, "     Remediate:   %s\n", m.Remediation)
 	}
 
 	if len(r.SuspectedMarkets) > 0 {
@@ -254,14 +267,17 @@ func RenderText(w io.Writer, r *Report) {
 		for _, m := range r.SuspectedMarkets {
 			fmt.Fprintf(w, "\n[%d] %s / %s   supply=$%.0f  borrow=$%.0f\n",
 				m.Rank, m.CollateralSymbol, m.LoanSymbol, m.SupplyUSD, m.BorrowUSD)
-			fmt.Fprintf(w, "     Market:     %s\n", m.MarketID)
-			fmt.Fprintf(w, "     Oracle:     %s  (%s, listed=%v)\n",
+			fmt.Fprintf(w, "     Market:      %s\n", m.MarketID)
+			fmt.Fprintf(w, "     Collateral:  %s (%s) at %s\n",
+				m.CollateralName, m.CollateralSymbol, m.CollateralAddress)
+			fmt.Fprintf(w, "     Oracle:      %s  (%s, listed=%v)\n",
 				m.Oracle, m.OracleType, m.Listed)
 			if len(m.Warnings) > 0 {
-				fmt.Fprintf(w, "     Warnings:   %s\n", strings.Join(m.Warnings, ", "))
+				fmt.Fprintf(w, "     Warnings:    %s\n", strings.Join(m.Warnings, ", "))
 			}
-			fmt.Fprintf(w, "     Selectors:  %s\n", strings.Join(m.Selectors, ", "))
-			fmt.Fprintf(w, "     Reason:     %s\n", m.Reason)
+			fmt.Fprintf(w, "     Selectors:   %s\n",
+				strings.Join(m.CollateralSelectors, ", "))
+			fmt.Fprintf(w, "     Reason:      %s\n", m.Reason)
 		}
 	}
 
