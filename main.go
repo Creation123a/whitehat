@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
 )
@@ -27,20 +26,18 @@ func main() {
 }
 
 func run() int {
-	// ---------- Flags ----------
-
 	fs := flag.NewFlagSet("scanner", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
 	var (
-		rpcURL       = fs.String("rpc", "", "pre-running RPC URL; skips Anvil spawn")
-		forkURL      = fs.String("fork-url", "", "Base RPC URL to fork (required unless --rpc)")
-		forkBlock    = fs.Uint64("fork-block", 0, "pinned fork block number (required unless --rpc)")
-		anvilBin     = fs.String("anvil", "anvil", "path to anvil binary")
-		anvilPort    = fs.Int("anvil-port", 8545, "anvil listen port")
-		outPath      = fs.String("out", "", "output file (default stdout)")
-		format       = fs.String("format", "text", "output format: text | json")
-		timeout      = fs.Duration("timeout", 15*time.Minute, "pipeline timeout")
+		rpcURL    = fs.String("rpc", "", "pre-running RPC URL; skips Anvil spawn")
+		forkURL   = fs.String("fork-url", "", "Base RPC URL to fork (required unless --rpc)")
+		forkBlock = fs.Uint64("fork-block", 0, "pinned fork block number (required unless --rpc)")
+		anvilBin  = fs.String("anvil", "anvil", "path to anvil binary")
+		anvilPort = fs.Int("anvil-port", 8545, "anvil listen port")
+		outPath   = fs.String("out", "", "output file (default stdout)")
+		format    = fs.String("format", "text", "output format: text | json")
+		timeout   = fs.Duration("timeout", 15*time.Minute, "pipeline timeout")
 	)
 
 	opsF := registerOpsFlags(fs)
@@ -49,10 +46,6 @@ func run() int {
 		return 1
 	}
 
-	// ---------- Signal handling ----------
-
-	// Root context cancelled on SIGINT/SIGTERM. Anvil teardown runs on
-	// the way out regardless.
 	rootCtx, cancelRoot := context.WithCancel(context.Background())
 	defer cancelRoot()
 
@@ -88,7 +81,6 @@ func run() int {
 			fmt.Fprintf(os.Stderr, "scanner: anvil start: %v\n", err)
 			return 1
 		}
-		// Defer teardown: kill, then wait so we do not leak a zombie.
 		defer func() {
 			if anvil.Process == nil {
 				return
@@ -133,12 +125,6 @@ func run() int {
 		return 1
 	}
 
-	// Confirm the two hardcoded protocol addresses are populated.
-	if (MorphoBlueAddress == common.Address{}) && (AaveV3PoolAddress == common.Address{}) {
-		fmt.Fprintln(os.Stderr, "scanner: config: MorphoBlueAddress and AaveV3PoolAddress are both unset; fill in config.go")
-		return 1
-	}
-
 	// ---------- Pipeline ----------
 
 	runCtx, cancelRun := context.WithTimeout(rootCtx, *timeout)
@@ -152,36 +138,38 @@ func run() int {
 
 	log.Printf("scanner: forked at block %d, chain %d", blockNum, chainID.Int64())
 
-	candidates, err := Discover(runCtx, client)
+	// Stage 1: inventory + suspicious-oracle filter, via Morpho API.
+	markets, err := Discover(runCtx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scanner: discovery: %v\n", err)
 		return 2
 	}
-	log.Printf("scanner: %d candidates after EOA filter", len(candidates))
+	log.Printf("scanner: %d suspicious markets from API", len(markets))
 
-	suspected := AnalyzeCandidates(runCtx, client, candidates)
-	log.Printf("scanner: %d SPOT_DEPENDENT (suspected)", len(suspected))
+	uniqueOracles := len(UniqueOracles(markets))
+	log.Printf("scanner: %d unique oracles", uniqueOracles)
 
-		results := Simulate(runCtx, client, rpcClient, suspected)
+	// Stage 2: bytecode triage.
+	shortlist := TriageOracles(runCtx, client, markets)
+	log.Printf("scanner: %d shortlisted markets", len(shortlist))
 
-	confirmedCount := 0
-	for _, f := range results {
-		if f.Verified {
-			confirmedCount++
-		}
-	}
-	log.Printf("scanner: %d suspected, %d confirmed", len(suspected), confirmedCount)
+	// Stage 3: fork confirmation.
+	confirmed := Simulate(runCtx, client, rpcClient, shortlist)
+	log.Printf("scanner: %d confirmed", len(confirmed))
 
 	meta := RunMetadata{
-		ChainID:        chainID.Int64(),
-		BlockNumber:    blockNum,
-		CandidateCount: len(candidates),
-		FalsePositives: len(suspected) - confirmedCount,
+		ChainID:            chainID.Int64(),
+		BlockNumber:        blockNum,
+		MarketsFromAPI:     len(markets),
+		SuspiciousOracles:  len(markets),
+		UniqueOracles:      uniqueOracles,
+		MarketsShortlisted: len(shortlist),
+		ConfirmedCount:     len(confirmed),
 	}
 
 	ops := DefaultOperationalProperties(opsF.toPresent())
 
-	rep, err := BuildReport(runCtx, client, meta, results, ops)
+	rep, err := BuildReport(runCtx, client, meta, confirmed, ops)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scanner: build report: %v\n", err)
 		return 2
@@ -192,16 +180,12 @@ func run() int {
 
 // ---------- RPC readiness ----------
 
-// dialReady polls until the endpoint answers eth_chainId and reports
-// the required chain, or until ctx expires. Anvil takes a variable
-// amount of time to fork depending on the upstream RPC.
 func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
 	var lastErr error
 	ticker := time.NewTicker(anvilPollEvery)
 	defer ticker.Stop()
 
 	for {
-		// Try immediately on first iteration, then after each tick.
 		c, err := rpc.DialContext(ctx, url)
 		if err == nil {
 			var id string
