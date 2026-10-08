@@ -213,16 +213,37 @@ func simulateOne(
 
 // ---------- AMM pool discovery ----------
 
-// locateAMMPoolDual scans both the oracle and the collateral asset for
-// PUSH20 constants. Either may reference the AMM pool:
-//   - The oracle, if it directly reads spot reserves.
-//   - The collateral, if it computes its own value from spot reserves.
+// locateAMMPoolDual resolves the AMM pool an oracle reads from.
+//
+// Check order:
+//  1. Is the collateral itself an AMM pool? (LP tokens used directly
+//     as collateral — Uniswap V2 LP, Aerodrome LP, etc.) If it
+//     answers getReserves() or slot0(), that's the pool.
+//  2. Scan the oracle's bytecode for PUSH20 pool references.
+//  3. Scan the collateral's bytecode for PUSH20 pool references.
 func locateAMMPoolDual(
 	ctx context.Context,
 	client *ethclient.Client,
 	oracle, collateral common.Address,
 ) (common.Address, string, error) {
 
+	// Case 1: collateral IS the pool.
+	if collateral != (common.Address{}) {
+		if _, err := callBig(ctx, client, collateral, SelGetReserves); err == nil {
+			if _, err := callBig(ctx, client, collateral, SelStable); err == nil {
+				return collateral, ammAerodromeV2, nil
+			}
+			return collateral, ammUniswapV2, nil
+		}
+		if _, err := callBig(ctx, client, collateral, SelSlot0); err == nil {
+			if _, err := callBig(ctx, client, collateral, SelFeeProtocol); err == nil {
+				return collateral, ammUniswapV3, nil
+			}
+			return collateral, ammAerodromeSlipstr, nil
+		}
+	}
+
+	// Case 2 & 3: scan oracle then collateral for PUSH20 references.
 	for _, target := range []common.Address{oracle, collateral} {
 		if target == (common.Address{}) {
 			continue
