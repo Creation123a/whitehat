@@ -25,7 +25,7 @@ type AssetInfo struct {
 type MorphoMarket struct {
 	MarketID        string
 	Oracle          common.Address
-	OracleType      string   // "Chainlink" | "ChainlinkV2" | "Custom"
+	OracleType      string   // "ChainlinkOracleV2" | "Unknown"
 	Warnings        []string // warning type strings
 	Listed          bool
 	LoanAsset       AssetInfo
@@ -46,9 +46,46 @@ type gqlRequest struct {
 	Variables map[string]any `json:"variables"`
 }
 
+// FlexString unmarshals from either a JSON string or a JSON number.
+// The Morpho API returns lltv as a string for live markets ("860000000000000000")
+// but as a number for idle markets (0).
+type FlexString string
+
+func (f *FlexString) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 || string(b) == "null" {
+		*f = ""
+		return nil
+	}
+	if b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		*f = FlexString(s)
+		return nil
+	}
+	*f = FlexString(string(b))
+	return nil
+}
+
 type gqlOracle struct {
 	Address string `json:"address"`
 	Type    string `json:"type"`
+	// Data is only returned for ChainlinkOracle and ChainlinkOracleV2 types.
+	// See: https://docs.morpho.org/tools/offchain/api/morpho/ [citation:1]
+	Data *gqlOracleData `json:"data,omitempty"`
+}
+
+// gqlOracleData contains feed composition for Chainlink-type oracles.
+// We query it to detect misconfigured Chainlink feeds (e.g., wrong decimals).
+type gqlOracleData struct {
+	// On MorphoChainlinkOracleV2Data
+	BaseFeed1         *string `json:"baseFeed1,omitempty"`
+	BaseFeed2         *string `json:"baseFeed2,omitempty"`
+	QuoteFeed1        *string `json:"quoteFeed1,omitempty"`
+	QuoteFeed2        *string `json:"quoteFeed2,omitempty"`
+	BaseTokenDecimals *int    `json:"baseTokenDecimals,omitempty"`
+	QuoteTokenDecimals *int   `json:"quoteTokenDecimals,omitempty"`
 }
 
 type gqlWarning struct {
@@ -63,13 +100,13 @@ type gqlAsset struct {
 }
 
 type gqlMarketItem struct {
-	MarketID        string      `json:"marketId"`
-	LLTV            string      `json:"lltv"`
-	Listed          bool        `json:"listed"`
-	Oracle          *gqlOracle  `json:"oracle"`
+	MarketID        string       `json:"marketId"`
+	LLTV            FlexString   `json:"lltv"`
+	Listed          bool         `json:"listed"`
+	Oracle          *gqlOracle   `json:"oracle"`
 	Warnings        []gqlWarning `json:"warnings"`
-	LoanAsset       gqlAsset    `json:"loanAsset"`
-	CollateralAsset *gqlAsset   `json:"collateralAsset"`
+	LoanAsset       gqlAsset     `json:"loanAsset"`
+	CollateralAsset *gqlAsset    `json:"collateralAsset"`
 	State           struct {
 		BorrowAssetsUsd     float64 `json:"borrowAssetsUsd"`
 		CollateralAssetsUsd float64 `json:"collateralAssetsUsd"`
@@ -97,7 +134,7 @@ const morphoMarketsQuery = `query($first: Int!, $skip: Int!) {
       marketId
       lltv
       listed
-      oracle { address type }
+      oracle { address type data { baseFeed1 baseFeed2 quoteFeed1 quoteFeed2 baseTokenDecimals quoteTokenDecimals } }
       warnings { type level }
       loanAsset { address symbol decimals }
       collateralAsset { address symbol decimals }
@@ -111,8 +148,8 @@ const morphoMarketsQuery = `query($first: Int!, $skip: Int!) {
 }`
 
 // Discover pulls every Morpho Blue market on Base, keeps only those
-// whose oracle is Custom or carries a warning flag, and returns them.
-// No TVL filter — TVL is a sort key in the report.
+// whose oracle is not Morpho's recognized Chainlink reference, and
+// returns them. No TVL filter — TVL is a sort key in the report.
 func Discover(ctx context.Context) ([]MorphoMarket, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	var all []MorphoMarket
@@ -121,7 +158,7 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 		if err := ctx.Err(); err != nil {
 			return all, err
 		}
-				reqBody, _ := json.Marshal(gqlRequest{
+		reqBody, _ := json.Marshal(gqlRequest{
 			Query: morphoMarketsQuery,
 			Variables: map[string]any{
 				"first": 100,
@@ -177,7 +214,7 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 				OracleType: it.Oracle.Type,
 				Warnings:   warnTypes,
 				Listed:     it.Listed,
-				LLTV:       it.LLTV,
+				LLTV:       string(it.LLTV),
 				LoanAsset: AssetInfo{
 					Address:  common.HexToAddress(it.LoanAsset.Address),
 					Symbol:   it.LoanAsset.Symbol,
@@ -202,24 +239,6 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 	return all, nil
 }
 
-// isSuspiciousOracle returns true when the oracle is not a
-// Chainlink-composed reference implementation, or when Morpho's own
-// risk engine flags it.
-//
-// VERIFY the exact warning type strings against the live API before
-// trusting this filter. If the API uses different casing or separators,
-// no market will match and the pipeline will return zero candidates.
-// isSuspiciousOracle returns true when the oracle is not a
-// Chainlink-composed reference implementation, or when Morpho's own
-// risk engine flags it.
-//
-// Matching is case- and separator-insensitive so it tolerates any of:
-//   "unrecognized_oracle", "UNRECOGNIZED_ORACLE", "oracle-unrecognized"
-//   "hardcoded_oracle_feed", "HARDCODED_FEED", "hardcodedFeed"
-// Substring matching is used because the exact API taxonomy may change
-// without notice. If the API introduces a new suspicious warning that
-// contains "unrecognized" / "hardcoded" / "incompatible", it will be
-// caught automatically.
 // isSuspiciousOracle returns true when the oracle is not Morpho's
 // recognized Chainlink reference implementation, or when the API flags
 // a price derivation problem on an otherwise-Chainlink oracle.
@@ -243,6 +262,7 @@ func isSuspiciousOracle(oracleType string, warnings []gqlWarning) bool {
 	}
 	return false
 }
+
 // UniqueOracles returns deduplicated oracle addresses.
 func UniqueOracles(markets []MorphoMarket) []common.Address {
 	seen := make(map[common.Address]struct{})
