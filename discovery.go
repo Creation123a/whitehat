@@ -212,24 +212,29 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 // without notice. If the API introduces a new suspicious warning that
 // contains "unrecognized" / "hardcoded" / "incompatible", it will be
 // caught automatically.
+// isSuspiciousOracle returns true when the oracle is not Morpho's
+// recognized Chainlink reference implementation, or when the API flags
+// a price derivation problem on an otherwise-Chainlink oracle.
+//
+// Verified against the live API on 2026-10-08. Actual taxonomies:
+//   oracle.type:  "ChainlinkOracleV2", "Unknown"
+//   warnings:     "not_whitelisted", "unrecognized_collateral_asset",
+//                 "sustained_low_liquidity", "bad_debt_unrealized",
+//                 "oracle_price_derivation"
 func isSuspiciousOracle(oracleType string, warnings []gqlWarning) bool {
-	// Oracle type: any variant of "Custom" (case-insensitive).
-	if strings.EqualFold(oracleType, "Custom") {
+	// Anything that isn't the reference oracle is worth bytecode triage.
+	if !strings.EqualFold(oracleType, "ChainlinkOracleV2") {
 		return true
 	}
+	// Chainlink oracle but the derived price doesn't match USD — flag.
+	// This is the case at market 0xff0f2bd5... in the diagnostic run.
 	for _, w := range warnings {
-		t := strings.ToLower(w.Type)
-		t = strings.ReplaceAll(t, "-", "_")
-		t = strings.ReplaceAll(t, " ", "_")
-		if strings.Contains(t, "unrecognized") ||
-			strings.Contains(t, "hardcoded") ||
-			strings.Contains(t, "incompatible") {
+		if strings.EqualFold(w.Type, "oracle_price_derivation") {
 			return true
 		}
 	}
 	return false
 }
-
 // UniqueOracles returns deduplicated oracle addresses.
 func UniqueOracles(markets []MorphoMarket) []common.Address {
 	seen := make(map[common.Address]struct{})
