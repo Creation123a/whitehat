@@ -138,7 +138,7 @@ func run() int {
 
 	log.Printf("scanner: forked at block %d, chain %d", blockNum, chainID.Int64())
 
-	// Stage 1: inventory + suspicious-oracle filter, via Morpho API.
+		// Stage 1: inventory + suspicious-oracle filter, via Morpho API.
 	markets, err := Discover(runCtx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scanner: discovery: %v\n", err)
@@ -153,9 +153,9 @@ func run() int {
 	shortlist := TriageOracles(runCtx, client, markets)
 	log.Printf("scanner: %d shortlisted markets", len(shortlist))
 
-	// Stage 3: fork confirmation.
-	confirmed := Simulate(runCtx, client, rpcClient, shortlist)
-	log.Printf("scanner: %d confirmed", len(confirmed))
+	// Stage 3: fork confirmation. Suspected list is the manual-review queue.
+	confirmed, suspected := Simulate(runCtx, client, rpcClient, shortlist)
+	log.Printf("scanner: %d confirmed, %d suspected", len(confirmed), len(suspected))
 
 	meta := RunMetadata{
 		ChainID:            chainID.Int64(),
@@ -165,19 +165,18 @@ func run() int {
 		UniqueOracles:      uniqueOracles,
 		MarketsShortlisted: len(shortlist),
 		ConfirmedCount:     len(confirmed),
+		SuspectedCount:     len(suspected),
 	}
 
 	ops := DefaultOperationalProperties(opsF.toPresent())
 
-	rep, err := BuildReport(runCtx, client, meta, confirmed, ops)
+	rep, err := BuildReport(runCtx, client, meta, confirmed, suspected, ops)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scanner: build report: %v\n", err)
 		return 2
 	}
 
 	return WriteReport(*outPath, *format, rep)
-}
-
 // ---------- RPC readiness ----------
 
 func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
