@@ -17,16 +17,18 @@ import (
 type AssetInfo struct {
 	Address  common.Address
 	Symbol   string
+	Name     string
 	Decimals uint8
 }
 
-// MorphoMarket is one market row, enriched with the API's oracle
-// classification and warnings. Populated by Discover.
+// MorphoMarket is one market row. The collateral asset is now the
+// primary object of interest — its bytecode is triaged, and its
+// internal pricing is the suspected vulnerability surface.
 type MorphoMarket struct {
 	MarketID        string
 	Oracle          common.Address
-	OracleType      string   // "ChainlinkOracleV2" | "Unknown"
-	Warnings        []string // warning type strings
+	OracleType      string
+	Warnings        []string
 	Listed          bool
 	LoanAsset       AssetInfo
 	CollateralAsset AssetInfo
@@ -35,8 +37,32 @@ type MorphoMarket struct {
 	CollateralUSD   float64
 	SupplyUSD       float64
 
-	// Populated by TriageOracles in analysis.go.
-	Selectors []string
+	// Populated by TriageCollateral in analysis.go.
+	CollateralSelectors []string
+}
+
+// ---------- Baseline assets (not suspicious) ----------
+
+// baselineAssets are the standard, non-wrapped tokens that the scanner
+// treats as safe collateral. Anything not in this set is flagged as
+// a potential wrapper or complex collateral asset.
+//
+// Base mainnet addresses, verified 2026-10-08.
+var baselineAssets = map[common.Address]bool{
+	common.HexToAddress("0x4200000000000000000000000000000000000006"): true, // WETH
+	common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"): true, // USDC
+	common.HexToAddress("0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"): true, // USDbC
+	common.HexToAddress("0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"): true, // cbETH
+	common.HexToAddress("0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452"): true, // wstETH
+	common.HexToAddress("0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"): true, // cbBTC
+	common.HexToAddress("0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"): true, // DAI
+	common.HexToAddress("0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42"): true, // EURC
+}
+
+// wrapperPatterns are substrings that indicate a collateral asset is
+// a wrapper, vault share, LP token, or restaking derivative.
+var wrapperPatterns = []string{
+	"lp", "share", "vault", "slip", "lrt", "st", "w", "v",
 }
 
 // ---------- GraphQL wire types ----------
@@ -46,9 +72,6 @@ type gqlRequest struct {
 	Variables map[string]any `json:"variables"`
 }
 
-// FlexString unmarshals from either a JSON string or a JSON number.
-// The Morpho API returns lltv as a string for live markets ("860000000000000000")
-// but as a number for idle markets (0).
 type FlexString string
 
 func (f *FlexString) UnmarshalJSON(b []byte) error {
@@ -71,9 +94,6 @@ func (f *FlexString) UnmarshalJSON(b []byte) error {
 type gqlOracle struct {
 	Address string `json:"address"`
 	Type    string `json:"type"`
-	// Do NOT query 'data' here. OracleData is an interface.
-	// Its fields are only accessible via inline fragments on concrete types.
-	// Bytecode triage in analysis.go inspects the implementation directly.
 }
 
 type gqlWarning struct {
@@ -84,6 +104,7 @@ type gqlWarning struct {
 type gqlAsset struct {
 	Address  string `json:"address"`
 	Symbol   string `json:"symbol"`
+	Name     string `json:"name"`
 	Decimals int    `json:"decimals"`
 }
 
@@ -124,8 +145,8 @@ const morphoMarketsQuery = `query($first: Int!, $skip: Int!) {
       listed
       oracle { address type }
       warnings { type level }
-      loanAsset { address symbol decimals }
-      collateralAsset { address symbol decimals }
+      loanAsset { address symbol name decimals }
+      collateralAsset { address symbol name decimals }
       state {
         borrowAssetsUsd
         collateralAssetsUsd
@@ -136,8 +157,10 @@ const morphoMarketsQuery = `query($first: Int!, $skip: Int!) {
 }`
 
 // Discover pulls every Morpho Blue market on Base, keeps only those
-// whose oracle is not Morpho's recognized Chainlink reference, and
-// returns them. No TVL filter — TVL is a sort key in the report.
+// whose collateral asset is a wrapper, vault share, LP token, or
+// non-baseline asset, and returns them sorted by supply USD descending.
+//
+// No TVL floor is applied. Sorting is done in the report.
 func Discover(ctx context.Context) ([]MorphoMarket, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	var all []MorphoMarket
@@ -181,13 +204,15 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 		}
 
 		for _, it := range items {
-			// Skip markets without oracle or collateral (idle markets).
 			if it.Oracle == nil || it.CollateralAsset == nil {
 				continue
 			}
 
-			// Primary filter — keep only suspicious oracles.
-			if !isSuspiciousOracle(it.Oracle.Type, it.Warnings) {
+			collAddr := common.HexToAddress(it.CollateralAsset.Address)
+
+			// Primary filter — keep only suspicious collateral.
+			if !isSuspiciousCollateral(collAddr,
+				it.CollateralAsset.Symbol, it.CollateralAsset.Name) {
 				continue
 			}
 
@@ -206,11 +231,13 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 				LoanAsset: AssetInfo{
 					Address:  common.HexToAddress(it.LoanAsset.Address),
 					Symbol:   it.LoanAsset.Symbol,
+					Name:     it.LoanAsset.Name,
 					Decimals: uint8(it.LoanAsset.Decimals),
 				},
 				CollateralAsset: AssetInfo{
-					Address:  common.HexToAddress(it.CollateralAsset.Address),
+					Address:  collAddr,
 					Symbol:   it.CollateralAsset.Symbol,
+					Name:     it.CollateralAsset.Name,
 					Decimals: uint8(it.CollateralAsset.Decimals),
 				},
 				BorrowUSD:     it.State.BorrowAssetsUsd,
@@ -227,43 +254,34 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 	return all, nil
 }
 
-// isSuspiciousOracle returns true when the oracle is not Morpho's
-// recognized Chainlink reference implementation, or when the API flags
-// a price derivation problem on an otherwise-Chainlink oracle.
-//
-// Verified against the live API on 2026-10-08. Actual taxonomies:
-//   oracle.type:  "ChainlinkOracleV2", "Unknown"
-//   warnings:     "not_whitelisted", "unrecognized_collateral_asset",
-//                 "sustained_low_liquidity", "bad_debt_unrealized",
-//                 "oracle_price_derivation"
-func isSuspiciousOracle(oracleType string, warnings []gqlWarning) bool {
-	// Anything that isn't the reference oracle is worth bytecode triage.
-	if !strings.EqualFold(oracleType, "ChainlinkOracleV2") {
-		return true
-	}
-	// Chainlink oracle but the derived price doesn't match USD — flag.
-	// This is the case at market 0xff0f2bd5... in the diagnostic run.
-	for _, w := range warnings {
-		if strings.EqualFold(w.Type, "oracle_price_derivation") {
+// isSuspiciousCollateral flags a market's collateral as worth bytecode
+// triage when it matches a wrapper pattern OR is not a standard
+// baseline asset.
+func isSuspiciousCollateral(addr common.Address, symbol, name string) bool {
+	// Wrapper pattern match on symbol + name (case-insensitive).
+	s := strings.ToLower(symbol + " " + name)
+	for _, p := range wrapperPatterns {
+		if strings.Contains(s, p) {
 			return true
 		}
 	}
-	return false
+	// Not a baseline asset -> suspicious.
+	return !baselineAssets[addr]
 }
 
-// UniqueOracles returns deduplicated oracle addresses.
-func UniqueOracles(markets []MorphoMarket) []common.Address {
+// UniqueCollaterals returns deduplicated collateral addresses.
+func UniqueCollaterals(markets []MorphoMarket) []common.Address {
 	seen := make(map[common.Address]struct{})
 	var out []common.Address
 	for _, m := range markets {
-		if m.Oracle == (common.Address{}) {
+		if m.CollateralAsset.Address == (common.Address{}) {
 			continue
 		}
-		if _, ok := seen[m.Oracle]; ok {
+		if _, ok := seen[m.CollateralAsset.Address]; ok {
 			continue
 		}
-		seen[m.Oracle] = struct{}{}
-		out = append(out, m.Oracle)
+		seen[m.CollateralAsset.Address] = struct{}{}
+		out = append(out, m.CollateralAsset.Address)
 	}
 	return out
 }
