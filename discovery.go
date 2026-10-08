@@ -15,32 +15,50 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-// ---------- Constants ----------
-
-// getReservesList() selector on Aave V3 Pool.
-var selGetReservesList = []byte{0xd1, 0x94, 0x6d, 0xbc}
-
-// Transfer(address,address,uint256) event topic.
-var transferTopic = common.HexToHash(
-	"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
-)
-
-// CreateMarket(Id,MarketParams) event topic from Morpho Blue.
-// keccak256("CreateMarket(bytes32,(address,address,address,address,uint256))")
+// ---------- Event topics ----------
 //
-// VERIFY against the deployed Morpho Blue on Base before shipping.
-// A wrong topic yields zero logs and a silently empty Morpho path.
-var morphoCreateMarketTopic = common.HexToHash(
-	"0xac4b2400f169220b0c0afdde7a0b32e775ba727ea1cb30b35f935cdaab8683ac",
+// Aave V3 user events:
+//   cast keccak "Supply(address,address,address,uint256,uint16)"
+//   cast keccak "Borrow(address,address,address,uint256,uint8,uint256,uint16)"
+//
+// Morpho Blue user events:
+//   cast keccak "Supply(bytes32,address,address,uint256,uint256)"
+//   cast keccak "Borrow(bytes32,address,address,address,uint256,uint256)"
+//   cast keccak "SupplyCollateral(bytes32,address,address,uint256)"
+//
+// VERIFY all five hashes with cast before running. A wrong topic
+// silently yields zero candidates for that event.
+
+var (
+	aaveSupplyTopic = common.HexToHash(
+		"0x2b627736bca15cd5381dcf80b0bf11fd197d01a037c52b927a881a10fb73ba61")
+	aaveBorrowTopic = common.HexToHash(
+		"0xb3d084820fb1a9decffb176436bd02558d15f68fc2cd2ed89e3ac68d0e5d0f0e")
+
+	morphoSupplyTopic = common.HexToHash(
+		"0xedf8870433c83823eb071d3df1caa8d008f12f6440918c20d75a3602cda30fe0")
+	morphoBorrowTopic = common.HexToHash(
+		"0x570954540bed6b1304a87dfe815a5eda4a648f7097a16240dcd85c9b5fd42a43")
+	morphoSupplyCollateralTopic = common.HexToHash(
+		"0xa3b9472a1399e17e123f3c2e6586c23e504184d504de59cdaa2b375e880c6184")
 )
 
 const discoverWorkers = 1
 
+// eventSpec describes one event topic and the 0-based index of the
+// "user" address within its Topics array.
+type eventSpec struct {
+	topic         common.Hash
+	onBehalfTopic int
+}
+
 // ---------- Public entry point ----------
 
-// Discover enumerates candidate vault addresses from Aave V3 and Morpho
-// Blue on the chain the client points at, filters EOAs, and returns the
-// survivors tagged with their discovery provenance.
+// Discover enumerates user addresses of Aave V3 and Morpho Blue over the
+// discovery window. The user (onBehalfOf / onBehalf) is the address that
+// the protocol acts for — for a vault calling Aave, that is the vault.
+// Filters out EOAs so only contracts ("protocols built on Aave/Morpho")
+// survive.
 func Discover(ctx context.Context, client *ethclient.Client) ([]Candidate, error) {
 	head, err := client.BlockNumber(ctx)
 	if err != nil {
@@ -51,25 +69,26 @@ func Discover(ctx context.Context, client *ethclient.Client) ([]Candidate, error
 		client:    client,
 		head:      head,
 		blocklist: defaultBlocklist(),
-		seen:      make(map[common.Address]Candidate),
+		seen:      make(map[candidateKey]Candidate),
 	}
 
-	// Aave path.
-	aaveTokens, err := d.aaveUnderlyings(ctx)
-	if err != nil {
-		log.Printf("discovery: aave enumeration failed: %v", err)
+	// Aave users.
+	aaveSpecs := []eventSpec{
+		{topic: aaveSupplyTopic, onBehalfTopic: 2},
+		{topic: aaveBorrowTopic, onBehalfTopic: 2},
 	}
-	if err := d.scanTransfers(ctx, aaveTokens, "aave", AaveV3PoolAddress); err != nil {
-		log.Printf("discovery: aave transfer scan failed: %v", err)
+	if err := d.scanProtocolUsers(ctx, AaveV3PoolAddress, "aave", aaveSpecs); err != nil {
+		log.Printf("discovery: aave user scan failed: %v", err)
 	}
 
-	// Morpho path.
-	morphoTokens, err := d.morphoUnderlyings(ctx)
-	if err != nil {
-		log.Printf("discovery: morpho enumeration failed: %v", err)
+	// Morpho users.
+	morphoSpecs := []eventSpec{
+		{topic: morphoSupplyTopic, onBehalfTopic: 3},
+		{topic: morphoBorrowTopic, onBehalfTopic: 2},
+		{topic: morphoSupplyCollateralTopic, onBehalfTopic: 3},
 	}
-	if err := d.scanTransfers(ctx, morphoTokens, "morpho", MorphoBlueAddress); err != nil {
-		log.Printf("discovery: morpho transfer scan failed: %v", err)
+	if err := d.scanProtocolUsers(ctx, MorphoBlueAddress, "morpho", morphoSpecs); err != nil {
+		log.Printf("discovery: morpho user scan failed: %v", err)
 	}
 
 	return d.filterAndEmit(ctx), nil
@@ -77,12 +96,17 @@ func Discover(ctx context.Context, client *ethclient.Client) ([]Candidate, error
 
 // ---------- State ----------
 
+type candidateKey struct {
+	address  common.Address
+	protocol string
+}
+
 type discovery struct {
 	client *ethclient.Client
 	head   uint64
 
 	blocklist map[common.Address]struct{}
-	seen      map[common.Address]Candidate
+	seen      map[candidateKey]Candidate
 }
 
 func defaultBlocklist() map[common.Address]struct{} {
@@ -92,139 +116,57 @@ func defaultBlocklist() map[common.Address]struct{} {
 		AerodromePoolFactory:       {},
 		AerodromeRouter:            {},
 		AerodromeSlipstreamFactory: {},
-		// Add more routers as discovered:
-		//  - Uniswap Universal Router (Base)
-		//  - BaseSwap Router
-		//  - SushiSwap Router (Base)
 	}
 }
 
-// ---------- Aave enumeration ----------
+// ---------- User-event scan ----------
 
-func (d *discovery) aaveUnderlyings(ctx context.Context) ([]common.Address, error) {
-	raw, err := d.client.CallContract(ctx,
-		callMsgData(AaveV3PoolAddress, selGetReservesList), nil)
-	if err != nil {
-		return nil, fmt.Errorf("getReservesList: %w", err)
-	}
-	return decodeAddressArray(raw)
-}
-
-// ---------- Morpho enumeration ----------
-
-func (d *discovery) morphoUnderlyings(ctx context.Context) ([]common.Address, error) {
-	// Floor logic: if MorphoDeployBlock is set, scan from deployment.
-	// Otherwise bound to the BlockWindowSize window for RPC safety.
-	var from uint64
-	switch {
-	case MorphoDeployBlock > 0:
-		from = MorphoDeployBlock
-	case d.head > BlockWindowSize:
-		from = d.head - BlockWindowSize
-	default:
-		from = 0
-	}
-
-	q := ethereum.FilterQuery{
-		FromBlock: new(big.Int).SetUint64(from),
-		ToBlock:   new(big.Int).SetUint64(d.head),
-		Addresses: []common.Address{MorphoBlueAddress},
-		Topics:    [][]common.Hash{{morphoCreateMarketTopic}},
-	}
-	logs, err := d.filterLogsChunked(ctx, q)  // was: d.client.FilterLogs(ctx, q)
-	if err != nil {
-		return nil, fmt.Errorf("CreateMarket filter: %w", err)
-	}
-
-	tokens := make(map[common.Address]struct{})
-	for _, lg := range logs {
-		loan, collateral, err := decodeCreateMarket(lg)
-		if err != nil {
-			continue
-		}
-		if loan != (common.Address{}) {
-			tokens[loan] = struct{}{}
-		}
-		if collateral != (common.Address{}) {
-			tokens[collateral] = struct{}{}
-		}
-	}
-
-	out := make([]common.Address, 0, len(tokens))
-	for t := range tokens {
-		out = append(out, t)
-	}
-	return out, nil
-}
-
-// decodeCreateMarket extracts (loanToken, collateralToken) from a
-// CreateMarket log. Non-indexed data is MarketParams:
+// scanProtocolUsers queries the given user events on the protocol contract
+// over the discovery window, extracts the onBehalfOf / onBehalf address
+// from each event, and records it tagged with (protocol, pool).
 //
-//	[  0: 32] loanToken
-//	[ 32: 64] collateralToken
-//	[ 64: 96] oracle
-//	[ 96:128] irm
-//	[128:160] lltv
-func decodeCreateMarket(lg types.Log) (loan, collateral common.Address, err error) {
-	if len(lg.Data) < 32*5 {
-		return common.Address{}, common.Address{}, fmt.Errorf("short data: %d", len(lg.Data))
-	}
-	loan = common.BytesToAddress(lg.Data[12:32])
-	collateral = common.BytesToAddress(lg.Data[32+12 : 64])
-	return loan, collateral, nil
-}
-
-// ---------- Transfer scan ----------
-
-// scanTransfers queries Transfer logs for the given tokens over the
-// discovery window, extracts unique `to` addresses, and records them
-// tagged with (protocol, pool). First-seen wins when an address is
-// observed under multiple sources.
-func (d *discovery) scanTransfers(
+// A contract may appear under both "aave" and "morpho" if it uses both.
+func (d *discovery) scanProtocolUsers(
 	ctx context.Context,
-	tokens []common.Address,
+	protocolContract common.Address,
 	protocol string,
-	pool common.Address,
+	specs []eventSpec,
 ) error {
-	if len(tokens) == 0 {
-		return nil
-	}
-
 	from := uint64(0)
 	if d.head > BlockWindowSize {
 		from = d.head - BlockWindowSize
 	}
 
-	q := ethereum.FilterQuery{
-		FromBlock: new(big.Int).SetUint64(from),
-		ToBlock:   new(big.Int).SetUint64(d.head),
-		Addresses: tokens,
-		Topics:    [][]common.Hash{{transferTopic}},
-	}
-	logs, err := d.filterLogsChunked(ctx, q)  // was: d.client.FilterLogs(ctx, q)
-	if err != nil {
-		return fmt.Errorf("Transfer filter: %w", err)
-	}
+	for _, spec := range specs {
+		q := ethereum.FilterQuery{
+			FromBlock: new(big.Int).SetUint64(from),
+			ToBlock:   new(big.Int).SetUint64(d.head),
+			Addresses: []common.Address{protocolContract},
+			Topics:    [][]common.Hash{{spec.topic}},
+		}
+		logs, err := d.filterLogsChunked(ctx, q)
+		if err != nil {
+			return fmt.Errorf("event %s: %w", spec.topic.Hex(), err)
+		}
 
-	for _, lg := range logs {
-		if len(lg.Topics) < 3 {
-			continue
-		}
-		to := common.BytesToAddress(lg.Topics[2].Bytes()[12:])
-		if to == (common.Address{}) {
-			continue
-		}
-		if _, blocked := d.blocklist[to]; blocked {
-			continue
-		}
-		if _, isToken := d.blocklist[lg.Address]; isToken {
-			continue
-		}
-		if _, exists := d.seen[to]; !exists {
-			d.seen[to] = Candidate{
-				Address:  to,
-				Protocol: protocol,
-				Pool:     pool,
+		for _, lg := range logs {
+			if len(lg.Topics) <= spec.onBehalfTopic {
+				continue
+			}
+			user := common.BytesToAddress(lg.Topics[spec.onBehalfTopic].Bytes()[12:])
+			if user == (common.Address{}) {
+				continue
+			}
+			if _, blocked := d.blocklist[user]; blocked {
+				continue
+			}
+			key := candidateKey{address: user, protocol: protocol}
+			if _, exists := d.seen[key]; !exists {
+				d.seen[key] = Candidate{
+					Address:  user,
+					Protocol: protocol,
+					Pool:     protocolContract,
+				}
 			}
 		}
 	}
@@ -256,18 +198,18 @@ func (d *discovery) filterAndEmit(ctx context.Context) []Candidate {
 		}()
 	}
 
-		go func() {
+	go func() {
 		defer close(in)
-		// Sort keys so the pipeline is deterministic across runs at the
-		// same block. Without this, map iteration order randomizes which
-		// findings arrive first, and sortProtocols only breaks ties by
-		// TVL — equal-TVL findings would reorder between runs.
-		keys := make([]common.Address, 0, len(d.seen))
+		// Deterministic order: by address, then by protocol.
+		keys := make([]candidateKey, 0, len(d.seen))
 		for k := range d.seen {
 			keys = append(keys, k)
 		}
 		sort.Slice(keys, func(i, j int) bool {
-			return bytes.Compare(keys[i][:], keys[j][:]) < 0
+			if c := bytes.Compare(keys[i].address[:], keys[j].address[:]); c != 0 {
+				return c < 0
+			}
+			return keys[i].protocol < keys[j].protocol
 		})
 		for _, k := range keys {
 			c := d.seen[k]
@@ -291,29 +233,6 @@ func (d *discovery) filterAndEmit(ctx context.Context) []Candidate {
 	return result
 }
 
-// ---------- ABI helpers ----------
-
-// decodeAddressArray decodes an ABI-encoded address[] return value.
-func decodeAddressArray(raw []byte) ([]common.Address, error) {
-	if len(raw) < 64 {
-		return nil, fmt.Errorf("short address[] response: %d", len(raw))
-	}
-	off := new(big.Int).SetBytes(raw[:32]).Uint64()
-	if uint64(len(raw)) < off+32 {
-		return nil, fmt.Errorf("bad offset %d (len %d)", off, len(raw))
-	}
-	n := new(big.Int).SetBytes(raw[off : off+32]).Uint64()
-	need := off + 32 + n*32
-	if uint64(len(raw)) < need {
-		return nil, fmt.Errorf("array truncated: need %d, have %d", need, len(raw))
-	}
-	out := make([]common.Address, 0, n)
-	for i := uint64(0); i < n; i++ {
-		base := off + 32 + i*32
-		out = append(out, common.BytesToAddress(raw[base+12:base+32]))
-	}
-	return out, nil
-}
 // ---------- Chunked log filter ----------
 
 // filterLogsChunked splits a log query into chunk-sized ranges and merges
