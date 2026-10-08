@@ -8,54 +8,60 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-// ---------- Candidate ----------
-
-// Candidate is produced by discovery.go and consumed here.
-// Protocol and Pool carry the provenance needed to populate Finding.
-type Candidate struct {
-	Address  common.Address
-	Protocol string         // "morpho" | "aave"
-	Pool     common.Address // lending pool the candidate was discovered from
+// OracleVerdict is the static analysis result for one oracle.
+type OracleVerdict struct {
+	Oracle        common.Address
+	HasSpotRead   bool
+	HasRobustFeed bool
+	Selectors     []string
+	Whitelisted   bool
+	Shortlisted   bool
 }
 
-// ---------- Detection selectors ----------
+const triageWorkers = 4
 
-// selectors recognized during the bytecode scan.
-var detectorSelectors = map[[4]byte]string{
-	{0x09, 0x02, 0xf1, 0xac}: "getReserves()",    // Uniswap V2
-	{0x38, 0x50, 0xc7, 0xbd}: "slot0()",          // Uniswap V3
-	{0xfe, 0xaf, 0x96, 0x8c}: "latestRoundData()", // Chainlink
-	{0x88, 0x3b, 0xdb, 0xfd}: "observe()",        // Uniswap V3 TWAP
-}
-
-const analysisWorkers = 16
-
-// ---------- Entry point ----------
-
-// AnalyzeCandidates scans each candidate's runtime bytecode, applies the
-// SPOT_DEPENDENT classification rule, and returns only the findings that
-// pass. Non-SPOT_DEPENDENT candidates are silently dropped.
-func AnalyzeCandidates(
+// TriageOracles scans each market's oracle bytecode, keeps only markets
+// whose oracle reads spot AMM state and has no robust feed.
+func TriageOracles(
 	ctx context.Context,
 	client *ethclient.Client,
-	candidates []Candidate,
-) []Finding {
+	markets []MorphoMarket,
+) []MorphoMarket {
 
-	in := make(chan Candidate)
-	out := make(chan Finding)
+	verdicts := scanUniqueOracles(ctx, client, UniqueOracles(markets))
+
+	var out []MorphoMarket
+	for _, m := range markets {
+		v, ok := verdicts[m.Oracle]
+		if !ok || !v.Shortlisted {
+			continue
+		}
+		m.Selectors = v.Selectors
+		out = append(out, m)
+	}
+	return out
+}
+
+func scanUniqueOracles(
+	ctx context.Context,
+	client *ethclient.Client,
+	oracles []common.Address,
+) map[common.Address]OracleVerdict {
+
+	in := make(chan common.Address)
+	out := make(chan OracleVerdict)
 
 	var wg sync.WaitGroup
-	for i := 0; i < analysisWorkers; i++ {
+	for i := 0; i < triageWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for c := range in {
-				if f, ok := analyzeOne(ctx, client, c); ok {
-					select {
-					case out <- f:
-					case <-ctx.Done():
-						return
-					}
+			for o := range in {
+				v := triageOne(ctx, client, o)
+				select {
+				case out <- v:
+				case <-ctx.Done():
+					return
 				}
 			}
 		}()
@@ -63,9 +69,9 @@ func AnalyzeCandidates(
 
 	go func() {
 		defer close(in)
-		for _, c := range candidates {
+		for _, o := range oracles {
 			select {
-			case in <- c:
+			case in <- o:
 			case <-ctx.Done():
 				return
 			}
@@ -77,82 +83,68 @@ func AnalyzeCandidates(
 		close(out)
 	}()
 
-	var findings []Finding
-	for f := range out {
-		findings = append(findings, f)
+	m := make(map[common.Address]OracleVerdict)
+	for v := range out {
+		m[v.Oracle] = v
 	}
-	return findings
+	return m
 }
 
-// ---------- Per-candidate analysis ----------
-
-func analyzeOne(
+func triageOne(
 	ctx context.Context,
 	client *ethclient.Client,
-	c Candidate,
-) (Finding, bool) {
+	oracle common.Address,
+) OracleVerdict {
 
-	code, err := client.CodeAt(ctx, c.Address, nil)
+	v := OracleVerdict{Oracle: oracle}
+	code, err := client.CodeAt(ctx, oracle, nil)
 	if err != nil || len(code) == 0 {
-		return Finding{}, false
+		return v
 	}
 
-	hits := scanSelectors(code)
+	has := func(sel []byte) bool { return containsPUSH4(code, sel) }
 
-	// One-level call-graph expansion: EIP-1967 proxy implementation.
-	if impl, ok := readEIP1967Impl(ctx, client, c.Address); ok &&
-		impl != (common.Address{}) {
-		if implCode, err := client.CodeAt(ctx, impl, nil); err == nil && len(implCode) > 0 {
-			for name := range scanSelectors(implCode) {
-				hits[name] = true
-			}
-		}
+	if has(SelGetReserves) {
+		v.HasSpotRead = true
+		v.Selectors = append(v.Selectors, "getReserves()")
 	}
-
-	// Classification rule:
-	//   contains getReserves() OR slot0()
-	//   AND does NOT contain latestRoundData() OR observe()
-	if !hits["getReserves()"] && !hits["slot0()"] {
-		return Finding{}, false
+	if has(SelSlot0) {
+		v.HasSpotRead = true
+		v.Selectors = append(v.Selectors, "slot0()")
 	}
-	if hits["latestRoundData()"] || hits["observe()"] {
-		return Finding{}, false
+	if has(SelBalanceOf) && has(SelTotalSupply) {
+		v.HasSpotRead = true
+		v.Selectors = append(v.Selectors, "balanceOf()+totalSupply()")
 	}
-
-	// Deterministic selector order for the report.
-	var sels []string
-	if hits["getReserves()"] {
-		sels = append(sels, "getReserves()")
+	if has(SelLatestRound) {
+		v.HasRobustFeed = true
 	}
-	if hits["slot0()"] {
-		sels = append(sels, "slot0()")
+	if has(SelObserve) {
+		v.HasRobustFeed = true
 	}
 
-	return Finding{
-		Vault:     c.Address,
-		Protocol:  c.Protocol,
-		Pool:      c.Pool,
-		Selectors: sels,
-		// Verified and Evidence left zero — set by simulation.go.
-	}, true
+	if v.HasRobustFeed && !v.HasSpotRead {
+		v.Whitelisted = true
+	}
+
+	v.Shortlisted = v.HasSpotRead && !v.HasRobustFeed && !v.Whitelisted
+	return v
 }
 
-// ---------- Bytecode scan ----------
-
-// scanSelectors linearly scans runtime bytecode for PUSH4 <selector>.
-// It does not disassemble; it does not distinguish code from data.
-// This is intentional and matches the spec's classification rule.
-func scanSelectors(code []byte) map[string]bool {
-	found := make(map[string]bool)
+// containsPUSH4 reports whether the exact PUSH4 <selector> sequence
+// appears in the bytecode.
+func containsPUSH4(code, sel []byte) bool {
+	if len(sel) != 4 {
+		return false
+	}
 	for i := 0; i+5 <= len(code); i++ {
-		if code[i] != 0x63 { // PUSH4
+		if code[i] != 0x63 {
 			continue
 		}
-		var sel [4]byte
-		copy(sel[:], code[i+1:i+5])
-		if name, ok := detectorSelectors[sel]; ok {
-			found[name] = true
+		if code[i+1] == sel[0] && code[i+2] == sel[1] &&
+			code[i+3] == sel[2] && code[i+4] == sel[3] {
+			return true
 		}
 	}
-	return found
+	return false
 }
