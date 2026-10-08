@@ -8,9 +8,9 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-// OracleVerdict is the static analysis result for one oracle.
-type OracleVerdict struct {
-	Oracle        common.Address
+// CollateralVerdict is the static analysis result for one collateral asset.
+type CollateralVerdict struct {
+	Collateral    common.Address
 	HasSpotRead   bool
 	HasRobustFeed bool
 	Selectors     []string
@@ -18,46 +18,47 @@ type OracleVerdict struct {
 	Shortlisted   bool
 }
 
-const triageWorkers = 4
+const triageWorkers = 1
 
-// TriageOracles scans each market's oracle bytecode, keeps only markets
-// whose oracle reads spot AMM state and has no robust feed.
-func TriageOracles(
+// TriageCollateral scans each market's collateral asset bytecode, keeps
+// only markets whose collateral reads spot AMM state and has no robust
+// Chainlink/TWAP feed in its valuation path.
+func TriageCollateral(
 	ctx context.Context,
 	client *ethclient.Client,
 	markets []MorphoMarket,
 ) []MorphoMarket {
 
-	verdicts := scanUniqueOracles(ctx, client, UniqueOracles(markets))
+	verdicts := scanUniqueCollaterals(ctx, client, UniqueCollaterals(markets))
 
 	var out []MorphoMarket
 	for _, m := range markets {
-		v, ok := verdicts[m.Oracle]
+		v, ok := verdicts[m.CollateralAsset.Address]
 		if !ok || !v.Shortlisted {
 			continue
 		}
-		m.Selectors = v.Selectors
+		m.CollateralSelectors = v.Selectors
 		out = append(out, m)
 	}
 	return out
 }
 
-func scanUniqueOracles(
+func scanUniqueCollaterals(
 	ctx context.Context,
 	client *ethclient.Client,
-	oracles []common.Address,
-) map[common.Address]OracleVerdict {
+	collaterals []common.Address,
+) map[common.Address]CollateralVerdict {
 
 	in := make(chan common.Address)
-	out := make(chan OracleVerdict)
+	out := make(chan CollateralVerdict)
 
 	var wg sync.WaitGroup
 	for i := 0; i < triageWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for o := range in {
-				v := triageOne(ctx, client, o)
+			for c := range in {
+				v := triageOneCollateral(ctx, client, c)
 				select {
 				case out <- v:
 				case <-ctx.Done():
@@ -69,9 +70,9 @@ func scanUniqueOracles(
 
 	go func() {
 		defer close(in)
-		for _, o := range oracles {
+		for _, c := range collaterals {
 			select {
-			case in <- o:
+			case in <- c:
 			case <-ctx.Done():
 				return
 			}
@@ -83,21 +84,28 @@ func scanUniqueOracles(
 		close(out)
 	}()
 
-	m := make(map[common.Address]OracleVerdict)
+	m := make(map[common.Address]CollateralVerdict)
 	for v := range out {
-		m[v.Oracle] = v
+		m[v.Collateral] = v
 	}
 	return m
 }
 
-func triageOne(
+// triageOneCollateral scans the collateral asset's runtime bytecode for
+// spot AMM selectors. If it finds getReserves() or slot0(), or
+// balanceOf()+totalSupply(), the collateral computes its own value from
+// spot AMM state — that is the vulnerability we hunt.
+//
+// If it finds latestRoundData() or observe(), the collateral uses a
+// robust external feed and is discarded.
+func triageOneCollateral(
 	ctx context.Context,
 	client *ethclient.Client,
-	oracle common.Address,
-) OracleVerdict {
+	collateral common.Address,
+) CollateralVerdict {
 
-	v := OracleVerdict{Oracle: oracle}
-	code, err := client.CodeAt(ctx, oracle, nil)
+	v := CollateralVerdict{Collateral: collateral}
+	code, err := client.CodeAt(ctx, collateral, nil)
 	if err != nil || len(code) == 0 {
 		return v
 	}
@@ -131,8 +139,6 @@ func triageOne(
 	return v
 }
 
-// containsPUSH4 reports whether the exact PUSH4 <selector> sequence
-// appears in the bytecode.
 func containsPUSH4(code, sel []byte) bool {
 	if len(sel) != 4 {
 		return false
