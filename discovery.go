@@ -37,8 +37,9 @@ type MorphoMarket struct {
 	CollateralUSD   float64
 	SupplyUSD       float64
 
-	// Populated by TriageCollateral in analysis.go.
-	CollateralSelectors []string
+	// Populated by TriageOracles in analysis.go.
+	Selectors  []string
+	TracedPool common.Address
 }
 
 // ---------- Baseline assets (not suspicious) ----------
@@ -282,6 +283,22 @@ func UniqueCollaterals(markets []MorphoMarket) []common.Address {
 		}
 		seen[m.CollateralAsset.Address] = struct{}{}
 		out = append(out, m.CollateralAsset.Address)
+	}
+	return out
+}
+// UniqueOracles returns deduplicated oracle addresses.
+func UniqueOracles(markets []MorphoMarket) []common.Address {
+	seen := make(map[common.Address]struct{})
+	var out []common.Address
+	for _, m := range markets {
+		if m.Oracle == (common.Address{}) {
+			continue
+		}
+		if _, ok := seen[m.Oracle]; ok {
+			continue
+		}
+		seen[m.Oracle] = struct{}{}
+		out = append(out, m.Oracle)
 	}
 	return out
 }
