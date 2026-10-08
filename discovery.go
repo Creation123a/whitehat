@@ -42,7 +42,8 @@ type MorphoMarket struct {
 // ---------- GraphQL wire types ----------
 
 type gqlRequest struct {
-	Query string `json:"query"`
+	Query     string         `json:"query"`
+	Variables map[string]any `json:"variables"`
 }
 
 type gqlOracle struct {
@@ -120,7 +121,13 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 		if err := ctx.Err(); err != nil {
 			return all, err
 		}
-		reqBody, _ := json.Marshal(gqlRequest{Query: morphoMarketsQuery})
+				reqBody, _ := json.Marshal(gqlRequest{
+			Query: morphoMarketsQuery,
+			Variables: map[string]any{
+				"first": 100,
+				"skip":  skip,
+			},
+		})
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 			MorphoGraphQLURL, bytes.NewReader(reqBody))
 		if err != nil {
