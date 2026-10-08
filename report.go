@@ -158,7 +158,7 @@ func toReport(cm ConfirmedMarket) MarketReport {
 		CollateralSymbol:    m.CollateralAsset.Symbol,
 		CollateralName:      m.CollateralAsset.Name,
 		CollateralAddress:   m.CollateralAsset.Address.Hex(),
-		CollateralSelectors: m.CollateralSelectors,
+				CollateralSelectors: m.Selectors,
 		LLTV:                m.LLTV,
 		SupplyUSD:           m.SupplyUSD,
 		BorrowUSD:           m.BorrowUSD,
@@ -168,7 +168,7 @@ func toReport(cm ConfirmedMarket) MarketReport {
 		PriceBefore:         cm.PriceBefore.String(),
 		PriceAfter:          cm.PriceAfter.String(),
 		DeltaPct:            cm.DeltaPct,
-		Selectors:           m.CollateralSelectors,
+				Selectors:           m.Selectors,
 		Evidence:            cm.Evidence,
 		Remediation: fmt.Sprintf(
 			"replace collateral wrapper at %s with a version that uses a "+
