@@ -11,13 +11,6 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
-// ---------- Selectors (local to this file) ----------
-
-var (
-	selGetReserves = []byte{0x09, 0x02, 0xf1, 0xac} // getReserves()
-	selSlot0       = []byte{0x38, 0x50, 0xc7, 0xbd} // slot0()
-)
-
 // ---------- AMM kinds ----------
 
 const (
@@ -27,41 +20,14 @@ const (
 	ammAerodromeSlipstr = "aerodrome-slipstream"
 )
 
-// ---------- Storage slots ----------
-
-// Uniswap V2 / V2-fork packed reserves.
-// Layout: [reserve0:112][reserve1:112][blockTimestampLast:32] at slot 8.
 // ---------- Storage slots (sourced from config.go) ----------
 
-var slotUniswapV2Reserves = common.BigToHash(
-	big.NewInt(int64(SlotUniswapV2Reserves)),
+var (
+	slotUniswapV2Reserves        = common.BigToHash(big.NewInt(int64(SlotUniswapV2Reserves)))
+	slotUniswapV3Slot0           = common.BigToHash(big.NewInt(int64(SlotUniswapV3Slot0)))
+	slotAerodromeV2Reserve0      = common.BigToHash(big.NewInt(int64(SlotAerodromeV2Reserve0)))
+	slotAerodromeSlipstreamSlot0 = common.BigToHash(big.NewInt(int64(SlotAerodromeSlipstreamSlot0)))
 )
-
-var slotUniswapV3Slot0 = common.BigToHash(
-	big.NewInt(int64(SlotUniswapV3Slot0)),
-)
-
-var slotAerodromeV2Reserve0 = common.BigToHash(
-	big.NewInt(int64(SlotAerodromeV2Reserve0)),
-)
-
-var slotAerodromeV2Reserve1 = common.BigToHash(
-	big.NewInt(int64(SlotAerodromeV2Reserve1)),
-)
-
-var slotAerodromeSlipstreamSlot0 = common.BigToHash(
-	big.NewInt(int64(SlotAerodromeSlipstreamSlot0)),
-)
-// Aerodrome Slipstream slot0.
-//
-// Slipstream CLPool.sol is adapted from Uniswap V3 but drops
-// feeProtocol from slot0, so the packed layout is:
-//
-//	[sqrtPriceX96:160][tick:24][observationIndex:16]
-//	[observationCardinality:16][observationCardinalityNext:16][unlocked:8]
-//
-// The slot itself is still slot 0 (slot0 is the first declared state var).
-
 
 // ---------- Shift factors ----------
 
@@ -73,8 +39,6 @@ var (
 	shiftV3Den = big.NewInt(100)
 )
 
-var confirmThresholdBps = big.NewInt(50) // 0.50%
-
 // ---------- Bit masks ----------
 
 var (
@@ -82,17 +46,21 @@ var (
 	mask160 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 160), big.NewInt(1))
 )
 
-// ---------- Entry point ----------
+// ---------- ConfirmedMarket ----------
 
-// Simulate attempts to confirm each SPOT_DEPENDENT finding by shifting
-// the underlying AMM pool's reserves in Anvil state and observing
-// whether the vault's totalAssets() responds.
-//
-// All input findings are returned. Findings that confirmed are marked
-// Verified=true with Evidence populated. Findings that did not confirm
-// (no AMM pool resolvable, no totalAssets(), or totalAssets() stable
-// under reserve shift) pass through unmodified — the report classifies
-// them as SUSPECTED.
+// ConfirmedMarket carries the fork-verified evidence for one market.
+type ConfirmedMarket struct {
+	Market      MorphoMarket
+	Pool        common.Address
+	PoolKind    string
+	PriceBefore *big.Int
+	PriceAfter  *big.Int
+	DeltaPct    float64
+	Evidence    string
+}
+
+// Simulate runs the fork test on each shortlisted market. Returns only
+// markets where oracle.price() moved more than MinDeltaPct.
 //
 // Serial by design: Anvil state is global, and parallel mutations of
 // shared pools would corrupt each other's baselines.
@@ -100,53 +68,49 @@ func Simulate(
 	ctx context.Context,
 	client *ethclient.Client,
 	rpcClient *rpc.Client,
-	suspected []Finding,
-) []Finding {
+	shortlist []MorphoMarket,
+) []ConfirmedMarket {
 
-	out := make([]Finding, 0, len(suspected))
-	for i := range suspected {
-		f := suspected[i]
-		ok, ev := simulateOne(ctx, client, rpcClient, f)
-		if ok {
-			f.Verified = true
-			f.Evidence = ev
+	var confirmed []ConfirmedMarket
+	for i := range shortlist {
+		cm, ok := simulateOne(ctx, client, rpcClient, shortlist[i])
+		if !ok {
+			continue
 		}
-		out = append(out, f)
+		confirmed = append(confirmed, cm)
 	}
-	return out
+	return confirmed
 }
-// ---------- Per-finding simulation ----------
 
 func simulateOne(
 	ctx context.Context,
 	client *ethclient.Client,
 	rpcClient *rpc.Client,
-	f Finding,
-) (bool, string) {
+	m MorphoMarket,
+) (ConfirmedMarket, bool) {
 
-	pool, kind, err := locateAMMPool(ctx, client, f.Vault)
+	pool, kind, err := locateAMMPool(ctx, client, m.Oracle)
 	if err != nil {
-		log.Printf("simulate %s: locate AMM pool: %v", f.Vault.Hex(), err)
-		return false, ""
+		log.Printf("simulate %s: locate AMM pool: %v", m.Oracle.Hex(), err)
+		return ConfirmedMarket{}, false
 	}
 
-	base, err := callBig(ctx, client, f.Vault, selTotalAssets)
+	base, err := callBig(ctx, client, m.Oracle, SelPrice)
 	if err != nil || base.Sign() == 0 {
-		return false, ""
+		return ConfirmedMarket{}, false
 	}
 
 	snap, err := takeSnapshot(ctx, rpcClient)
 	if err != nil {
-		log.Printf("simulate %s: snapshot: %v", f.Vault.Hex(), err)
-		return false, ""
+		log.Printf("simulate %s: snapshot: %v", m.Oracle.Hex(), err)
+		return ConfirmedMarket{}, false
 	}
 	defer func() {
-    if err := revertSnapshot(context.Background(), rpcClient, snap); err != nil {
-        log.Printf("simulate %s: revert snapshot %s failed: %v", f.Vault.Hex(), snap, err)
-    }
-}()
-	// Dispatch on AMM kind. Each branch returns the mutated slot
-	// and value, or an error if the original state is unusable.
+		if err := revertSnapshot(context.Background(), rpcClient, snap); err != nil {
+			log.Printf("simulate %s: revert failed: %v", m.Oracle.Hex(), err)
+		}
+	}()
+
 	var (
 		slot    common.Hash
 		mutated common.Hash
@@ -158,110 +122,112 @@ func simulateOne(
 		slot = slotUniswapV2Reserves
 		original, err := readSlot(ctx, client, pool, slot)
 		if err != nil {
-			return false, ""
+			return ConfirmedMarket{}, false
 		}
 		mutated, label, err = shiftV2ReservesPacked(original, mask112, 112)
 		if err != nil {
-			return false, ""
+			return ConfirmedMarket{}, false
 		}
 
 	case ammUniswapV3:
 		slot = slotUniswapV3Slot0
 		original, err := readSlot(ctx, client, pool, slot)
 		if err != nil {
-			return false, ""
+			return ConfirmedMarket{}, false
 		}
 		mutated, label, err = shiftV3Slot0(original, mask160, 160)
 		if err != nil {
-			return false, ""
+			return ConfirmedMarket{}, false
 		}
 
 	case ammAerodromeV2:
-		// Aerodrome V2 reserves are uint256 in two separate slots.
-		// We mutate reserve0 only; reserve1 stays put.
 		slot = slotAerodromeV2Reserve0
 		original, err := readSlot(ctx, client, pool, slot)
 		if err != nil {
-			return false, ""
+			return ConfirmedMarket{}, false
 		}
 		mutated, label, err = shiftAerodromeV2Reserve0(original)
 		if err != nil {
-			return false, ""
+			return ConfirmedMarket{}, false
 		}
 
 	case ammAerodromeSlipstr:
 		slot = slotAerodromeSlipstreamSlot0
 		original, err := readSlot(ctx, client, pool, slot)
 		if err != nil {
-			return false, ""
+			return ConfirmedMarket{}, false
 		}
 		mutated, label, err = shiftSlipstreamSlot0(original)
 		if err != nil {
-			return false, ""
+			return ConfirmedMarket{}, false
 		}
 
 	default:
-		return false, ""
+		return ConfirmedMarket{}, false
 	}
 
 	if err := setStorage(ctx, rpcClient, pool, slot, mutated); err != nil {
-		log.Printf("simulate %s: setStorageAt: %v", f.Vault.Hex(), err)
-		return false, ""
+		log.Printf("simulate %s: setStorageAt: %v", m.Oracle.Hex(), err)
+		return ConfirmedMarket{}, false
 	}
 
-	after, err := callBig(ctx, client, f.Vault, selTotalAssets)
+	after, err := callBig(ctx, client, m.Oracle, SelPrice)
 	if err != nil {
-		return false, ""
+		return ConfirmedMarket{}, false
 	}
 
 	delta := new(big.Int).Sub(after, base)
 	absDelta := new(big.Int).Abs(delta)
-	bps := new(big.Int).Mul(absDelta, big.NewInt(10000))
-	bps.Div(bps, base)
+	pctF := new(big.Float).Quo(
+		new(big.Float).SetInt(absDelta),
+		new(big.Float).SetInt(base),
+	)
+	pctF.Mul(pctF, big.NewFloat(100))
+	pct, _ := pctF.Float64()
 
-	if bps.Cmp(confirmThresholdBps) <= 0 {
-		return false, ""
+	if pct < MinDeltaPct {
+		return ConfirmedMarket{}, false
 	}
 
-	pct := float64(bps.Int64()) / 100.0
 	evidence := fmt.Sprintf(
-		"totalAssets moved %.2f%% when %s (%s at %s); invariant tracks spot",
-		pct, label, kind, pool.Hex())
-	return true, evidence
+		"oracle.price() moved %.2f%% (%s → %s) when %s shifted (%s pool %s)",
+		pct, base.String(), after.String(), label, kind, pool.Hex())
+
+	return ConfirmedMarket{
+		Market:      m,
+		Pool:        pool,
+		PoolKind:    kind,
+		PriceBefore: base,
+		PriceAfter:  after,
+		DeltaPct:    pct,
+		Evidence:    evidence,
+	}, true
 }
 
 // ---------- AMM pool discovery ----------
 
-// locateAMMPool scans the vault's runtime bytecode for PUSH20 constants
-// and probes each candidate. Kind detection order matters: we check
-// getReserves() first, then slot0(). If a candidate answers getReserves()
-// we still need to distinguish Uniswap V2 from Aerodrome V2 — they share
-// the same selector. We do that by calling stable() (Aerodrome-only).
+// locateAMMPool scans the oracle's runtime bytecode for PUSH20 constants
+// and probes each. Returns the first AMM pool that responds.
 func locateAMMPool(
 	ctx context.Context,
 	client *ethclient.Client,
-	vault common.Address,
+	oracle common.Address,
 ) (common.Address, string, error) {
 
-	code, err := client.CodeAt(ctx, vault, nil)
+	code, err := client.CodeAt(ctx, oracle, nil)
 	if err != nil {
 		return common.Address{}, "", err
 	}
 
 	for _, addr := range extractPUSH20Candidates(code) {
-		// --- getReserves() path: Uniswap V2 or Aerodrome V2 ---
-		if _, err := callBig(ctx, client, addr, selGetReserves); err == nil {
-			if _, err := callBig(ctx, client, addr, selStable); err == nil {
+		if _, err := callBig(ctx, client, addr, SelGetReserves); err == nil {
+			if _, err := callBig(ctx, client, addr, SelStable); err == nil {
 				return addr, ammAerodromeV2, nil
 			}
 			return addr, ammUniswapV2, nil
 		}
-
-		// --- slot0() path: Uniswap V3 or Aerodrome Slipstream ---
-		if _, err := callBig(ctx, client, addr, selSlot0); err == nil {
-			// Distinguish by probe: Slipstream has no feeProtocol()
-			// in its ABI. If the call reverts, it's Slipstream.
-			if _, err := callBig(ctx, client, addr, selFeeProtocol); err == nil {
+		if _, err := callBig(ctx, client, addr, SelSlot0); err == nil {
+			if _, err := callBig(ctx, client, addr, SelFeeProtocol); err == nil {
 				return addr, ammUniswapV3, nil
 			}
 			return addr, ammAerodromeSlipstr, nil
@@ -270,17 +236,11 @@ func locateAMMPool(
 	return common.Address{}, "", fmt.Errorf("no AMM pool resolved")
 }
 
-// selStable and selFeeProtocol are used only for kind detection.
-var (
-	selStable      = []byte{0x22, 0xbe, 0x12, 0xe4} // stable()
-	selFeeProtocol = []byte{0x82, 0x06, 0xbc, 0x24} // feeProtocol()
-)
-
 func extractPUSH20Candidates(code []byte) []common.Address {
 	seen := make(map[common.Address]struct{})
 	var out []common.Address
 	for i := 0; i+21 <= len(code); i++ {
-		if code[i] != 0x73 { // PUSH20
+		if code[i] != 0x73 {
 			continue
 		}
 		addr := common.BytesToAddress(code[i+1 : i+21])
@@ -298,8 +258,6 @@ func extractPUSH20Candidates(code []byte) []common.Address {
 
 // ---------- Storage mutations ----------
 
-// shiftV2ReservesPacked handles Uniswap V2's packed 112/112/32 layout.
-// width parameter is 112 for Uniswap V2.
 func shiftV2ReservesPacked(
 	old common.Hash,
 	mask *big.Int,
@@ -311,22 +269,17 @@ func shiftV2ReservesPacked(
 	if reserve0.Sign() == 0 {
 		return common.Hash{}, "", fmt.Errorf("zero reserve0")
 	}
-
 	newReserve0 := new(big.Int).Mul(reserve0, shiftV2Num)
 	newReserve0.Div(newReserve0, shiftV2Den)
 	if newReserve0.BitLen() > int(width) {
 		return common.Hash{}, "", fmt.Errorf("reserve0 overflow")
 	}
-
 	cleared := new(big.Int).And(v, new(big.Int).Not(mask))
 	result := new(big.Int).Or(cleared, newReserve0)
-
 	pct := shiftV2Num.Int64() - 100
 	return common.BigToHash(result), fmt.Sprintf("+%d%% reserve0", pct), nil
 }
 
-// shiftAerodromeV2Reserve0 handles Aerodrome V2's uint256 reserve0.
-// No masking needed — the whole slot is the reserve.
 func shiftAerodromeV2Reserve0(old common.Hash) (common.Hash, string, error) {
 	v := new(big.Int).SetBytes(old.Bytes())
 	if v.Sign() == 0 {
@@ -334,13 +287,11 @@ func shiftAerodromeV2Reserve0(old common.Hash) (common.Hash, string, error) {
 	}
 	newReserve0 := new(big.Int).Mul(v, shiftV2Num)
 	newReserve0.Div(newReserve0, shiftV2Den)
-
 	pct := shiftV2Num.Int64() - 100
 	return common.BigToHash(newReserve0),
-		fmt.Sprintf("+%d%% aerodrome reserve0", pct), nil
+		fmt.Sprintf("+%d%% reserve0", pct), nil
 }
 
-// shiftV3Slot0 handles Uniswap V3's packed slot0.
 func shiftV3Slot0(
 	old common.Hash,
 	mask *big.Int,
@@ -354,20 +305,13 @@ func shiftV3Slot0(
 	}
 	newSqrt := new(big.Int).Mul(sqrtPrice, shiftV3Num)
 	newSqrt.Div(newSqrt, shiftV3Den)
-
 	cleared := new(big.Int).And(v, new(big.Int).Not(mask))
 	result := new(big.Int).Or(cleared, newSqrt)
-
 	pct := 100 - shiftV3Num.Int64()
 	return common.BigToHash(result),
-		fmt.Sprintf("sqrtPriceX96 -%d%% (~%d%% spot)", pct, pct*2), nil
+		fmt.Sprintf("sqrtPriceX96 -%d%%", pct), nil
 }
 
-// shiftSlipstreamSlot0 handles Aerodrome Slipstream's slot0, which
-// shares the same [sqrtPriceX96:160] low bits as Uniswap V3. The
-// difference is only in the bits above 160, which we preserve wholesale.
-// So the mutation is byte-identical to shiftV3Slot0 — the distinct
-// function exists to make the AMM kind explicit in the code path.
 func shiftSlipstreamSlot0(old common.Hash) (common.Hash, string, error) {
 	return shiftV3Slot0(old, mask160, 160)
 }
@@ -380,6 +324,7 @@ func readSlot(
 	addr common.Address,
 	slot common.Hash,
 ) (common.Hash, error) {
+
 	raw, err := client.StorageAt(ctx, addr, slot, nil)
 	if err != nil {
 		return common.Hash{}, err
@@ -396,6 +341,7 @@ func setStorage(
 	addr common.Address,
 	slot, value common.Hash,
 ) error {
+
 	var res interface{}
 	err := c.CallContext(ctx, &res, "anvil_setStorageAt",
 		addr.Hex(), slot.Hex(), value.Hex())
