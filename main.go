@@ -138,22 +138,22 @@ func run() int {
 
 	log.Printf("scanner: forked at block %d, chain %d", blockNum, chainID.Int64())
 
-		// Stage 1: inventory + suspicious-oracle filter, via Morpho API.
+			// Stage 1: inventory + suspicious-collateral filter, via Morpho API.
 	markets, err := Discover(runCtx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scanner: discovery: %v\n", err)
 		return 2
 	}
-	log.Printf("scanner: %d suspicious markets from API", len(markets))
+	log.Printf("scanner: %d suspicious-collateral markets from API", len(markets))
 
-	uniqueOracles := len(UniqueOracles(markets))
-	log.Printf("scanner: %d unique oracles", uniqueOracles)
+	uniqueCollaterals := len(UniqueCollaterals(markets))
+	log.Printf("scanner: %d unique collateral assets", uniqueCollaterals)
 
-	// Stage 2: bytecode triage.
-	shortlist := TriageOracles(runCtx, client, markets)
+	// Stage 2: bytecode triage on collateral assets.
+	shortlist := TriageCollateral(runCtx, client, markets)
 	log.Printf("scanner: %d shortlisted markets", len(shortlist))
 
-	// Stage 3: fork confirmation. Suspected list is the manual-review queue.
+	// Stage 3: fork confirmation. Scans oracle AND collateral for pool refs.
 	confirmed, suspected := Simulate(runCtx, client, rpcClient, shortlist)
 	log.Printf("scanner: %d confirmed, %d suspected", len(confirmed), len(suspected))
 
@@ -162,12 +162,11 @@ func run() int {
 		BlockNumber:        blockNum,
 		MarketsFromAPI:     len(markets),
 		SuspiciousOracles:  len(markets),
-		UniqueOracles:      uniqueOracles,
+		UniqueOracles:      uniqueCollaterals,
 		MarketsShortlisted: len(shortlist),
 		ConfirmedCount:     len(confirmed),
 		SuspectedCount:     len(suspected),
 	}
-
 	ops := DefaultOperationalProperties(opsF.toPresent())
 
 	rep, err := BuildReport(runCtx, client, meta, confirmed, suspected, ops)
