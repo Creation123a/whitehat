@@ -1,4 +1,4 @@
-name: Base Spot-AMM Scanner
+name: Base Protocol Spot-AMM Exposure Scan
 
 on:
   workflow_dispatch:
@@ -19,26 +19,14 @@ on:
         description: 'Pipeline timeout (e.g. 20m, 1h)'
         required: true
         default: '20m'
-      op_public_rpc:
-        description: 'O-1: public RPC only'
-        required: false
-        default: false
-        type: boolean
-      op_anon_team:
-        description: 'O-2: anonymous team'
-        required: false
-        default: false
-        type: boolean
-      op_no_legal:
-        description: 'O-3: no legal entity'
-        required: false
-        default: false
-        type: boolean
-      op_tracking_stale:
-        description: 'O-4: tracking obsolete'
-        required: false
-        default: false
-        type: boolean
+      min_protocols:
+        description: 'Minimum protocols attached to a market to scan it'
+        required: true
+        default: '2'
+      min_tvl:
+        description: 'Minimum protocol TVL in USD to survive dust filter'
+        required: true
+        default: '50000'
 
 jobs:
   scan:
@@ -73,17 +61,14 @@ jobs:
           OVERRIDE: ${{ inputs.fork_block }}
         run: |
           set -euo pipefail
-
           if [ -n "${OVERRIDE:-}" ]; then
             BLOCK="$OVERRIDE"
             echo "Using explicit override block: $BLOCK"
           else
             HEAD=$(cast block-number --rpc-url "$BASE_FORK_URL")
-            # Back off 100 blocks to avoid reorg edge cases.
             BLOCK=$((HEAD - 100))
             echo "Fetched head: $HEAD, using: $BLOCK"
           fi
-
           echo "block=$BLOCK" >> "$GITHUB_OUTPUT"
 
       - name: Run scan
@@ -92,22 +77,30 @@ jobs:
           FORK_BLOCK:    ${{ steps.fork.outputs.block }}
           FORMAT:        ${{ inputs.format }}
           TIMEOUT:       ${{ inputs.timeout }}
+          MIN_PROTOCOLS: ${{ inputs.min_protocols }}
+          MIN_TVL:       ${{ inputs.min_tvl }}
         run: |
           set -euo pipefail
-
           ARGS=()
           ARGS+=(--fork-url "$BASE_FORK_URL")
           ARGS+=(--fork-block "$FORK_BLOCK")
           ARGS+=(--format "$FORMAT")
           ARGS+=(--out report.json)
           ARGS+=(--timeout "$TIMEOUT")
-
-          if [ "${{ inputs.op_public_rpc }}"     = "true" ]; then ARGS+=(--op-public-rpc);     fi
-          if [ "${{ inputs.op_anon_team }}"      = "true" ]; then ARGS+=(--op-anon-team);      fi
-          if [ "${{ inputs.op_no_legal }}"       = "true" ]; then ARGS+=(--op-no-legal);       fi
-          if [ "${{ inputs.op_tracking_stale }}" = "true" ]; then ARGS+=(--op-tracking-stale); fi
-
+          ARGS+=(--min-protocols "$MIN_PROTOCOLS")
+          ARGS+=(--min-tvl "$MIN_TVL")
           ./scanner "${ARGS[@]}"
+
+      - name: Show report summary
+        if: always()
+        run: |
+          if [ -f report.json ]; then
+            echo "--- report.json (first 8 KB) ---"
+            head -c 8192 report.json || true
+            echo
+          else
+            echo "report.json not produced"
+          fi
 
       - name: Upload report
         if: always()
