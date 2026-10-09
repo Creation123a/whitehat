@@ -58,6 +58,26 @@ type SuspectedReport struct {
 	Protocols        []ProtocolReport `json:"protocols"`
 }
 
+// EvaluatedProtocol is a protocol that was successfully probed and
+// showed no AMM dependence. Its presence proves the scanner looked.
+type EvaluatedProtocol struct {
+	Name     string  `json:"name"`
+	Address  string  `json:"address,omitempty"`
+	Category string  `json:"category"`
+	TVLUSD   float64 `json:"tvl_usd"`
+	Reason   string  `json:"reason"`
+}
+
+// SkippedProtocol is a protocol the scanner could not evaluate.
+// Recorded so a zero in Confirmed is interpretable.
+type SkippedProtocol struct {
+	Name     string  `json:"name"`
+	Address  string  `json:"address,omitempty"`
+	Category string  `json:"category"`
+	TVLUSD   float64 `json:"tvl_usd"`
+	Reason   string  `json:"reason"`
+}
+
 type RunMetadata struct {
 	SchemaVersion        string `json:"schema_version"`
 	ChainID              int64  `json:"chain_id"`
@@ -70,12 +90,17 @@ type RunMetadata struct {
 	MarketsVulnerable    int    `json:"markets_vulnerable"`
 	ConfirmedCount       int    `json:"confirmed_count"`
 	SuspectedCount       int    `json:"suspected_count"`
+	ProtocolsProbed      int    `json:"protocols_probed"`
+	ProtocolsEvaluated   int    `json:"protocols_evaluated"`
+	ProtocolsSkipped     int    `json:"protocols_skipped"`
 }
 
 type Report struct {
-	Metadata  RunMetadata     `json:"metadata"`
-	Confirmed []FindingReport `json:"confirmed"`
-	Suspected []SuspectedReport `json:"suspected"`
+	Metadata  RunMetadata         `json:"metadata"`
+	Confirmed []FindingReport     `json:"confirmed"`
+	Suspected []SuspectedReport   `json:"suspected"`
+	Evaluated []EvaluatedProtocol `json:"evaluated"`
+	Skipped   []SkippedProtocol   `json:"skipped"`
 }
 
 // sameMarketID compares two market IDs using the same normalization
@@ -90,8 +115,54 @@ func BuildReport(
 	meta RunMetadata,
 	confirmed []ConfirmedMarket,
 	suspected []SuspectedMarket,
+	probes []ProbeVerdict,
 ) (*Report, error) {
 
+	// ---- Fold non-Morpho probe results into suspected / evaluated /
+	//      skipped BEFORE assembling the SuspectedReport slice, so
+	//      AMM-dependent non-Morpho protocols appear in the report. ----
+	allSuspected := append([]SuspectedMarket(nil), suspected...)
+	var evaluated []EvaluatedProtocol
+	var skipped []SkippedProtocol
+
+	for _, pv := range probes {
+		switch {
+		case pv.Skipped:
+			skipped = append(skipped, SkippedProtocol{
+				Name:     pv.Name,
+				Address:  pv.Protocol.Hex(),
+				Category: pv.Category,
+				TVLUSD:   pv.TVLUSD,
+				Reason:   pv.SkipReason,
+			})
+		case pv.AMMDependent:
+			allSuspected = append(allSuspected, SuspectedMarket{
+				Market: MorphoMarket{
+					MarketID:   "non-morpho:" + pv.Protocol.Hex(),
+					Oracle:     pv.Protocol,
+					OracleType: "protocol-direct",
+					SupplyUSD:  pv.TVLUSD,
+				},
+				Protocols: []Protocol{{
+					Address:        pv.Protocol,
+					Name:           pv.Name,
+					Category:       pv.Category,
+					TotalAssetsUSD: pv.TVLUSD,
+				}},
+				Reason: describeDivergence(pv),
+			})
+		default:
+			evaluated = append(evaluated, EvaluatedProtocol{
+				Name:     pv.Name,
+				Address:  pv.Protocol.Hex(),
+				Category: pv.Category,
+				TVLUSD:   pv.TVLUSD,
+				Reason:   pv.Reason,
+			})
+		}
+	}
+
+	// ---- Confirmed ----
 	cr := make([]FindingReport, 0, len(confirmed))
 	for _, c := range confirmed {
 		cr = append(cr, toFindingReport(c))
@@ -103,22 +174,56 @@ func BuildReport(
 		cr[i].Rank = i + 1
 	}
 
-	sr := make([]SuspectedReport, 0, len(suspected))
-	for _, s := range suspected {
+	// ---- Suspected (Morpho suspects + non-Morpho AMM-dependent) ----
+	sr := make([]SuspectedReport, 0, len(allSuspected))
+	for _, s := range allSuspected {
 		sr = append(sr, toSuspectedReport(s))
 	}
+	sort.SliceStable(sr, func(i, j int) bool {
+		return sr[i].SupplyUSD > sr[j].SupplyUSD
+	})
 	for i := range sr {
 		sr[i].Rank = i + 1
 	}
 
+	sort.SliceStable(evaluated, func(i, j int) bool {
+		return evaluated[i].TVLUSD > evaluated[j].TVLUSD
+	})
+	sort.SliceStable(skipped, func(i, j int) bool {
+		return skipped[i].TVLUSD > skipped[j].TVLUSD
+	})
+
 	meta.SchemaVersion = "6.0"
 	meta.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	meta.ConfirmedCount = len(cr)
+	meta.SuspectedCount = len(sr)
+	meta.ProtocolsProbed = len(probes)
+	meta.ProtocolsEvaluated = len(evaluated)
+	meta.ProtocolsSkipped = len(skipped)
 
 	return &Report{
 		Metadata:  meta,
 		Confirmed: cr,
 		Suspected: sr,
+		Evaluated: evaluated,
+		Skipped:   skipped,
 	}, nil
+}
+
+func describeDivergence(pv ProbeVerdict) string {
+	var parts []string
+	for _, d := range pv.DivergentFuncs {
+		name := d.FunctionName
+		if name == "" {
+			name = "0x" + d.SelectorHex
+		}
+		parts = append(parts, name+" @ "+d.Pool)
+	}
+	if len(parts) == 0 {
+		return "differential probe: AMM dependence detected"
+	}
+	return "differential probe: AMM mutation moved output of " +
+		strings.Join(parts, ", ")
 }
 
 func toFindingReport(c ConfirmedMarket) FindingReport {
@@ -201,12 +306,13 @@ func RenderText(w io.Writer, r *Report) {
 		r.Metadata.ChainID, r.Metadata.BlockNumber, r.Metadata.Timestamp)
 	fmt.Fprintf(w, "Markets from API: %d   Protocols discovered: %d\n",
 		r.Metadata.MarketsFromAPI, r.Metadata.ProtocolsFromAPI)
-	fmt.Fprintf(w, "Vulnerable markets (triage): %d   after protocol filter: %d\n",
+	fmt.Fprintf(w, "Vulnerable markets (triage): %d   after TVL filter: %d\n",
 		r.Metadata.MarketsAfterCountFlt, r.Metadata.MarketsAfterTVLFlt)
-	fmt.Fprintf(w, "Confirmed: %d   Suspected: %d\n\n",
-		r.Metadata.ConfirmedCount, r.Metadata.SuspectedCount)
+	fmt.Fprintf(w, "Confirmed: %d   Suspected: %d   Evaluated: %d   Skipped: %d\n\n",
+		r.Metadata.ConfirmedCount, r.Metadata.SuspectedCount,
+		r.Metadata.ProtocolsEvaluated, r.Metadata.ProtocolsSkipped)
 
-	fmt.Fprintln(w, "--- CONFIRMED (vulnerable oracles exposing one or more protocols) ---")
+	fmt.Fprintln(w, "--- CONFIRMED (Morpho markets with manipulable oracles) ---")
 	if len(r.Confirmed) == 0 {
 		fmt.Fprintln(w, "(none)")
 	}
@@ -234,14 +340,36 @@ func RenderText(w io.Writer, r *Report) {
 	if len(r.Suspected) > 0 {
 		fmt.Fprintf(w, "\n--- SUSPECTED (%d) ---\n", len(r.Suspected))
 		for _, s := range r.Suspected {
-			fmt.Fprintf(w, "\n[%d] %s / %s   supply=$%.0f\n",
-				s.Rank, s.CollateralSymbol, s.LoanSymbol, s.SupplyUSD)
+			label := s.CollateralSymbol + " / " + s.LoanSymbol
+			if strings.Trim(label, " /") == "" {
+				label = "protocol"
+			}
+			fmt.Fprintf(w, "\n[%d] %s   supply=$%.0f\n",
+				s.Rank, label, s.SupplyUSD)
 			fmt.Fprintf(w, "     Oracle:      %s (%s)\n", s.Oracle, s.OracleType)
 			fmt.Fprintf(w, "     Reason:      %s\n", s.Reason)
 			for _, p := range s.Protocols {
-				fmt.Fprintf(w, "       - %-28s [%s] exposure=$%.0f\n",
-					p.Name, p.Category, p.ExposureUSD)
+				fmt.Fprintf(w, "       - %-28s [%s] exposure=$%.0f  %s\n",
+					p.Name, p.Category, p.ExposureUSD, p.Address)
 			}
+		}
+	}
+
+	if len(r.Evaluated) > 0 {
+		fmt.Fprintf(w, "\n--- EVALUATED (probed, no AMM dependence found) (%d) ---\n",
+			len(r.Evaluated))
+		for _, e := range r.Evaluated {
+			fmt.Fprintf(w, "  %-30s [%s] tvl=$%.0f   %s\n",
+				e.Name, e.Category, e.TVLUSD, e.Reason)
+		}
+	}
+
+	if len(r.Skipped) > 0 {
+		fmt.Fprintf(w, "\n--- SKIPPED (could not evaluate) (%d) ---\n",
+			len(r.Skipped))
+		for _, s := range r.Skipped {
+			fmt.Fprintf(w, "  %-30s [%s] tvl=$%.0f   %s\n",
+				s.Name, s.Category, s.TVLUSD, s.Reason)
 		}
 	}
 }
