@@ -17,7 +17,6 @@ import (
 // Core domain types
 // =============================================================
 
-// AssetInfo describes a loan or collateral token.
 type AssetInfo struct {
 	Address  common.Address
 	Symbol   string
@@ -25,7 +24,6 @@ type AssetInfo struct {
 	Decimals uint8
 }
 
-// MorphoMarket is one Morpho Blue market row.
 type MorphoMarket struct {
 	MarketID        string
 	Oracle          common.Address
@@ -39,20 +37,15 @@ type MorphoMarket struct {
 	CollateralUSD   float64
 	SupplyUSD       float64
 
-	// Populated by TriageOracles in analysis.go.
 	Selectors   []string
 	TracedPools []common.Address
 }
 
-// Allocation links a protocol to a market it supplies to.
 type Allocation struct {
 	MarketID  string
 	SupplyUSD float64
 }
 
-// Protocol is a strategy-level actor built on top of Morpho Blue:
-// a MetaMorpho vault, an ERC-4626 yield vault, or any curated
-// wrapper that reports per-market allocations.
 type Protocol struct {
 	Address        common.Address
 	Name           string
@@ -62,8 +55,6 @@ type Protocol struct {
 	Allocations    []Allocation
 }
 
-// MarketWithProtocols is the join of a market with all protocols
-// that supply to it.
 type MarketWithProtocols struct {
 	Market    MorphoMarket
 	Protocols []Protocol
@@ -139,16 +130,17 @@ type gqlMarketsResponse struct {
 	} `json:"data"`
 }
 
-// ---------- Vault wire types (V1 schema) ----------
+// ---------- V1 vault wire types ----------
 //
-// Morpho V1 exposes vault identity on the Vault type and live state
-// on the nested VaultState type. totalAssetsUsd and allocation both
-// live under state; asking for them on the parent type produces a
-// GRAPHQL_VALIDATION_FAILED response.
+// V1 (MetaMorpho) schema:
+//   - state.totalAssetsUsd
+//   - state.allocation[] with market { marketId } and supplyAssetsUsd
+//
+// The `uniqueKey` field name belongs to V2 / Midnight, not V1.
 
 type gqlAllocationItem struct {
 	Market struct {
-		UniqueKey string `json:"uniqueKey"`
+		MarketID string `json:"marketId"`
 	} `json:"market"`
 	SupplyAssetsUsd float64 `json:"supplyAssetsUsd"`
 }
@@ -202,6 +194,8 @@ const morphoMarketsQuery = `query($first: Int!, $skip: Int!) {
   }
 }`
 
+// morphoVaultsQuery targets the V1 `vaults` root. State is nested
+// under `state`; allocation items reference markets by `marketId`.
 const morphoVaultsQuery = `query($first: Int!, $skip: Int!) {
   vaults(
     first: $first
@@ -217,7 +211,7 @@ const morphoVaultsQuery = `query($first: Int!, $skip: Int!) {
       state {
         totalAssetsUsd
         allocation {
-          market { uniqueKey }
+          market { marketId }
           supplyAssetsUsd
         }
       }
@@ -254,9 +248,6 @@ func postGraphQL(ctx context.Context, query string, vars map[string]any) ([]byte
 // Market discovery
 // =============================================================
 
-// DiscoverMarkets returns every Morpho Blue market on Base.
-// No filter is applied at this stage — filtering happens later,
-// after protocols are attached.
 func DiscoverMarkets(ctx context.Context) ([]MorphoMarket, error) {
 	var all []MorphoMarket
 	for skip := 0; ; skip += 100 {
@@ -319,9 +310,6 @@ func DiscoverMarkets(ctx context.Context) ([]MorphoMarket, error) {
 // Protocol discovery
 // =============================================================
 
-// DiscoverProtocols pulls every MetaMorpho vault on Base with its
-// per-market allocations. Any vault that reports at least one
-// allocation to a market is considered a protocol in scope.
 func DiscoverProtocols(ctx context.Context) ([]Protocol, error) {
 	var all []Protocol
 	for skip := 0; ; skip += 100 {
@@ -344,11 +332,11 @@ func DiscoverProtocols(ctx context.Context) ([]Protocol, error) {
 		for _, it := range items {
 			allocs := make([]Allocation, 0, len(it.State.Allocation))
 			for _, a := range it.State.Allocation {
-				if a.Market.UniqueKey == "" {
+				if a.Market.MarketID == "" {
 					continue
 				}
 				allocs = append(allocs, Allocation{
-					MarketID:  a.Market.UniqueKey,
+					MarketID:  a.Market.MarketID,
 					SupplyUSD: a.SupplyAssetsUsd,
 				})
 			}
@@ -368,10 +356,6 @@ func DiscoverProtocols(ctx context.Context) ([]Protocol, error) {
 	return all, nil
 }
 
-// classifyProtocol derives a strategy category from vault metadata.
-// The Morpho API does not carry an authoritative category field,
-// so this is a name-based heuristic. Unknown vaults are still
-// included; they will be filtered later if they are dust.
 func classifyProtocol(name, symbol string) string {
 	s := strings.ToLower(name + " " + symbol)
 	switch {
@@ -392,7 +376,7 @@ func classifyProtocol(name, symbol string) string {
 		strings.Contains(s, "vault"):
 		return catERC4626YieldVault
 	default:
-		return catERC4626YieldVault // MetaMorpho default
+		return catERC4626YieldVault
 	}
 }
 
@@ -400,13 +384,6 @@ func classifyProtocol(name, symbol string) string {
 // Join
 // =============================================================
 
-// BuildMarketProtocolIndex joins markets to protocols by matching
-// each protocol's allocations to market IDs. Returns one entry per
-// market that has at least one protocol attached.
-//
-// Both sides are normalized to lowercase hex without a 0x prefix
-// before matching, because the Morpho API has historically returned
-// market IDs in mixed casing across its endpoints.
 func BuildMarketProtocolIndex(
 	markets []MorphoMarket,
 	protocols []Protocol,
