@@ -58,8 +58,9 @@ type SuspectedReport struct {
 	Protocols        []ProtocolReport `json:"protocols"`
 }
 
-// EvaluatedProtocol is a protocol that was successfully probed and
-// showed no AMM dependence. Its presence proves the scanner looked.
+// EvaluatedProtocol records protocols that were successfully probed
+// and showed no AMM dependence. Its presence proves the scanner
+// actually looked, distinguishing "clean" from "blind".
 type EvaluatedProtocol struct {
 	Name     string  `json:"name"`
 	Address  string  `json:"address,omitempty"`
@@ -68,8 +69,9 @@ type EvaluatedProtocol struct {
 	Reason   string  `json:"reason"`
 }
 
-// SkippedProtocol is a protocol the scanner could not evaluate.
-// Recorded so a zero in Confirmed is interpretable.
+// SkippedProtocol records protocols the scanner could not evaluate.
+// Without it, a zero in Confirmed cannot be told apart from a
+// pipeline that never reached them.
 type SkippedProtocol struct {
 	Name     string  `json:"name"`
 	Address  string  `json:"address,omitempty"`
@@ -109,6 +111,10 @@ func sameMarketID(a, b string) bool {
 	return normalizeMarketID(a) == normalizeMarketID(b)
 }
 
+// BuildReport merges the Morpho fork-confirmation results with the
+// non-Morpho differential-probe verdicts, and returns the final
+// report. Probes are folded in before the report slices are built,
+// so AMM-dependent non-Morpho protocols appear in Suspected.
 func BuildReport(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -118,9 +124,8 @@ func BuildReport(
 	probes []ProbeVerdict,
 ) (*Report, error) {
 
-	// ---- Fold non-Morpho probe results into suspected / evaluated /
-	//      skipped BEFORE assembling the SuspectedReport slice, so
-	//      AMM-dependent non-Morpho protocols appear in the report. ----
+	// Fold probe verdicts into the suspected set and the new
+	// evaluated / skipped sections.
 	allSuspected := append([]SuspectedMarket(nil), suspected...)
 	var evaluated []EvaluatedProtocol
 	var skipped []SkippedProtocol
@@ -162,7 +167,7 @@ func BuildReport(
 		}
 	}
 
-	// ---- Confirmed ----
+	// Confirmed: sorted by supply USD descending.
 	cr := make([]FindingReport, 0, len(confirmed))
 	for _, c := range confirmed {
 		cr = append(cr, toFindingReport(c))
@@ -174,7 +179,7 @@ func BuildReport(
 		cr[i].Rank = i + 1
 	}
 
-	// ---- Suspected (Morpho suspects + non-Morpho AMM-dependent) ----
+	// Suspected: Morpho suspects + AMM-dependent non-Morpho.
 	sr := make([]SuspectedReport, 0, len(allSuspected))
 	for _, s := range allSuspected {
 		sr = append(sr, toSuspectedReport(s))
@@ -210,6 +215,8 @@ func BuildReport(
 	}, nil
 }
 
+// describeDivergence renders the divergent-function list for the
+// Suspected reason field of a non-Morpho protocol.
 func describeDivergence(pv ProbeVerdict) string {
 	var parts []string
 	for _, d := range pv.DivergentFuncs {
@@ -340,9 +347,9 @@ func RenderText(w io.Writer, r *Report) {
 	if len(r.Suspected) > 0 {
 		fmt.Fprintf(w, "\n--- SUSPECTED (%d) ---\n", len(r.Suspected))
 		for _, s := range r.Suspected {
-			label := s.CollateralSymbol + " / " + s.LoanSymbol
-			if strings.Trim(label, " /") == "" {
-				label = "protocol"
+			label := strings.TrimSpace(s.CollateralSymbol + " / " + s.LoanSymbol)
+			if label == "/" || label == "" {
+				label = "protocol-direct"
 			}
 			fmt.Fprintf(w, "\n[%d] %s   supply=$%.0f\n",
 				s.Rank, label, s.SupplyUSD)
