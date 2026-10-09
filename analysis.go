@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -12,6 +13,11 @@ import (
 )
 
 // CallFrame is one node in a callTracer execution tree.
+//
+// callTracer sets Error on the frame that reverted and does NOT
+// return an RPC-level error for the trace call itself. Treating a
+// reverted frame as "no spot reads" is a false negative — see
+// traceOneOracle.
 type CallFrame struct {
 	From   string      `json:"from"`
 	To     string      `json:"to"`
@@ -21,37 +27,62 @@ type CallFrame struct {
 	Calls  []CallFrame `json:"calls,omitempty"`
 }
 
+// traceOutcome records what happened during the trace phase for one
+// oracle. It is intentionally separate from Shortlisted so callers
+// can distinguish "trace worked, oracle is clean" from "trace could
+// not exercise the pricing path".
+type traceOutcome int
+
+const (
+	outcomeTraceOK       traceOutcome = iota // trace walked cleanly
+	outcomeTraceReverted                      // root frame reverted (msg.sender, stale feed, etc.)
+	outcomeTraceError                         // debug_traceCall itself failed (provider, transport)
+)
+
 // OracleTraceVerdict is the trace-based analysis result for one oracle.
 type OracleTraceVerdict struct {
 	Oracle      common.Address
 	HasSpotRead bool
-	MixedSource bool            // both spot read AND robust feed present
+	MixedSource bool             // both spot read AND robust feed present
 	Selectors   []string
-	Pools       []common.Address // every pool the trace touched via getReserves/slot0
+	Pools       []common.Address // every pool touched via getReserves()/slot0()
 	TracedAddrs []common.Address
 	Shortlisted bool
+
+	outcome traceOutcome // unexported; aggregated into TriageStats
+}
+
+// TriageStats summarizes one TriageOracles pass. main.go logs it so
+// a "0 shortlisted" result is never mistaken for a clean ecosystem
+// when the real cause was transport / sender / staleness.
+type TriageStats struct {
+	Total         int
+	TraceOK       int64
+	TraceReverted int64
+	TraceError    int64
+	Shortlisted   int64
 }
 
 const triageWorkers = 2
 
 // TriageOracles traces each market's oracle price() call via
-// debug_traceCall, walks the entire execution tree, and inspects the
-// actual calldata of every frame. A frame whose input starts with the
+// debug_traceCall, walks the execution tree, and inspects the
+// calldata of every frame. A frame whose input starts with the
 // getReserves() or slot0() selector is ground truth.
 //
-// IMPORTANT (Bug 1 fix): a Chainlink latestRoundData() anywhere in
-// the tree does NOT whitelist the oracle. Mixed-source oracles —
-// Chainlink for one leg, spot AMM for the other — are exactly the
-// May 2025 Aerodrome cUSDO/USDC pattern. They are shortlisted and
-// flagged MixedSource.
+// Bug 1 policy: a Chainlink latestRoundData() anywhere in the tree
+// does NOT whitelist the oracle. Mixed-source oracles — Chainlink
+// for one leg, spot AMM for the other — are exactly the May 2025
+// Aerodrome cUSDO/USDC pattern. They are shortlisted and flagged
+// MixedSource.
 func TriageOracles(
 	ctx context.Context,
 	client *ethclient.Client,
 	rpcClient *rpc.Client,
 	markets []MorphoMarket,
-) []MorphoMarket {
+) ([]MorphoMarket, TriageStats) {
 
-	verdicts := traceUniqueOracles(ctx, client, rpcClient, markets)
+	verdicts, stats := traceUniqueOracles(ctx, client, rpcClient, markets)
 
 	var out []MorphoMarket
 	for _, m := range markets {
@@ -63,7 +94,8 @@ func TriageOracles(
 		m.TracedPools = v.Pools
 		out = append(out, m)
 	}
-	return out
+	stats.Shortlisted = int64(len(out))
+	return out, stats
 }
 
 func traceUniqueOracles(
@@ -71,9 +103,9 @@ func traceUniqueOracles(
 	client *ethclient.Client,
 	rpcClient *rpc.Client,
 	markets []MorphoMarket,
-) map[common.Address]OracleTraceVerdict {
+) (map[common.Address]OracleTraceVerdict, TriageStats) {
 
-	// Dedupe by oracle, keeping the first market we saw for collateral
+	// Dedupe by oracle, keeping the first market for collateral
 	// context (used only by the bytecode fallback).
 	seen := make(map[common.Address]MorphoMarket)
 	var oracles []common.Address
@@ -88,6 +120,12 @@ func traceUniqueOracles(
 		oracles = append(oracles, m.Oracle)
 	}
 
+	var (
+		nOK       atomic.Int64
+		nReverted atomic.Int64
+		nError    atomic.Int64
+	)
+
 	in := make(chan common.Address)
 	out := make(chan OracleTraceVerdict)
 
@@ -98,7 +136,15 @@ func traceUniqueOracles(
 			defer wg.Done()
 			for o := range in {
 				m := seen[o]
-				v := traceOneOracle(ctx, client, rpcClient, m)
+				v, oc := traceOneOracle(ctx, client, rpcClient, m)
+				switch oc {
+				case outcomeTraceOK:
+					nOK.Add(1)
+				case outcomeTraceReverted:
+					nReverted.Add(1)
+				case outcomeTraceError:
+					nError.Add(1)
+				}
 				select {
 				case out <- v:
 				case <-ctx.Done():
@@ -128,7 +174,13 @@ func traceUniqueOracles(
 	for v := range out {
 		result[v.Oracle] = v
 	}
-	return result
+
+	return result, TriageStats{
+		Total:         len(oracles),
+		TraceOK:       nOK.Load(),
+		TraceReverted: nReverted.Load(),
+		TraceError:    nError.Load(),
+	}
 }
 
 func traceOneOracle(
@@ -136,13 +188,17 @@ func traceOneOracle(
 	client *ethclient.Client,
 	rpcClient *rpc.Client,
 	m MorphoMarket,
-) OracleTraceVerdict {
+) (OracleTraceVerdict, traceOutcome) {
 
 	v := OracleTraceVerdict{Oracle: m.Oracle}
 
 	frame, err := tracePriceCall(ctx, rpcClient, m.Oracle)
 	if err != nil || frame == nil {
-		return fallbackBytecodeScan(ctx, client, m.Oracle, m.CollateralAsset.Address)
+		// Transport-level failure. Bytecode fallback is the best we
+		// can do; flag the outcome so the caller can count it.
+		fv := fallbackBytecodeScan(ctx, client, m.Oracle, m.CollateralAsset.Address)
+		fv.outcome = outcomeTraceError
+		return fv, outcomeTraceError
 	}
 
 	targets := make(map[common.Address]struct{})
@@ -176,24 +232,43 @@ func traceOneOracle(
 
 	v.Pools = dedupeAddresses(v.Pools)
 
-	// Bug 1 fix: a robust feed does NOT whitelist the oracle. It only
-	// downgrades the classification to "mixed source".
 	if hasRobust && v.HasSpotRead {
 		v.MixedSource = true
 		v.Selectors = append(v.Selectors, "MIXED_SOURCE")
 	}
 
+	// Issue A: a reverted root frame is not evidence of a clean
+	// oracle. callTracer still populates sub-calls that executed
+	// before the revert, so we keep whatever spot reads the partial
+	// tree yielded. If the partial tree is empty AND the root
+	// reverted, fall through to bytecode so an unexecuted branch
+	// that contains getReserves()/slot0() is not silently missed.
+	oc := outcomeTraceOK
+	if frame.Error != "" {
+		oc = outcomeTraceReverted
+		if !v.HasSpotRead {
+			fb := fallbackBytecodeScan(ctx, client,
+				m.Oracle, m.CollateralAsset.Address)
+			fb.Selectors = append(fb.Selectors,
+				"TRACE_REVERTED:"+frame.Error)
+			fb.outcome = oc
+			return fb, oc
+		}
+		v.Selectors = append(v.Selectors,
+			"TRACE_REVERTED:"+frame.Error)
+	}
+
 	v.Shortlisted = v.HasSpotRead
-	return v
+	v.outcome = oc
+	return v, oc
 }
 
 // hasSelectorPrefix reports whether a hex-encoded calldata string
 // starts with the given 4-byte selector.
 //
-// NOTE: getReserves() and slot0() take no arguments, so we cannot
-// require argument bytes after the selector — the check is
-// intentionally just the 4-byte prefix. The AMM-kind probe in
-// simulation.go (detectAMMKind) is the real defence against
+// NOTE (Bug 5, accepted): getReserves() and slot0() take no arguments,
+// so we cannot require argument bytes after the selector. The AMM-kind
+// probe in simulation.go (detectAMMKind) is the real defence against
 // 4-byte selector collisions.
 func hasSelectorPrefix(input string, sel []byte) bool {
 	if len(input) < 10 {
@@ -223,6 +298,11 @@ func walkFrames(f *CallFrame, visit func(*CallFrame)) {
 
 // tracePriceCall runs debug_traceCall with callTracer against the
 // oracle's price() function at the latest block.
+//
+// Issue B: from is set to the Morpho Blue contract so oracles that
+// gate on msg.sender (a common defensive pattern) are exercised with
+// the same caller they see on-chain. Defaulting to the zero address
+// silently reverts those traces.
 func tracePriceCall(
 	ctx context.Context,
 	rpcClient *rpc.Client,
@@ -230,6 +310,7 @@ func tracePriceCall(
 ) (*CallFrame, error) {
 
 	callArg := map[string]interface{}{
+		"from": MorphoBlueAddress.Hex(),
 		"to":   oracle.Hex(),
 		"data": "0xa035b1fe", // price()
 	}
@@ -254,13 +335,9 @@ func collectTargets(frame *CallFrame, out map[common.Address]struct{}) {
 	}
 }
 
-// fallbackBytecodeScan is used when debug_traceCall is unavailable or
-// the oracle reverts. Scans the oracle AND the collateral's bytecode
-// for spot selectors and robust selectors.
-//
-// Bug 4 fix: the previous version scanned only the oracle's own
-// bytecode, which is structurally blind to wrapper-collateral
-// patterns where the AMM read lives in the collateral contract.
+// fallbackBytecodeScan is used when debug_traceCall is unavailable,
+// the oracle reverts with an empty partial tree, or the trace fails.
+// Scans the oracle AND the collateral for spot selectors.
 func fallbackBytecodeScan(
 	ctx context.Context,
 	client *ethclient.Client,
