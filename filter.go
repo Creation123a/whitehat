@@ -3,7 +3,10 @@ package main
 import "sort"
 
 // FilterMarketsByProtocolCount drops markets that do not have at
-// least MinProtocolsPerMarket distinct protocols attached.
+// least minProtocols distinct protocols attached. In the v6.0
+// pipeline this is OFF by default (min-protocols=0) because
+// triage runs first and markets with zero known protocols are
+// still valid findings.
 func FilterMarketsByProtocolCount(
 	in []MarketWithProtocols,
 	minProtocols int,
@@ -26,32 +29,33 @@ func FilterMarketsByProtocolCount(
 //   - its own TotalAssetsUSD >= minTVL, OR
 //   - its allocation to this specific market >= minTVL.
 //
-// The second clause matters for large MetaMorpho vaults that only
-// route a small slice into a given market: the vault is not dust,
-// and its exposure to this market is what we are checking.
+// Markets with no protocols after filtering are still kept: a
+// vulnerable oracle with no known protocol exposure is still a
+// finding (the exposure may be undiscovered).
+//
+// MarketID comparisons use normalizeMarketID on both sides, since
+// the Morpho API returns mixed casing across endpoints.
 func FilterProtocolsByTVL(
 	in []MarketWithProtocols,
 	minTVL float64,
 ) []MarketWithProtocols {
 
-	var out []MarketWithProtocols
+	out := make([]MarketWithProtocols, 0, len(in))
 	for _, mp := range in {
+		marketKey := normalizeMarketID(mp.Market.MarketID)
 		var kept []Protocol
 		for _, p := range mp.Protocols {
 			if p.TotalAssetsUSD >= minTVL {
 				kept = append(kept, p)
 				continue
 			}
-			// Check the per-market allocation.
 			for _, a := range p.Allocations {
-				if a.MarketID == mp.Market.MarketID && a.SupplyUSD >= minTVL {
+				if normalizeMarketID(a.MarketID) == marketKey &&
+					a.SupplyUSD >= minTVL {
 					kept = append(kept, p)
 					break
 				}
 			}
-		}
-		if len(kept) == 0 {
-			continue
 		}
 		mp.Protocols = kept
 		out = append(out, mp)
@@ -60,9 +64,7 @@ func FilterProtocolsByTVL(
 }
 
 // FilterMarketsByOracleVulnerability keeps only markets whose
-// oracle triage flagged a spot-AMM read. This is applied after
-// TriageOracles. Protocols on non-vulnerable markets are dropped
-// from the pipeline entirely.
+// oracle triage flagged a spot-AMM read.
 func FilterMarketsByOracleVulnerability(
 	in []MarketWithProtocols,
 	vulnerable map[string]bool,
