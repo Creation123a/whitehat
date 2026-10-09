@@ -21,9 +21,7 @@ type AssetInfo struct {
 	Decimals uint8
 }
 
-// MorphoMarket is one market row. The collateral asset is now the
-// primary object of interest — its bytecode is triaged, and its
-// internal pricing is the suspected vulnerability surface.
+// MorphoMarket is one market row.
 type MorphoMarket struct {
 	MarketID        string
 	Oracle          common.Address
@@ -38,17 +36,15 @@ type MorphoMarket struct {
 	SupplyUSD       float64
 
 	// Populated by TriageOracles in analysis.go.
-	Selectors  []string
-	TracedPool common.Address
+	Selectors   []string
+	TracedPools []common.Address
 }
 
-// ---------- Baseline assets (not suspicious) ----------
-
-// baselineAssets are the standard, non-wrapped tokens that the scanner
-// treats as safe collateral. Anything not in this set is flagged as
-// a potential wrapper or complex collateral asset.
+// ---------- Baseline assets (informational only) ----------
 //
-// Base mainnet addresses, verified 2026-10-08.
+// These are no longer used as a filter — the oracle is the object
+// of interest, not the collateral. Kept for reference and future
+// use by report classification.
 var baselineAssets = map[common.Address]bool{
 	common.HexToAddress("0x4200000000000000000000000000000000000006"): true, // WETH
 	common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"): true, // USDC
@@ -60,10 +56,10 @@ var baselineAssets = map[common.Address]bool{
 	common.HexToAddress("0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42"): true, // EURC
 }
 
-// wrapperPatterns are substrings that indicate a collateral asset is
-// a wrapper, vault share, LP token, or restaking derivative.
+// wrapperPatterns kept for future classification; not used as a
+// discovery filter anymore.
 var wrapperPatterns = []string{
-	"lp", "share", "vault", "slip", "lrt", "st", "w", "v",
+	"lp", "share", "vault", "slip", "lrt",
 }
 
 // ---------- GraphQL wire types ----------
@@ -157,11 +153,9 @@ const morphoMarketsQuery = `query($first: Int!, $skip: Int!) {
   }
 }`
 
-// Discover pulls every Morpho Blue market on Base, keeps only those
-// whose collateral asset is a wrapper, vault share, LP token, or
-// non-baseline asset, and returns them sorted by supply USD descending.
-//
-// No TVL floor is applied. Sorting is done in the report.
+// Discover pulls every Morpho Blue market on Base. No collateral
+// filter is applied — the oracle is the object of interest and a
+// baseline collateral does not make an oracle safe.
 func Discover(ctx context.Context) ([]MorphoMarket, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	var all []MorphoMarket
@@ -209,14 +203,6 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 				continue
 			}
 
-			collAddr := common.HexToAddress(it.CollateralAsset.Address)
-
-			// Primary filter — keep only suspicious collateral.
-			if !isSuspiciousCollateral(collAddr,
-				it.CollateralAsset.Symbol, it.CollateralAsset.Name) {
-				continue
-			}
-
 			warnTypes := make([]string, 0, len(it.Warnings))
 			for _, w := range it.Warnings {
 				warnTypes = append(warnTypes, w.Type)
@@ -236,7 +222,7 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 					Decimals: uint8(it.LoanAsset.Decimals),
 				},
 				CollateralAsset: AssetInfo{
-					Address:  collAddr,
+					Address:  common.HexToAddress(it.CollateralAsset.Address),
 					Symbol:   it.CollateralAsset.Symbol,
 					Name:     it.CollateralAsset.Name,
 					Decimals: uint8(it.CollateralAsset.Decimals),
@@ -255,18 +241,15 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 	return all, nil
 }
 
-// isSuspiciousCollateral flags a market's collateral as worth bytecode
-// triage when it matches a wrapper pattern OR is not a standard
-// baseline asset.
+// isSuspiciousCollateral is retained for future classification. It
+// is no longer called during discovery.
 func isSuspiciousCollateral(addr common.Address, symbol, name string) bool {
-	// Wrapper pattern match on symbol + name (case-insensitive).
 	s := strings.ToLower(symbol + " " + name)
 	for _, p := range wrapperPatterns {
 		if strings.Contains(s, p) {
 			return true
 		}
 	}
-	// Not a baseline asset -> suspicious.
 	return !baselineAssets[addr]
 }
 
@@ -286,6 +269,7 @@ func UniqueCollaterals(markets []MorphoMarket) []common.Address {
 	}
 	return out
 }
+
 // UniqueOracles returns deduplicated oracle addresses.
 func UniqueOracles(markets []MorphoMarket) []common.Address {
 	seen := make(map[common.Address]struct{})
