@@ -16,13 +16,13 @@ on:
           - json
           - text
       timeout:
-        description: 'Pipeline timeout (e.g. 20m, 1h)'
+        description: 'Pipeline timeout (e.g. 20m, 30m, 1h) — probing may need 30m+'
         required: true
-        default: '20m'
+        default: '30m'
       min_protocols:
-        description: 'Minimum protocols attached to a market to scan it'
+        description: 'Minimum protocols attached to a market to scan it (0 = off)'
         required: true
-        default: '2'
+        default: '0'
       min_tvl:
         description: 'Minimum protocol TVL in USD to survive dust filter'
         required: true
@@ -46,7 +46,7 @@ jobs:
       - name: Install Foundry (Anvil)
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: v1.0.0
 
       - name: Build scanner
         run: go build -o scanner .
