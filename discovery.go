@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -105,8 +106,6 @@ type gqlAsset struct {
 	Decimals int    `json:"decimals"`
 }
 
-// ---------- Market wire types ----------
-
 type gqlMarketItem struct {
 	MarketID        string       `json:"marketId"`
 	LLTV            FlexString   `json:"lltv"`
@@ -129,14 +128,6 @@ type gqlMarketsResponse struct {
 		} `json:"markets"`
 	} `json:"data"`
 }
-
-// ---------- V1 vault wire types ----------
-//
-// V1 (MetaMorpho) schema:
-//   - state.totalAssetsUsd
-//   - state.allocation[] with market { marketId } and supplyAssetsUsd
-//
-// The `uniqueKey` field name belongs to V2 / Midnight, not V1.
 
 type gqlAllocationItem struct {
 	Market struct {
@@ -194,8 +185,6 @@ const morphoMarketsQuery = `query($first: Int!, $skip: Int!) {
   }
 }`
 
-// morphoVaultsQuery targets the V1 `vaults` root. State is nested
-// under `state`; allocation items reference markets by `marketId`.
 const morphoVaultsQuery = `query($first: Int!, $skip: Int!) {
   vaults(
     first: $first
@@ -244,8 +233,26 @@ func postGraphQL(ctx context.Context, query string, vars map[string]any) ([]byte
 	return raw, nil
 }
 
+func httpGet(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	c := &http.Client{Timeout: 60 * time.Second}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, string(raw))
+	}
+	return raw, nil
+}
+
 // =============================================================
-// Market discovery
+// Market discovery (Morpho Blue)
 // =============================================================
 
 func DiscoverMarkets(ctx context.Context) ([]MorphoMarket, error) {
@@ -307,7 +314,7 @@ func DiscoverMarkets(ctx context.Context) ([]MorphoMarket, error) {
 }
 
 // =============================================================
-// Protocol discovery
+// MetaMorpho vault discovery (Morpho GraphQL)
 // =============================================================
 
 func DiscoverProtocols(ctx context.Context) ([]Protocol, error) {
@@ -381,9 +388,205 @@ func classifyProtocol(name, symbol string) string {
 }
 
 // =============================================================
+// DefiLlama discovery
+// =============================================================
+
+type defiLlamaProtocol struct {
+	Name      string             `json:"name"`
+	Slug      string             `json:"slug"`
+	TVL       float64            `json:"tvl"`
+	Category  string             `json:"category"`
+	Chains    []string           `json:"chains"`
+	ChainTvls map[string]float64 `json:"chainTvls"`
+	URL       string             `json:"url"`
+	Change1d  float64            `json:"change_1d"`
+}
+
+// DiscoverDefiLlamaProtocols fetches every DefiLlama protocol,
+// filters to Base, target category, and Base-TVL >= minTVL, and
+// attempts best-effort SQD address resolution.
+func DiscoverDefiLlamaProtocols(ctx context.Context, minTVL float64) ([]Protocol, error) {
+	raw, err := httpGet(ctx, DefiLlamaProtocolsURL)
+	if err != nil {
+		return nil, fmt.Errorf("defillama fetch: %w", err)
+	}
+	var all []defiLlamaProtocol
+	if err := json.Unmarshal(raw, &all); err != nil {
+		return nil, fmt.Errorf("defillama decode: %w", err)
+	}
+
+	var out []Protocol
+	for _, p := range all {
+		if !containsString(p.Chains, DefiLlamaBaseChain) {
+			continue
+		}
+		baseTVL, ok := p.ChainTvls[DefiLlamaBaseChain]
+		if !ok {
+			baseTVL = p.TVL
+		}
+		if baseTVL < minTVL {
+			continue
+		}
+		if !TargetDefiLlamaCategories[p.Category] {
+			continue
+		}
+
+		proto := Protocol{
+			Name:           p.Name,
+			Symbol:         p.Slug,
+			Category:       mapDefiLlamaCategory(p.Category),
+			TotalAssetsUSD: baseTVL,
+		}
+
+		// Best-effort address resolution. On failure, leave the
+		// zero address; the protocol is still listed in the
+		// universe and can be reported as "skipped" later.
+		if addr, err := ResolveProtocolAddress(ctx, p.Name); err == nil {
+			proto.Address = addr
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"scanner: sqd resolve %q failed: %v\n", p.Name, err)
+		}
+
+		out = append(out, proto)
+	}
+	return out, nil
+}
+
+// mapDefiLlamaCategory converts a DefiLlama category to the
+// scanner's internal category labels.
+func mapDefiLlamaCategory(dl string) string {
+	switch dl {
+	case "Leveraged Farming", "Yield Aggregator", "Yield":
+		return catLeveragedYieldFarm
+	case "Delta Neutral":
+		return catDeltaNeutralVault
+	case "LP Collateral", "Lending":
+		return catLPCollateral
+	default:
+		return catUnknown
+	}
+}
+
+// =============================================================
+// SQD Portal: name -> address resolution
+// =============================================================
+
+// sqdRequest is the payload sent to the SQD Portal resolve endpoint.
+// The exact field names depend on the deployed Portal; if the
+// endpoint returns nothing useful, we log and continue with the
+// zero address so the pipeline never aborts.
+type sqdRequest struct {
+	Query   string `json:"query"`
+	Network string `json:"network"`
+	Kind    string `json:"kind"`
+	Limit   int    `json:"limit"`
+}
+
+type sqdMatch struct {
+	Address string `json:"address"`
+	Name    string `json:"name"`
+	ChainID int    `json:"chainId"`
+}
+
+type sqdResponse struct {
+	Matches []sqdMatch `json:"matches"`
+}
+
+// ResolveProtocolAddress returns the primary Base contract address
+// for the given protocol name. On any failure (network, no match,
+// non-Base result) it returns the zero address and an error.
+func ResolveProtocolAddress(ctx context.Context, name string) (common.Address, error) {
+	body, _ := json.Marshal(sqdRequest{
+		Query:   name,
+		Network: "base-mainnet",
+		Kind:    "protocol",
+		Limit:   5,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		SQDPortalURL+"/resolve", bytes.NewReader(body))
+	if err != nil {
+		return common.Address{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c := &http.Client{Timeout: 15 * time.Second}
+	resp, err := c.Do(req)
+	if err != nil {
+		return common.Address{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return common.Address{}, fmt.Errorf("sqd HTTP %d", resp.StatusCode)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	var parsed sqdResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return common.Address{}, err
+	}
+	for _, m := range parsed.Matches {
+		if m.Address == "" {
+			continue
+		}
+		if m.ChainID != 0 && m.ChainID != 8453 {
+			continue
+		}
+		return common.HexToAddress(m.Address), nil
+	}
+	return common.Address{}, fmt.Errorf("sqd: no Base match for %q", name)
+}
+
+// =============================================================
+// Combined discovery
+// =============================================================
+
+// DiscoverAllProtocols merges Morpho MetaMorpho vaults and the
+// DefiLlama protocol universe. Deduplicates by lowercase name.
+// Non-fatal failures are logged and the other path's output is
+// still returned.
+func DiscoverAllProtocols(ctx context.Context, minTVL float64) ([]Protocol, error) {
+	var merged []Protocol
+
+	morphoProtos, err := DiscoverProtocols(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "scanner: morpho vaults discovery failed: %v\n", err)
+	} else {
+		merged = append(merged, morphoProtos...)
+	}
+
+	dlProtos, err := DiscoverDefiLlamaProtocols(ctx, minTVL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "scanner: defillama discovery failed: %v\n", err)
+	} else {
+		merged = append(merged, dlProtos...)
+	}
+
+	if len(merged) == 0 {
+		return nil, fmt.Errorf("all discovery paths failed")
+	}
+
+	seen := make(map[string]bool)
+	var out []Protocol
+	for _, p := range merged {
+		key := strings.ToLower(strings.TrimSpace(p.Name))
+		if key == "" {
+			continue
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// =============================================================
 // Join
 // =============================================================
 
+// BuildMarketProtocolIndex joins protocols to markets by allocation
+// market ID. Only markets that have at least one matching protocol
+// are emitted.
 func BuildMarketProtocolIndex(
 	markets []MorphoMarket,
 	protocols []Protocol,
@@ -415,11 +618,56 @@ func BuildMarketProtocolIndex(
 	return out
 }
 
+// AttachProtocolsToMarkets emits an entry for every market, using
+// the empty slice when no protocols are matched. This keeps
+// vulnerable oracles with no known protocol exposure in the scan,
+// so the report distinguishes "no protocol found" from "no
+// vulnerability found."
+func AttachProtocolsToMarkets(
+	markets []MorphoMarket,
+	protocols []Protocol,
+) []MarketWithProtocols {
+
+	idx := make(map[string][]Protocol)
+	for _, p := range protocols {
+		for _, a := range p.Allocations {
+			key := normalizeMarketID(a.MarketID)
+			if key == "" {
+				continue
+			}
+			idx[key] = append(idx[key], p)
+		}
+	}
+
+	out := make([]MarketWithProtocols, 0, len(markets))
+	for _, m := range markets {
+		key := normalizeMarketID(m.MarketID)
+		out = append(out, MarketWithProtocols{
+			Market:    m,
+			Protocols: idx[key],
+		})
+	}
+	return out
+}
+
 func normalizeMarketID(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.ToLower(s)
 	s = strings.TrimPrefix(s, "0x")
 	return s
+}
+
+// =============================================================
+// Helpers
+// =============================================================
+
+func containsString(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // =============================================================
