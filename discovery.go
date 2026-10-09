@@ -13,7 +13,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// AssetInfo describes a loan or collateral token.
+// ---------- Wire types ----------
+
 type AssetInfo struct {
 	Address  common.Address
 	Symbol   string
@@ -21,7 +22,8 @@ type AssetInfo struct {
 	Decimals uint8
 }
 
-// MorphoMarket is one market row.
+// MorphoMarket is a raw Morpho Blue market. It has no protocol
+// attachments yet — those are joined in BuildMarketProtocolIndex.
 type MorphoMarket struct {
 	MarketID        string
 	Oracle          common.Address
@@ -35,34 +37,37 @@ type MorphoMarket struct {
 	CollateralUSD   float64
 	SupplyUSD       float64
 
-	// Populated by TriageOracles in analysis.go.
+	// Populated by triage.
 	Selectors   []string
 	TracedPools []common.Address
 }
 
-// ---------- Baseline assets (informational only) ----------
-//
-// These are no longer used as a filter — the oracle is the object
-// of interest, not the collateral. Kept for reference and future
-// use by report classification.
-var baselineAssets = map[common.Address]bool{
-	common.HexToAddress("0x4200000000000000000000000000000000000006"): true, // WETH
-	common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"): true, // USDC
-	common.HexToAddress("0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"): true, // USDbC
-	common.HexToAddress("0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"): true, // cbETH
-	common.HexToAddress("0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452"): true, // wstETH
-	common.HexToAddress("0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"): true, // cbBTC
-	common.HexToAddress("0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"): true, // DAI
-	common.HexToAddress("0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42"): true, // EURC
+// Allocation links a protocol to a market it supplies to.
+type Allocation struct {
+	MarketID  string
+	SupplyUSD float64
 }
 
-// wrapperPatterns kept for future classification; not used as a
-// discovery filter anymore.
-var wrapperPatterns = []string{
-	"lp", "share", "vault", "slip", "lrt",
+// Protocol is a strategy-level actor built on top of Morpho:
+// a MetaMorpho vault, an ERC-4626 yield vault, or any curated
+// wrapper that reports per-market allocations.
+type Protocol struct {
+	Address        common.Address
+	Name           string
+	Symbol         string
+	Category       string
+	TotalAssetsUSD float64
+	Allocations    []Allocation
 }
 
-// ---------- GraphQL wire types ----------
+// MarketWithProtocols is the join of a market with all protocols
+// that supply to it.
+type MarketWithProtocols struct {
+	Market    MorphoMarket
+	Protocols []Protocol
+}
+
+// ---------- GraphQL wire ----------
 
 type gqlRequest struct {
 	Query     string         `json:"query"`
@@ -128,6 +133,31 @@ type gqlMarketsResponse struct {
 	} `json:"data"`
 }
 
+type gqlAllocationItem struct {
+	Market struct {
+		UniqueKey string `json:"uniqueKey"`
+	} `json:"market"`
+	SupplyAssetsUsd float64 `json:"supplyAssetsUsd"`
+}
+
+type gqlVaultItem struct {
+	Address         string              `json:"address"`
+	Name            string              `json:"name"`
+	Symbol          string              `json:"symbol"`
+	TotalAssetsUsd  float64             `json:"totalAssetsUsd"`
+	Allocation      []gqlAllocationItem `json:"allocation"`
+}
+
+type gqlVaultsResponse struct {
+	Data struct {
+		Vaults struct {
+			Items []gqlVaultItem `json:"items"`
+		} `json:"vaults"`
+	} `json:"data"`
+}
+
+// ---------- Queries ----------
+
 const morphoMarketsQuery = `query($first: Int!, $skip: Int!) {
   markets(
     first: $first
@@ -153,62 +183,86 @@ const morphoMarketsQuery = `query($first: Int!, $skip: Int!) {
   }
 }`
 
-// Discover pulls every Morpho Blue market on Base. No collateral
-// filter is applied — the oracle is the object of interest and a
-// baseline collateral does not make an oracle safe.
-func Discover(ctx context.Context) ([]MorphoMarket, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
-	var all []MorphoMarket
+// morphoVaultsQuery pulls every MetaMorpho vault on Base together
+// with its per-market allocation. This is the link from market to
+// protocol; the reverse index is built in BuildMarketProtocolIndex.
+const morphoVaultsQuery = `query($first: Int!, $skip: Int!) {
+  vaults(
+    first: $first
+    skip: $skip
+    orderBy: TotalAssetsUsd
+    orderDirection: Desc
+    where: { chainId_in: [8453] }
+  ) {
+    items {
+      address
+      name
+      symbol
+      totalAssetsUsd
+      allocation {
+        market { uniqueKey }
+        supplyAssetsUsd
+      }
+    }
+  }
+}`
 
+// ---------- HTTP helpers ----------
+
+func postGraphQL(ctx context.Context, query string, vars map[string]any) ([]byte, error) {
+	body, _ := json.Marshal(gqlRequest{Query: query, Variables: vars})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		MorphoGraphQLURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c := &http.Client{Timeout: 30 * time.Second}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("graphql HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+	return raw, nil
+}
+
+// ---------- Market discovery ----------
+
+// DiscoverMarkets returns every Morpho Blue market on Base.
+// No filter is applied at this stage — filtering happens later,
+// after protocols are attached.
+func DiscoverMarkets(ctx context.Context) ([]MorphoMarket, error) {
+	var all []MorphoMarket
 	for skip := 0; ; skip += 100 {
 		if err := ctx.Err(); err != nil {
 			return all, err
 		}
-		reqBody, _ := json.Marshal(gqlRequest{
-			Query: morphoMarketsQuery,
-			Variables: map[string]any{
-				"first": 100,
-				"skip":  skip,
-			},
-		})
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-			MorphoGraphQLURL, bytes.NewReader(reqBody))
+		raw, err := postGraphQL(ctx, morphoMarketsQuery,
+			map[string]any{"first": 100, "skip": skip})
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("morpho api: %w", err)
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("morpho api: HTTP %d: %s",
-				resp.StatusCode, string(body))
-		}
-
 		var parsed gqlMarketsResponse
-		if err := json.Unmarshal(body, &parsed); err != nil {
-			return nil, fmt.Errorf("morpho api decode: %w", err)
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			return nil, fmt.Errorf("decode markets: %w", err)
 		}
 		items := parsed.Data.Markets.Items
 		if len(items) == 0 {
 			break
 		}
-
 		for _, it := range items {
 			if it.Oracle == nil || it.CollateralAsset == nil {
 				continue
 			}
-
 			warnTypes := make([]string, 0, len(it.Warnings))
 			for _, w := range it.Warnings {
 				warnTypes = append(warnTypes, w.Type)
 			}
-
-			m := MorphoMarket{
+			all = append(all, MorphoMarket{
 				MarketID:   it.MarketID,
 				Oracle:     common.HexToAddress(it.Oracle.Address),
 				OracleType: it.Oracle.Type,
@@ -230,10 +284,8 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 				BorrowUSD:     it.State.BorrowAssetsUsd,
 				CollateralUSD: it.State.CollateralAssetsUsd,
 				SupplyUSD:     it.State.SupplyAssetsUsd,
-			}
-			all = append(all, m)
+			})
 		}
-
 		if len(items) < 100 {
 			break
 		}
@@ -241,36 +293,117 @@ func Discover(ctx context.Context) ([]MorphoMarket, error) {
 	return all, nil
 }
 
-// isSuspiciousCollateral is retained for future classification. It
-// is no longer called during discovery.
-func isSuspiciousCollateral(addr common.Address, symbol, name string) bool {
-	s := strings.ToLower(symbol + " " + name)
-	for _, p := range wrapperPatterns {
-		if strings.Contains(s, p) {
-			return true
+// ---------- Protocol discovery ----------
+
+// DiscoverProtocols pulls every MetaMorpho vault on Base with its
+// per-market allocations. Any vault that reports at least one
+// allocation to a market is considered a protocol in scope.
+func DiscoverProtocols(ctx context.Context) ([]Protocol, error) {
+	var all []Protocol
+	for skip := 0; ; skip += 100 {
+		if err := ctx.Err(); err != nil {
+			return all, err
+		}
+		raw, err := postGraphQL(ctx, morphoVaultsQuery,
+			map[string]any{"first": 100, "skip": skip})
+		if err != nil {
+			return nil, err
+		}
+		var parsed gqlVaultsResponse
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			return nil, fmt.Errorf("decode vaults: %w", err)
+		}
+		items := parsed.Data.Vaults.Items
+		if len(items) == 0 {
+			break
+		}
+		for _, it := range items {
+			allocs := make([]Allocation, 0, len(it.Allocation))
+			for _, a := range it.Allocation {
+				if a.Market.UniqueKey == "" {
+					continue
+				}
+				allocs = append(allocs, Allocation{
+					MarketID:  a.Market.UniqueKey,
+					SupplyUSD: a.SupplyAssetsUsd,
+				})
+			}
+			all = append(all, Protocol{
+				Address:        common.HexToAddress(it.Address),
+				Name:           it.Name,
+				Symbol:         it.Symbol,
+				Category:       classifyProtocol(it.Name, it.Symbol),
+				TotalAssetsUSD: it.TotalAssetsUsd,
+				Allocations:    allocs,
+			})
+		}
+		if len(items) < 100 {
+			break
 		}
 	}
-	return !baselineAssets[addr]
+	return all, nil
 }
 
-// UniqueCollaterals returns deduplicated collateral addresses.
-func UniqueCollaterals(markets []MorphoMarket) []common.Address {
-	seen := make(map[common.Address]struct{})
-	var out []common.Address
+// classifyProtocol derives a strategy category from vault metadata.
+// The Morpho API does not carry an authoritative category field,
+// so this is a name-based heuristic. Unknown vaults are still
+// included; they will be filtered later if they are dust.
+func classifyProtocol(name, symbol string) string {
+	s := strings.ToLower(name + " " + symbol)
+	switch {
+	case strings.Contains(s, "delta"),
+		strings.Contains(s, "neutral"),
+		strings.Contains(s, "hedge"),
+		strings.Contains(s, "basis"):
+		return catDeltaNeutralVault
+	case strings.Contains(s, "lever"),
+		strings.Contains(s, "farm"),
+		strings.Contains(s, "loop"),
+		strings.Contains(s, "yield"):
+		return catLeveragedYieldFarm
+	case strings.Contains(s, "lp"),
+		strings.Contains(s, "collateral"):
+		return catLPCollateral
+	case strings.Contains(s, "metamorpho"),
+		strings.Contains(s, "vault"):
+		return catERC4626YieldVault
+	default:
+		return catERC4626YieldVault // MetaMorpho default
+	}
+}
+
+// BuildMarketProtocolIndex joins markets to protocols by matching
+// each protocol's allocations to market IDs. Returns one entry per
+// market that has at least one protocol attached.
+func BuildMarketProtocolIndex(
+	markets []MorphoMarket,
+	protocols []Protocol,
+) []MarketWithProtocols {
+
+	// marketID -> []Protocol
+	idx := make(map[string][]Protocol)
+	for _, p := range protocols {
+		for _, a := range p.Allocations {
+			idx[a.MarketID] = append(idx[a.MarketID], p)
+		}
+	}
+
+	var out []MarketWithProtocols
 	for _, m := range markets {
-		if m.CollateralAsset.Address == (common.Address{}) {
+		ps := idx[m.MarketID]
+		if len(ps) == 0 {
 			continue
 		}
-		if _, ok := seen[m.CollateralAsset.Address]; ok {
-			continue
-		}
-		seen[m.CollateralAsset.Address] = struct{}{}
-		out = append(out, m.CollateralAsset.Address)
+		out = append(out, MarketWithProtocols{
+			Market:    m,
+			Protocols: ps,
+		})
 	}
 	return out
 }
 
-// UniqueOracles returns deduplicated oracle addresses.
+// ---------- Dedupe helpers ----------
+
 func UniqueOracles(markets []MorphoMarket) []common.Address {
 	seen := make(map[common.Address]struct{})
 	var out []common.Address
@@ -283,6 +416,22 @@ func UniqueOracles(markets []MorphoMarket) []common.Address {
 		}
 		seen[m.Oracle] = struct{}{}
 		out = append(out, m.Oracle)
+	}
+	return out
+}
+
+func UniqueProtocols(ps []Protocol) []common.Address {
+	seen := make(map[common.Address]struct{})
+	var out []common.Address
+	for _, p := range ps {
+		if p.Address == (common.Address{}) {
+			continue
+		}
+		if _, ok := seen[p.Address]; ok {
+			continue
+		}
+		seen[p.Address] = struct{}{}
+		out = append(out, p.Address)
 	}
 	return out
 }
