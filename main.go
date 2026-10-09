@@ -151,14 +151,19 @@ func run() int {
 	log.Printf("scanner: %d unique collateral assets, %d unique oracles",
 		uniqueCollaterals, uniqueOracles)
 
-	// Stage 2: trace-based oracle triage.
-	shortlist := TriageOracles(runCtx, client, rpcClient, markets)
+		// Stage 2: trace-based oracle triage.
+	shortlist, triageStats := TriageOracles(runCtx, client, rpcClient, markets)
 	log.Printf("scanner: %d shortlisted markets", len(shortlist))
+	log.Printf("scanner[triage]: total=%d trace_ok=%d trace_reverted=%d trace_error=%d shortlisted=%d",
+		triageStats.Total,
+		triageStats.TraceOK,
+		triageStats.TraceReverted,
+		triageStats.TraceError,
+		triageStats.Shortlisted)
 
 	// Stage 3: fork confirmation.
 	confirmed, suspected := Simulate(runCtx, client, rpcClient, shortlist)
 	log.Printf("scanner: %d confirmed, %d suspected", len(confirmed), len(suspected))
-
 	meta := RunMetadata{
 		ChainID:            chainID.Int64(),
 		BlockNumber:        blockNum,
