@@ -13,8 +13,11 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// ---------- Wire types ----------
+// =============================================================
+// Core domain types
+// =============================================================
 
+// AssetInfo describes a loan or collateral token.
 type AssetInfo struct {
 	Address  common.Address
 	Symbol   string
@@ -22,8 +25,7 @@ type AssetInfo struct {
 	Decimals uint8
 }
 
-// MorphoMarket is a raw Morpho Blue market. It has no protocol
-// attachments yet — those are joined in BuildMarketProtocolIndex.
+// MorphoMarket is one Morpho Blue market row.
 type MorphoMarket struct {
 	MarketID        string
 	Oracle          common.Address
@@ -37,7 +39,7 @@ type MorphoMarket struct {
 	CollateralUSD   float64
 	SupplyUSD       float64
 
-	// Populated by triage.
+	// Populated by TriageOracles in analysis.go.
 	Selectors   []string
 	TracedPools []common.Address
 }
@@ -48,7 +50,7 @@ type Allocation struct {
 	SupplyUSD float64
 }
 
-// Protocol is a strategy-level actor built on top of Morpho:
+// Protocol is a strategy-level actor built on top of Morpho Blue:
 // a MetaMorpho vault, an ERC-4626 yield vault, or any curated
 // wrapper that reports per-market allocations.
 type Protocol struct {
@@ -67,7 +69,9 @@ type MarketWithProtocols struct {
 	Protocols []Protocol
 }
 
-// ---------- GraphQL wire ----------
+// =============================================================
+// GraphQL wire helpers
+// =============================================================
 
 type gqlRequest struct {
 	Query     string         `json:"query"`
@@ -110,6 +114,8 @@ type gqlAsset struct {
 	Decimals int    `json:"decimals"`
 }
 
+// ---------- Market wire types ----------
+
 type gqlMarketItem struct {
 	MarketID        string       `json:"marketId"`
 	LLTV            FlexString   `json:"lltv"`
@@ -133,6 +139,13 @@ type gqlMarketsResponse struct {
 	} `json:"data"`
 }
 
+// ---------- Vault wire types (V1 schema) ----------
+//
+// Morpho V1 exposes vault identity on the Vault type and live state
+// on the nested VaultState type. totalAssetsUsd and allocation both
+// live under state; asking for them on the parent type produces a
+// GRAPHQL_VALIDATION_FAILED response.
+
 type gqlAllocationItem struct {
 	Market struct {
 		UniqueKey string `json:"uniqueKey"`
@@ -140,12 +153,16 @@ type gqlAllocationItem struct {
 	SupplyAssetsUsd float64 `json:"supplyAssetsUsd"`
 }
 
+type gqlVaultState struct {
+	TotalAssetsUsd float64             `json:"totalAssetsUsd"`
+	Allocation     []gqlAllocationItem `json:"allocation"`
+}
+
 type gqlVaultItem struct {
-	Address         string              `json:"address"`
-	Name            string              `json:"name"`
-	Symbol          string              `json:"symbol"`
-	TotalAssetsUsd  float64             `json:"totalAssetsUsd"`
-	Allocation      []gqlAllocationItem `json:"allocation"`
+	Address string        `json:"address"`
+	Name    string        `json:"name"`
+	Symbol  string        `json:"symbol"`
+	State   gqlVaultState `json:"state"`
 }
 
 type gqlVaultsResponse struct {
@@ -156,7 +173,9 @@ type gqlVaultsResponse struct {
 	} `json:"data"`
 }
 
-// ---------- Queries ----------
+// =============================================================
+// Queries
+// =============================================================
 
 const morphoMarketsQuery = `query($first: Int!, $skip: Int!) {
   markets(
@@ -183,9 +202,6 @@ const morphoMarketsQuery = `query($first: Int!, $skip: Int!) {
   }
 }`
 
-// morphoVaultsQuery pulls every MetaMorpho vault on Base together
-// with its per-market allocation. This is the link from market to
-// protocol; the reverse index is built in BuildMarketProtocolIndex.
 const morphoVaultsQuery = `query($first: Int!, $skip: Int!) {
   vaults(
     first: $first
@@ -198,16 +214,20 @@ const morphoVaultsQuery = `query($first: Int!, $skip: Int!) {
       address
       name
       symbol
-      totalAssetsUsd
-      allocation {
-        market { uniqueKey }
-        supplyAssetsUsd
+      state {
+        totalAssetsUsd
+        allocation {
+          market { uniqueKey }
+          supplyAssetsUsd
+        }
       }
     }
   }
 }`
 
-// ---------- HTTP helpers ----------
+// =============================================================
+// HTTP transport
+// =============================================================
 
 func postGraphQL(ctx context.Context, query string, vars map[string]any) ([]byte, error) {
 	body, _ := json.Marshal(gqlRequest{Query: query, Variables: vars})
@@ -230,7 +250,9 @@ func postGraphQL(ctx context.Context, query string, vars map[string]any) ([]byte
 	return raw, nil
 }
 
-// ---------- Market discovery ----------
+// =============================================================
+// Market discovery
+// =============================================================
 
 // DiscoverMarkets returns every Morpho Blue market on Base.
 // No filter is applied at this stage — filtering happens later,
@@ -293,7 +315,9 @@ func DiscoverMarkets(ctx context.Context) ([]MorphoMarket, error) {
 	return all, nil
 }
 
-// ---------- Protocol discovery ----------
+// =============================================================
+// Protocol discovery
+// =============================================================
 
 // DiscoverProtocols pulls every MetaMorpho vault on Base with its
 // per-market allocations. Any vault that reports at least one
@@ -318,8 +342,8 @@ func DiscoverProtocols(ctx context.Context) ([]Protocol, error) {
 			break
 		}
 		for _, it := range items {
-			allocs := make([]Allocation, 0, len(it.Allocation))
-			for _, a := range it.Allocation {
+			allocs := make([]Allocation, 0, len(it.State.Allocation))
+			for _, a := range it.State.Allocation {
 				if a.Market.UniqueKey == "" {
 					continue
 				}
@@ -333,7 +357,7 @@ func DiscoverProtocols(ctx context.Context) ([]Protocol, error) {
 				Name:           it.Name,
 				Symbol:         it.Symbol,
 				Category:       classifyProtocol(it.Name, it.Symbol),
-				TotalAssetsUSD: it.TotalAssetsUsd,
+				TotalAssetsUSD: it.State.TotalAssetsUsd,
 				Allocations:    allocs,
 			})
 		}
@@ -372,25 +396,37 @@ func classifyProtocol(name, symbol string) string {
 	}
 }
 
+// =============================================================
+// Join
+// =============================================================
+
 // BuildMarketProtocolIndex joins markets to protocols by matching
 // each protocol's allocations to market IDs. Returns one entry per
 // market that has at least one protocol attached.
+//
+// Both sides are normalized to lowercase hex without a 0x prefix
+// before matching, because the Morpho API has historically returned
+// market IDs in mixed casing across its endpoints.
 func BuildMarketProtocolIndex(
 	markets []MorphoMarket,
 	protocols []Protocol,
 ) []MarketWithProtocols {
 
-	// marketID -> []Protocol
 	idx := make(map[string][]Protocol)
 	for _, p := range protocols {
 		for _, a := range p.Allocations {
-			idx[a.MarketID] = append(idx[a.MarketID], p)
+			key := normalizeMarketID(a.MarketID)
+			if key == "" {
+				continue
+			}
+			idx[key] = append(idx[key], p)
 		}
 	}
 
 	var out []MarketWithProtocols
 	for _, m := range markets {
-		ps := idx[m.MarketID]
+		key := normalizeMarketID(m.MarketID)
+		ps := idx[key]
 		if len(ps) == 0 {
 			continue
 		}
@@ -402,7 +438,16 @@ func BuildMarketProtocolIndex(
 	return out
 }
 
-// ---------- Dedupe helpers ----------
+func normalizeMarketID(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ToLower(s)
+	s = strings.TrimPrefix(s, "0x")
+	return s
+}
+
+// =============================================================
+// Dedupe helpers
+// =============================================================
 
 func UniqueOracles(markets []MorphoMarket) []common.Address {
 	seen := make(map[common.Address]struct{})
