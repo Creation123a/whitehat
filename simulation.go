@@ -28,19 +28,15 @@ var (
 var (
 	shiftV2Num = big.NewInt(110)
 	shiftV2Den = big.NewInt(100)
-
 	shiftV3Num = big.NewInt(95)
 	shiftV3Den = big.NewInt(100)
-)
-
-var (
 	mask112 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 112), big.NewInt(1))
 	mask160 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 160), big.NewInt(1))
 )
 
-// ConfirmedMarket carries the fork-verified evidence for one market.
 type ConfirmedMarket struct {
 	Market      MorphoMarket
+	Protocols   []Protocol
 	Pool        common.Address
 	PoolKind    string
 	PriceBefore *big.Int
@@ -49,32 +45,32 @@ type ConfirmedMarket struct {
 	Evidence    string
 }
 
-// SuspectedMarket is a shortlisted market that didn't confirm.
 type SuspectedMarket struct {
-	Market MorphoMarket
-	Reason string
+	Market    MorphoMarket
+	Protocols []Protocol
+	Reason    string
 }
 
-// Simulate runs the fork test on each shortlisted market.
 func Simulate(
 	ctx context.Context,
 	client *ethclient.Client,
 	rpcClient *rpc.Client,
-	shortlist []MorphoMarket,
+	in []MarketWithProtocols,
 ) ([]ConfirmedMarket, []SuspectedMarket) {
 
 	var confirmed []ConfirmedMarket
 	var suspected []SuspectedMarket
 
-	for i := range shortlist {
-		cm, reason, ok := simulateOne(ctx, client, rpcClient, shortlist[i])
+	for _, mp := range in {
+		cm, reason, ok := simulateOne(ctx, client, rpcClient, mp)
 		if ok {
 			confirmed = append(confirmed, cm)
 			continue
 		}
 		suspected = append(suspected, SuspectedMarket{
-			Market: shortlist[i],
-			Reason: reason,
+			Market:    mp.Market,
+			Protocols: mp.Protocols,
+			Reason:    reason,
 		})
 	}
 	return confirmed, suspected
@@ -84,60 +80,49 @@ func simulateOne(
 	ctx context.Context,
 	client *ethclient.Client,
 	rpcClient *rpc.Client,
-	m MorphoMarket,
+	mp MarketWithProtocols,
 ) (ConfirmedMarket, string, bool) {
 
-	// Candidate pools. The trace now collects every pool the oracle
-	// touched via getReserves()/slot0(). If the trace failed, fall
-	// back to probing the oracle and collateral directly.
-	var candidatePools []common.Address
-	if len(m.TracedPools) > 0 {
-		candidatePools = m.TracedPools
-	} else {
-		pool, _, err := locateAMMPoolDual(ctx, client, m.Oracle,
-			m.CollateralAsset.Address)
+	m := mp.Market
+
+	pools := m.TracedPools
+	if len(pools) == 0 {
+		pool, _, err := locateAMMPoolDual(ctx, client, m.Oracle, m.CollateralAsset.Address)
 		if err != nil {
-			return ConfirmedMarket{},
-				"pool_not_resolved: " + err.Error(), false
+			return ConfirmedMarket{}, "pool_not_resolved: " + err.Error(), false
 		}
-		candidatePools = []common.Address{pool}
+		pools = []common.Address{pool}
 	}
 
-	// Baseline price.
 	base, err := callBig(ctx, client, m.Oracle, SelPrice)
 	if err != nil || base.Sign() == 0 {
 		return ConfirmedMarket{}, "oracle_call_failed", false
 	}
 
 	threshold := minDeltaForPair(m.LoanAsset, m.CollateralAsset)
-
 	lastReason := "no_pool_confirmed"
-	for _, pool := range candidatePools {
+	for _, pool := range pools {
 		kind := detectAMMKind(ctx, client, pool)
 		if kind == "" {
-			lastReason = "traced_pool_does_not_respond_to_getReserves_or_slot0"
+			lastReason = "traced_pool_not_amm"
 			continue
 		}
-
-		cm, reason, ok := tryPool(ctx, client, rpcClient, m,
+		cm, reason, ok := tryPool(ctx, client, rpcClient, m, mp.Protocols,
 			pool, kind, base, threshold)
 		if ok {
 			return cm, "", true
 		}
 		lastReason = reason
 	}
-
 	return ConfirmedMarket{}, lastReason, false
 }
 
-// tryPool snapshots, mutates the pool's storage, re-reads price(),
-// compares to baseline, and always reverts. The mutation is
-// guaranteed to be undone before returning.
 func tryPool(
 	ctx context.Context,
 	client *ethclient.Client,
 	rpcClient *rpc.Client,
 	m MorphoMarket,
+	protocols []Protocol,
 	pool common.Address,
 	kind string,
 	base *big.Int,
@@ -164,29 +149,20 @@ func tryPool(
 		return ConfirmedMarket{}, "oracle_call_after_failed", false
 	}
 
-	delta := new(big.Int).Sub(after, base)
-	absDelta := new(big.Int).Abs(delta)
-	pctF := new(big.Float).Quo(
-		new(big.Float).SetInt(absDelta),
-		new(big.Float).SetInt(base),
-	)
-	pctF.Mul(pctF, big.NewFloat(100))
-	pct, _ := pctF.Float64()
-
+	pct := pctDelta(base, after)
 	if pct < threshold {
 		return ConfirmedMarket{},
-			fmt.Sprintf("delta_below_threshold: %.4f%% < %.2f%%", pct, threshold),
-			false
+			fmt.Sprintf("delta_below_threshold: %.4f%% < %.2f%%", pct, threshold), false
 	}
 
 	evidence := fmt.Sprintf(
-		"oracle.price() moved %.2f%% (%s → %s) when %s shifted (%s pool %s); "+
-			"collateral wrapper at %s uses spot AMM state internally",
-		pct, base.String(), after.String(), label, kind, pool.Hex(),
-		m.CollateralAsset.Address.Hex())
+		"oracle.price() moved %.2f%% (%s -> %s) when %s shifted (%s pool %s); "+
+			"%d protocol(s) supply to this market and are exposed",
+		pct, base.String(), after.String(), label, kind, pool.Hex(), len(protocols))
 
 	return ConfirmedMarket{
 		Market:      m,
+		Protocols:   protocols,
 		Pool:        pool,
 		PoolKind:    kind,
 		PriceBefore: base,
@@ -196,17 +172,19 @@ func tryPool(
 	}, "", true
 }
 
-// mutatePool performs the AMM-kind-specific storage mutation and
-// returns a human-readable label. Returns error if the pool's slot
-// layout doesn't match the detected kind.
-func mutatePool(
-	ctx context.Context,
-	client *ethclient.Client,
-	rpcClient *rpc.Client,
-	pool common.Address,
-	kind string,
-) (string, error) {
+func pctDelta(base, after *big.Int) float64 {
+	if base.Sign() == 0 {
+		return 0
+	}
+	d := new(big.Int).Sub(after, base)
+	abs := new(big.Int).Abs(d)
+	f := new(big.Float).Quo(new(big.Float).SetInt(abs), new(big.Float).SetInt(base))
+	f.Mul(f, big.NewFloat(100))
+	v, _ := f.Float64()
+	return v
+}
 
+func mutatePool(ctx context.Context, client *ethclient.Client, rpcClient *rpc.Client, pool common.Address, kind string) (string, error) {
 	switch kind {
 	case ammUniswapV2:
 		slot := slotUniswapV2Reserves
@@ -218,11 +196,7 @@ func mutatePool(
 		if err != nil {
 			return "", err
 		}
-		if err := setStorage(ctx, rpcClient, pool, slot, mutated); err != nil {
-			return "", err
-		}
-		return label, nil
-
+		return label, setStorage(ctx, rpcClient, pool, slot, mutated)
 	case ammUniswapV3:
 		slot := slotUniswapV3Slot0
 		original, err := readSlot(ctx, client, pool, slot)
@@ -233,11 +207,7 @@ func mutatePool(
 		if err != nil {
 			return "", err
 		}
-		if err := setStorage(ctx, rpcClient, pool, slot, mutated); err != nil {
-			return "", err
-		}
-		return label, nil
-
+		return label, setStorage(ctx, rpcClient, pool, slot, mutated)
 	case ammAerodromeV2:
 		slot := slotAerodromeV2Reserve0
 		original, err := readSlot(ctx, client, pool, slot)
@@ -248,11 +218,7 @@ func mutatePool(
 		if err != nil {
 			return "", err
 		}
-		if err := setStorage(ctx, rpcClient, pool, slot, mutated); err != nil {
-			return "", err
-		}
-		return label, nil
-
+		return label, setStorage(ctx, rpcClient, pool, slot, mutated)
 	case ammAerodromeSlipstr:
 		slot := slotAerodromeSlipstreamSlot0
 		original, err := readSlot(ctx, client, pool, slot)
@@ -263,25 +229,12 @@ func mutatePool(
 		if err != nil {
 			return "", err
 		}
-		if err := setStorage(ctx, rpcClient, pool, slot, mutated); err != nil {
-			return "", err
-		}
-		return label, nil
-
-	default:
-		return "", fmt.Errorf("unknown_amm_kind")
+		return label, setStorage(ctx, rpcClient, pool, slot, mutated)
 	}
+	return "", fmt.Errorf("unknown_amm_kind")
 }
 
-// ---------- AMM pool discovery ----------
-
-func locateAMMPoolDual(
-	ctx context.Context,
-	client *ethclient.Client,
-	oracle, collateral common.Address,
-) (common.Address, string, error) {
-
-	// Case 1: collateral IS the pool.
+func locateAMMPoolDual(ctx context.Context, client *ethclient.Client, oracle, collateral common.Address) (common.Address, string, error) {
 	if collateral != (common.Address{}) {
 		if _, err := callBig(ctx, client, collateral, SelGetReserves); err == nil {
 			if _, err := callBig(ctx, client, collateral, SelStable); err == nil {
@@ -296,8 +249,6 @@ func locateAMMPoolDual(
 			return collateral, ammAerodromeSlipstr, nil
 		}
 	}
-
-	// Case 2 & 3: scan oracle then collateral for PUSH20 refs.
 	for _, target := range []common.Address{oracle, collateral} {
 		if target == (common.Address{}) {
 			continue
@@ -321,7 +272,7 @@ func locateAMMPoolDual(
 			}
 		}
 	}
-	return common.Address{}, "", fmt.Errorf("no AMM pool resolved in oracle or collateral")
+	return common.Address{}, "", fmt.Errorf("no AMM pool resolved")
 }
 
 func extractPUSH20Candidates(code []byte) []common.Address {
@@ -344,25 +295,20 @@ func extractPUSH20Candidates(code []byte) []common.Address {
 	return out
 }
 
-// ---------- Storage mutations ----------
-
-func shiftV2ReservesPacked(
-	old common.Hash, mask *big.Int, width uint,
-) (common.Hash, string, error) {
+func shiftV2ReservesPacked(old common.Hash, mask *big.Int, width uint) (common.Hash, string, error) {
 	v := new(big.Int).SetBytes(old.Bytes())
-	reserve0 := new(big.Int).And(v, mask)
-	if reserve0.Sign() == 0 {
+	r0 := new(big.Int).And(v, mask)
+	if r0.Sign() == 0 {
 		return common.Hash{}, "", fmt.Errorf("zero reserve0")
 	}
-	newReserve0 := new(big.Int).Mul(reserve0, shiftV2Num)
-	newReserve0.Div(newReserve0, shiftV2Den)
-	if newReserve0.BitLen() > int(width) {
+	nr0 := new(big.Int).Mul(r0, shiftV2Num)
+	nr0.Div(nr0, shiftV2Den)
+	if nr0.BitLen() > int(width) {
 		return common.Hash{}, "", fmt.Errorf("reserve0 overflow")
 	}
 	cleared := new(big.Int).And(v, new(big.Int).Not(mask))
-	result := new(big.Int).Or(cleared, newReserve0)
-	pct := shiftV2Num.Int64() - 100
-	return common.BigToHash(result), fmt.Sprintf("+%d%% reserve0", pct), nil
+	return common.BigToHash(new(big.Int).Or(cleared, nr0)),
+		fmt.Sprintf("+%d%% reserve0", shiftV2Num.Int64()-100), nil
 }
 
 func shiftAerodromeV2Reserve0(old common.Hash) (common.Hash, string, error) {
@@ -370,40 +316,30 @@ func shiftAerodromeV2Reserve0(old common.Hash) (common.Hash, string, error) {
 	if v.Sign() == 0 {
 		return common.Hash{}, "", fmt.Errorf("zero reserve0")
 	}
-	newReserve0 := new(big.Int).Mul(v, shiftV2Num)
-	newReserve0.Div(newReserve0, shiftV2Den)
-	pct := shiftV2Num.Int64() - 100
-	return common.BigToHash(newReserve0),
-		fmt.Sprintf("+%d%% reserve0", pct), nil
+	nr0 := new(big.Int).Mul(v, shiftV2Num)
+	nr0.Div(nr0, shiftV2Den)
+	return common.BigToHash(nr0),
+		fmt.Sprintf("+%d%% reserve0", shiftV2Num.Int64()-100), nil
 }
 
-func shiftV3Slot0(
-	old common.Hash, mask *big.Int, width uint,
-) (common.Hash, string, error) {
+func shiftV3Slot0(old common.Hash, mask *big.Int, width uint) (common.Hash, string, error) {
 	v := new(big.Int).SetBytes(old.Bytes())
-	sqrtPrice := new(big.Int).And(v, mask)
-	if sqrtPrice.Sign() == 0 {
+	sp := new(big.Int).And(v, mask)
+	if sp.Sign() == 0 {
 		return common.Hash{}, "", fmt.Errorf("zero sqrtPriceX96")
 	}
-	newSqrt := new(big.Int).Mul(sqrtPrice, shiftV3Num)
-	newSqrt.Div(newSqrt, shiftV3Den)
+	ns := new(big.Int).Mul(sp, shiftV3Num)
+	ns.Div(ns, shiftV3Den)
 	cleared := new(big.Int).And(v, new(big.Int).Not(mask))
-	result := new(big.Int).Or(cleared, newSqrt)
-	pct := 100 - shiftV3Num.Int64()
-	return common.BigToHash(result),
-		fmt.Sprintf("sqrtPriceX96 -%d%%", pct), nil
+	return common.BigToHash(new(big.Int).Or(cleared, ns)),
+		fmt.Sprintf("sqrtPriceX96 -%d%%", 100-shiftV3Num.Int64()), nil
 }
 
 func shiftSlipstreamSlot0(old common.Hash) (common.Hash, string, error) {
 	return shiftV3Slot0(old, mask160, 160)
 }
 
-// ---------- RPC helpers ----------
-
-func readSlot(
-	ctx context.Context, client *ethclient.Client,
-	addr common.Address, slot common.Hash,
-) (common.Hash, error) {
+func readSlot(ctx context.Context, client *ethclient.Client, addr common.Address, slot common.Hash) (common.Hash, error) {
 	raw, err := client.StorageAt(ctx, addr, slot, nil)
 	if err != nil {
 		return common.Hash{}, err
@@ -414,18 +350,12 @@ func readSlot(
 	return common.BytesToHash(raw), nil
 }
 
-func setStorage(
-	ctx context.Context, c *rpc.Client,
-	addr common.Address, slot, value common.Hash,
-) error {
+func setStorage(ctx context.Context, c *rpc.Client, addr common.Address, slot, value common.Hash) error {
 	var res interface{}
-	err := c.CallContext(ctx, &res, "anvil_setStorageAt",
-		addr.Hex(), slot.Hex(), value.Hex())
-	if err == nil {
+	if err := c.CallContext(ctx, &res, "anvil_setStorageAt", addr.Hex(), slot.Hex(), value.Hex()); err == nil {
 		return nil
 	}
-	return c.CallContext(ctx, &res, "hardhat_setStorageAt",
-		addr.Hex(), slot.Hex(), value.Hex())
+	return c.CallContext(ctx, &res, "hardhat_setStorageAt", addr.Hex(), slot.Hex(), value.Hex())
 }
 
 func takeSnapshot(ctx context.Context, c *rpc.Client) (string, error) {
@@ -444,12 +374,7 @@ func revertSnapshot(ctx context.Context, c *rpc.Client, id string) error {
 	return c.CallContext(ctx, &ok, "evm_revert", id)
 }
 
-// detectAMMKind probes a pool address and returns its AMM kind.
-func detectAMMKind(
-	ctx context.Context,
-	client *ethclient.Client,
-	pool common.Address,
-) string {
+func detectAMMKind(ctx context.Context, client *ethclient.Client, pool common.Address) string {
 	if _, err := callBig(ctx, client, pool, SelGetReserves); err == nil {
 		if _, err := callBig(ctx, client, pool, SelStable); err == nil {
 			return ammAerodromeV2
