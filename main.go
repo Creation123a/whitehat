@@ -38,8 +38,8 @@ func run() int {
 		outPath   = fs.String("out", "", "output file (default stdout)")
 		format    = fs.String("format", "text", "output format: text | json")
 		timeout   = fs.Duration("timeout", 20*time.Minute, "pipeline timeout")
-		minProt   = fs.Int("min-protocols", MinProtocolsPerMarket,
-			"minimum protocols attached to a market for it to be scanned")
+		minProt   = fs.Int("min-protocols", 0,
+			"optional post-join filter: drop markets with fewer than N protocols (0 = off)")
 		minTVL = fs.Float64("min-tvl", MinProtocolTVLUSD,
 			"minimum protocol TVL (USD) to survive dust filter")
 	)
@@ -132,7 +132,7 @@ func run() int {
 	}
 	log.Printf("scanner: forked at block %d, chain %d", blockNum, chainID.Int64())
 
-	// ---- Stage 1: market discovery ----
+	// ---- Stage 1: market discovery (Morpho Blue markets) ----
 	markets, err := DiscoverMarkets(runCtx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scanner: market discovery: %v\n", err)
@@ -140,66 +140,67 @@ func run() int {
 	}
 	log.Printf("scanner: %d markets from Morpho API", len(markets))
 
-	// ---- Stage 2: protocol discovery ----
-	protocols, err := DiscoverProtocols(runCtx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "scanner: protocol discovery: %v\n", err)
-		return 2
-	}
-	log.Printf("scanner: %d protocols from vaults API", len(protocols))
-
-	// ---- Stage 3: attach protocols to markets ----
-	indexed := BuildMarketProtocolIndex(markets, protocols)
-	log.Printf("scanner: %d markets have at least one protocol attached", len(indexed))
-
-	// ---- Stage 4: filter markets by protocol count ----
-	afterCount := FilterMarketsByProtocolCount(indexed, *minProt)
-	log.Printf("scanner: %d markets after min-protocols=%d filter",
-		len(afterCount), *minProt)
-
-	// ---- Stage 5: dust filter on protocols ----
-	afterTVL := FilterProtocolsByTVL(afterCount, *minTVL)
-	log.Printf("scanner: %d markets after TVL filter (min=$%.0f)",
-		len(afterTVL), *minTVL)
-
-	if len(afterTVL) == 0 {
-		log.Printf("scanner: no markets survived the filters; nothing to scan")
-		writeEmptyReport(*outPath, *format, blockNum, chainID.Int64(),
-			len(markets), len(protocols), len(indexed))
+	if len(markets) == 0 {
+		log.Printf("scanner: no markets returned from API; nothing to scan")
+		writeEmptyReport(*outPath, *format, blockNum, chainID.Int64(), 0, 0, 0)
 		return 0
 	}
 
-	// ---- Stage 6: oracle triage (spot AMM check) ----
-	flatMarkets := make([]MorphoMarket, 0, len(afterTVL))
-	for _, mp := range afterTVL {
-		flatMarkets = append(flatMarkets, mp.Market)
-	}
-	verdicts, triageStats := TriageOracles(runCtx, client, rpcClient, flatMarkets)
+	// ---- Stage 2: oracle triage over ALL markets, BEFORE any
+	//      protocol filtering or TVL filtering. This ordering is
+	//      the critical fix versus v5.0. ----
+	verdicts, triageStats := TriageOracles(runCtx, client, rpcClient, markets)
 	log.Printf("scanner[triage]: oracles=%d ok=%d reverted=%d error=%d shortlisted=%d",
 		triageStats.Total, triageStats.TraceOK,
 		triageStats.TraceReverted, triageStats.TraceError,
 		triageStats.Shortlisted)
 
-	// Attach traced pool + selectors back to markets in the joined list.
-	for i := range afterTVL {
-		v, ok := verdicts[afterTVL[i].Market.MarketID]
-		if !ok {
+	// ---- Stage 3: keep only markets whose oracle has a spot-AMM
+	//      read anywhere in its pricing path. ----
+	var vulnerableMarkets []MorphoMarket
+	for _, m := range markets {
+		v, ok := verdicts[m.MarketID]
+		if !ok || !v.Shortlisted {
 			continue
 		}
-		afterTVL[i].Market.Selectors = v.Selectors
-		afterTVL[i].Market.TracedPools = v.Pools
+		m.Selectors = v.Selectors
+		m.TracedPools = v.Pools
+		vulnerableMarkets = append(vulnerableMarkets, m)
+	}
+	log.Printf("scanner: %d vulnerable markets after oracle triage",
+		len(vulnerableMarkets))
+
+	// ---- Stage 4: protocol universe discovery (Morpho vaults
+	//      + DefiLlama, with best-effort SQD resolution). ----
+	protocols, err := DiscoverAllProtocols(runCtx, *minTVL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "scanner: protocol discovery: %v\n", err)
+		return 2
+	}
+	log.Printf("scanner: %d protocols from Morpho vaults + DefiLlama",
+		len(protocols))
+
+	// ---- Stage 5: attach protocols to every vulnerable market.
+	//      Markets with no matching protocols are kept so the
+	//      report distinguishes "no protocol" from "no vuln". ----
+	indexed := AttachProtocolsToMarkets(vulnerableMarkets, protocols)
+	log.Printf("scanner: %d vulnerable markets after protocol attachment",
+		len(indexed))
+
+	// ---- Stage 5b: optional post-join min-protocols filter. ----
+	if *minProt > 0 {
+		indexed = FilterMarketsByProtocolCount(indexed, *minProt)
+		log.Printf("scanner: %d markets after min-protocols=%d filter",
+			len(indexed), *minProt)
 	}
 
-	// ---- Stage 7: keep only vulnerable markets ----
-	vulnSet := make(map[string]bool, len(verdicts))
-	for id := range verdicts {
-		vulnSet[id] = true
-	}
-	vulnerable := FilterMarketsByOracleVulnerability(afterTVL, vulnSet)
-	log.Printf("scanner: %d vulnerable markets after oracle filter", len(vulnerable))
+	// ---- Stage 6: dust filter on protocol lists. ----
+	afterTVL := FilterProtocolsByTVL(indexed, *minTVL)
+	log.Printf("scanner: %d markets after TVL filter (min=$%.0f)",
+		len(afterTVL), *minTVL)
 
-	// ---- Stage 8: fork confirmation ----
-	confirmed, suspected := Simulate(runCtx, client, rpcClient, vulnerable)
+	// ---- Stage 7: fork confirmation. ----
+	confirmed, suspected := Simulate(runCtx, client, rpcClient, afterTVL)
 	log.Printf("scanner: %d confirmed, %d suspected", len(confirmed), len(suspected))
 
 	meta := RunMetadata{
@@ -207,9 +208,9 @@ func run() int {
 		BlockNumber:          blockNum,
 		MarketsFromAPI:       len(markets),
 		ProtocolsFromAPI:     len(protocols),
-		MarketsAfterCountFlt: len(afterCount),
+		MarketsAfterCountFlt: len(vulnerableMarkets), // repurposed: after triage
 		MarketsAfterTVLFlt:   len(afterTVL),
-		MarketsVulnerable:    len(vulnerable),
+		MarketsVulnerable:    len(vulnerableMarkets),
 		ConfirmedCount:       len(confirmed),
 		SuspectedCount:       len(suspected),
 	}
@@ -222,7 +223,7 @@ func run() int {
 	return WriteReport(*outPath, *format, rep)
 }
 
-// writeEmptyReport is called when the filters prune everything.
+// writeEmptyReport is called when discovery returns nothing at all.
 // The report is still emitted so the run is auditable.
 func writeEmptyReport(path, format string, block uint64, chainID int64,
 	markets, protocols, indexed int) {
