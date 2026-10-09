@@ -56,12 +56,6 @@ type SuspectedMarket struct {
 }
 
 // Simulate runs the fork test on each shortlisted market.
-//
-// The pipeline is now collateral-aware: pool resolution scans both the
-// oracle's bytecode AND the collateral asset's bytecode. If a spot-
-// dependent collateral wrapper is present, its AMM pool reference will
-// be found, the pool mutated, and oracle.price() — which reads the
-// collateral's valuation — will register the shift.
 func Simulate(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -93,30 +87,62 @@ func simulateOne(
 	m MorphoMarket,
 ) (ConfirmedMarket, string, bool) {
 
-		var pool common.Address
-	var kind string
-
-		if m.TracedPool != (common.Address{}) {
-		// Trace gave us the exact pool the oracle calls getReserves()/slot0() on.
-		pool = m.TracedPool
-		kind = detectAMMKind(ctx, client, pool)
-		if kind == "" {
-			return ConfirmedMarket{},
-				"traced_pool_does_not_respond_to_getReserves_or_slot0", false
-		}
+	// Candidate pools. The trace now collects every pool the oracle
+	// touched via getReserves()/slot0(). If the trace failed, fall
+	// back to probing the oracle and collateral directly.
+	var candidatePools []common.Address
+	if len(m.TracedPools) > 0 {
+		candidatePools = m.TracedPools
 	} else {
-		var err error
-		pool, kind, err = locateAMMPoolDual(ctx, client, m.Oracle,
+		pool, _, err := locateAMMPoolDual(ctx, client, m.Oracle,
 			m.CollateralAsset.Address)
 		if err != nil {
-			return ConfirmedMarket{}, "pool_not_resolved: " + err.Error(), false
+			return ConfirmedMarket{},
+				"pool_not_resolved: " + err.Error(), false
 		}
+		candidatePools = []common.Address{pool}
 	}
 
+	// Baseline price.
 	base, err := callBig(ctx, client, m.Oracle, SelPrice)
 	if err != nil || base.Sign() == 0 {
 		return ConfirmedMarket{}, "oracle_call_failed", false
 	}
+
+	threshold := minDeltaForPair(m.LoanAsset, m.CollateralAsset)
+
+	lastReason := "no_pool_confirmed"
+	for _, pool := range candidatePools {
+		kind := detectAMMKind(ctx, client, pool)
+		if kind == "" {
+			lastReason = "traced_pool_does_not_respond_to_getReserves_or_slot0"
+			continue
+		}
+
+		cm, reason, ok := tryPool(ctx, client, rpcClient, m,
+			pool, kind, base, threshold)
+		if ok {
+			return cm, "", true
+		}
+		lastReason = reason
+	}
+
+	return ConfirmedMarket{}, lastReason, false
+}
+
+// tryPool snapshots, mutates the pool's storage, re-reads price(),
+// compares to baseline, and always reverts. The mutation is
+// guaranteed to be undone before returning.
+func tryPool(
+	ctx context.Context,
+	client *ethclient.Client,
+	rpcClient *rpc.Client,
+	m MorphoMarket,
+	pool common.Address,
+	kind string,
+	base *big.Int,
+	threshold float64,
+) (ConfirmedMarket, string, bool) {
 
 	snap, err := takeSnapshot(ctx, rpcClient)
 	if err != nil {
@@ -128,63 +154,9 @@ func simulateOne(
 		}
 	}()
 
-	var (
-		slot    common.Hash
-		mutated common.Hash
-		label   string
-	)
-
-	switch kind {
-	case ammUniswapV2:
-		slot = slotUniswapV2Reserves
-		original, err := readSlot(ctx, client, pool, slot)
-		if err != nil {
-			return ConfirmedMarket{}, "read_slot_failed", false
-		}
-		mutated, label, err = shiftV2ReservesPacked(original, mask112, 112)
-		if err != nil {
-			return ConfirmedMarket{}, "mutation_failed: " + err.Error(), false
-		}
-
-	case ammUniswapV3:
-		slot = slotUniswapV3Slot0
-		original, err := readSlot(ctx, client, pool, slot)
-		if err != nil {
-			return ConfirmedMarket{}, "read_slot_failed", false
-		}
-		mutated, label, err = shiftV3Slot0(original, mask160, 160)
-		if err != nil {
-			return ConfirmedMarket{}, "mutation_failed: " + err.Error(), false
-		}
-
-	case ammAerodromeV2:
-		slot = slotAerodromeV2Reserve0
-		original, err := readSlot(ctx, client, pool, slot)
-		if err != nil {
-			return ConfirmedMarket{}, "read_slot_failed", false
-		}
-		mutated, label, err = shiftAerodromeV2Reserve0(original)
-		if err != nil {
-			return ConfirmedMarket{}, "mutation_failed: " + err.Error(), false
-		}
-
-	case ammAerodromeSlipstr:
-		slot = slotAerodromeSlipstreamSlot0
-		original, err := readSlot(ctx, client, pool, slot)
-		if err != nil {
-			return ConfirmedMarket{}, "read_slot_failed", false
-		}
-		mutated, label, err = shiftSlipstreamSlot0(original)
-		if err != nil {
-			return ConfirmedMarket{}, "mutation_failed: " + err.Error(), false
-		}
-
-	default:
-		return ConfirmedMarket{}, "unknown_amm_kind", false
-	}
-
-	if err := setStorage(ctx, rpcClient, pool, slot, mutated); err != nil {
-		return ConfirmedMarket{}, "storage_write_failed: " + err.Error(), false
+	label, err := mutatePool(ctx, client, rpcClient, pool, kind)
+	if err != nil {
+		return ConfirmedMarket{}, "mutation_failed: " + err.Error(), false
 	}
 
 	after, err := callBig(ctx, client, m.Oracle, SelPrice)
@@ -201,9 +173,9 @@ func simulateOne(
 	pctF.Mul(pctF, big.NewFloat(100))
 	pct, _ := pctF.Float64()
 
-	if pct < MinDeltaPct {
+	if pct < threshold {
 		return ConfirmedMarket{},
-			fmt.Sprintf("delta_below_threshold: %.4f%% < %.2f%%", pct, MinDeltaPct),
+			fmt.Sprintf("delta_below_threshold: %.4f%% < %.2f%%", pct, threshold),
 			false
 	}
 
@@ -224,16 +196,85 @@ func simulateOne(
 	}, "", true
 }
 
+// mutatePool performs the AMM-kind-specific storage mutation and
+// returns a human-readable label. Returns error if the pool's slot
+// layout doesn't match the detected kind.
+func mutatePool(
+	ctx context.Context,
+	client *ethclient.Client,
+	rpcClient *rpc.Client,
+	pool common.Address,
+	kind string,
+) (string, error) {
+
+	switch kind {
+	case ammUniswapV2:
+		slot := slotUniswapV2Reserves
+		original, err := readSlot(ctx, client, pool, slot)
+		if err != nil {
+			return "", err
+		}
+		mutated, label, err := shiftV2ReservesPacked(original, mask112, 112)
+		if err != nil {
+			return "", err
+		}
+		if err := setStorage(ctx, rpcClient, pool, slot, mutated); err != nil {
+			return "", err
+		}
+		return label, nil
+
+	case ammUniswapV3:
+		slot := slotUniswapV3Slot0
+		original, err := readSlot(ctx, client, pool, slot)
+		if err != nil {
+			return "", err
+		}
+		mutated, label, err := shiftV3Slot0(original, mask160, 160)
+		if err != nil {
+			return "", err
+		}
+		if err := setStorage(ctx, rpcClient, pool, slot, mutated); err != nil {
+			return "", err
+		}
+		return label, nil
+
+	case ammAerodromeV2:
+		slot := slotAerodromeV2Reserve0
+		original, err := readSlot(ctx, client, pool, slot)
+		if err != nil {
+			return "", err
+		}
+		mutated, label, err := shiftAerodromeV2Reserve0(original)
+		if err != nil {
+			return "", err
+		}
+		if err := setStorage(ctx, rpcClient, pool, slot, mutated); err != nil {
+			return "", err
+		}
+		return label, nil
+
+	case ammAerodromeSlipstr:
+		slot := slotAerodromeSlipstreamSlot0
+		original, err := readSlot(ctx, client, pool, slot)
+		if err != nil {
+			return "", err
+		}
+		mutated, label, err := shiftSlipstreamSlot0(original)
+		if err != nil {
+			return "", err
+		}
+		if err := setStorage(ctx, rpcClient, pool, slot, mutated); err != nil {
+			return "", err
+		}
+		return label, nil
+
+	default:
+		return "", fmt.Errorf("unknown_amm_kind")
+	}
+}
+
 // ---------- AMM pool discovery ----------
 
-// locateAMMPoolDual resolves the AMM pool an oracle reads from.
-//
-// Check order:
-//  1. Is the collateral itself an AMM pool? (LP tokens used directly
-//     as collateral — Uniswap V2 LP, Aerodrome LP, etc.) If it
-//     answers getReserves() or slot0(), that's the pool.
-//  2. Scan the oracle's bytecode for PUSH20 pool references.
-//  3. Scan the collateral's bytecode for PUSH20 pool references.
 func locateAMMPoolDual(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -256,7 +297,7 @@ func locateAMMPoolDual(
 		}
 	}
 
-	// Case 2 & 3: scan oracle then collateral for PUSH20 references.
+	// Case 2 & 3: scan oracle then collateral for PUSH20 refs.
 	for _, target := range []common.Address{oracle, collateral} {
 		if target == (common.Address{}) {
 			continue
@@ -402,6 +443,7 @@ func revertSnapshot(ctx context.Context, c *rpc.Client, id string) error {
 	}
 	return c.CallContext(ctx, &ok, "evm_revert", id)
 }
+
 // detectAMMKind probes a pool address and returns its AMM kind.
 func detectAMMKind(
 	ctx context.Context,
