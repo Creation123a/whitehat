@@ -147,8 +147,8 @@ func run() int {
 	}
 
 	// ---- Stage 2: oracle triage over ALL markets, BEFORE any
-	//      protocol filtering or TVL filtering. This ordering is
-	//      the critical fix versus v5.0. ----
+	//      protocol filtering or TVL filtering. This is the
+	//      critical fix versus v5.0. ----
 	verdicts, triageStats := TriageOracles(runCtx, client, rpcClient, markets)
 	log.Printf("scanner[triage]: oracles=%d ok=%d reverted=%d error=%d shortlisted=%d",
 		triageStats.Total, triageStats.TraceOK,
@@ -199,7 +199,36 @@ func run() int {
 	log.Printf("scanner: %d markets after TVL filter (min=$%.0f)",
 		len(afterTVL), *minTVL)
 
-	// ---- Stage 7: fork confirmation. ----
+	// ---- Stage 7: differential probing on non-Morpho protocols.
+	//      Protocols with no Morpho allocations are probed directly
+	//      against their own bytecode and any AMM pools they
+	//      reference. Their results flow into the report's
+	//      Evaluated / Skipped sections and into Suspected when
+	//      AMM dependence is confirmed. ----
+	var probes []ProbeVerdict
+	for _, p := range protocols {
+		if len(p.Allocations) > 0 {
+			// Morpho integrator: already covered by the
+			// oracle-triage + Simulate path above.
+			continue
+		}
+		pv := ProbeProtocol(runCtx, client, rpcClient, p)
+		probes = append(probes, pv)
+		switch {
+		case pv.Skipped:
+			log.Printf("scanner[probe]: SKIP  %-30s (%s) %s",
+				pv.Name, pv.Category, pv.SkipReason)
+		case pv.AMMDependent:
+			log.Printf("scanner[probe]: FLAG  %-30s (%s) %d func(s)",
+				pv.Name, pv.Category, len(pv.DivergentFuncs))
+		default:
+			log.Printf("scanner[probe]: CLEAN %-30s (%s)",
+				pv.Name, pv.Category)
+		}
+	}
+	log.Printf("scanner[probe]: probed %d non-Morpho protocols", len(probes))
+
+	// ---- Stage 8: fork confirmation on Morpho markets. ----
 	confirmed, suspected := Simulate(runCtx, client, rpcClient, afterTVL)
 	log.Printf("scanner: %d confirmed, %d suspected", len(confirmed), len(suspected))
 
@@ -213,9 +242,10 @@ func run() int {
 		MarketsVulnerable:    len(vulnerableMarkets),
 		ConfirmedCount:       len(confirmed),
 		SuspectedCount:       len(suspected),
+		ProtocolsProbed:      len(probes),
 	}
 
-	rep, err := BuildReport(runCtx, client, meta, confirmed, suspected)
+	rep, err := BuildReport(runCtx, client, meta, confirmed, suspected, probes)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scanner: build report: %v\n", err)
 		return 2
@@ -238,8 +268,9 @@ func writeEmptyReport(path, format string, block uint64, chainID int64,
 		MarketsVulnerable:    0,
 		ConfirmedCount:       0,
 		SuspectedCount:       0,
+		ProtocolsProbed:      0,
 	}
-	rep, _ := BuildReport(context.Background(), nil, meta, nil, nil)
+	rep, _ := BuildReport(context.Background(), nil, meta, nil, nil, nil)
 	_ = WriteReport(path, format, rep)
 }
 
