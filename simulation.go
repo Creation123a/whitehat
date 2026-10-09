@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/big"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
@@ -30,8 +31,8 @@ var (
 	shiftV2Den = big.NewInt(100)
 	shiftV3Num = big.NewInt(95)
 	shiftV3Den = big.NewInt(100)
-	mask112 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 112), big.NewInt(1))
-	mask160 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 160), big.NewInt(1))
+	mask112    = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 112), big.NewInt(1))
+	mask160    = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 160), big.NewInt(1))
 )
 
 type ConfirmedMarket struct {
@@ -388,4 +389,36 @@ func detectAMMKind(ctx context.Context, client *ethclient.Client, pool common.Ad
 		return ammAerodromeSlipstr
 	}
 	return ""
+}
+
+// ---------- eth_call helpers (moved from report.go) ----------
+
+// callMsgData packs a selector plus pre-encoded 32-byte arguments
+// into an eth_call message.
+func callMsgData(to common.Address, selector []byte, args ...[]byte) ethereum.CallMsg {
+	data := make([]byte, 0, 4+32*len(args))
+	data = append(data, selector...)
+	for _, a := range args {
+		data = append(data, a...)
+	}
+	return ethereum.CallMsg{To: &to, Data: data}
+}
+
+// callBig performs an eth_call against `to` with `selector` as
+// calldata and decodes the first 32 bytes of the return value as
+// a big.Int.
+func callBig(
+	ctx context.Context,
+	client *ethclient.Client,
+	to common.Address,
+	selector []byte,
+) (*big.Int, error) {
+	raw, err := client.CallContract(ctx, callMsgData(to, selector), nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) < 32 {
+		return nil, fmt.Errorf("short response")
+	}
+	return new(big.Int).SetBytes(raw[:32]), nil
 }
