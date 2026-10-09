@@ -73,9 +73,15 @@ type RunMetadata struct {
 }
 
 type Report struct {
-	Metadata  RunMetadata    `json:"metadata"`
+	Metadata  RunMetadata     `json:"metadata"`
 	Confirmed []FindingReport `json:"confirmed"`
 	Suspected []SuspectedReport `json:"suspected"`
+}
+
+// sameMarketID compares two market IDs using the same normalization
+// used by the join. Must be used everywhere MarketIDs are compared.
+func sameMarketID(a, b string) bool {
+	return normalizeMarketID(a) == normalizeMarketID(b)
 }
 
 func BuildReport(
@@ -105,7 +111,7 @@ func BuildReport(
 		sr[i].Rank = i + 1
 	}
 
-	meta.SchemaVersion = "5.0"
+	meta.SchemaVersion = "6.0"
 	meta.Timestamp = time.Now().UTC().Format(time.RFC3339)
 
 	return &Report{
@@ -120,7 +126,7 @@ func toFindingReport(c ConfirmedMarket) FindingReport {
 	for _, p := range c.Protocols {
 		var exposure float64
 		for _, a := range p.Allocations {
-			if a.MarketID == c.Market.MarketID {
+			if sameMarketID(a.MarketID, c.Market.MarketID) {
 				exposure += a.SupplyUSD
 			}
 		}
@@ -163,7 +169,7 @@ func toSuspectedReport(s SuspectedMarket) SuspectedReport {
 	for _, p := range s.Protocols {
 		var exposure float64
 		for _, a := range p.Allocations {
-			if a.MarketID == s.Market.MarketID {
+			if sameMarketID(a.MarketID, s.Market.MarketID) {
 				exposure += a.SupplyUSD
 			}
 		}
@@ -190,14 +196,13 @@ func toSuspectedReport(s SuspectedMarket) SuspectedReport {
 }
 
 func RenderText(w io.Writer, r *Report) {
-	fmt.Fprintf(w, "=== PROTOCOL-LEVEL SPOT-AMM EXPOSURE SCAN ===\n")
+	fmt.Fprintf(w, "=== BASE NETWORK SPOT-AMM EXPOSURE SCAN (v6.0) ===\n")
 	fmt.Fprintf(w, "Chain %d  Block %d  %s\n",
 		r.Metadata.ChainID, r.Metadata.BlockNumber, r.Metadata.Timestamp)
-	fmt.Fprintf(w, "Markets from API: %d   Protocols from API: %d\n",
+	fmt.Fprintf(w, "Markets from API: %d   Protocols discovered: %d\n",
 		r.Metadata.MarketsFromAPI, r.Metadata.ProtocolsFromAPI)
-	fmt.Fprintf(w, "After protocol-count filter: %d   after TVL filter: %d   vulnerable: %d\n",
-		r.Metadata.MarketsAfterCountFlt, r.Metadata.MarketsAfterTVLFlt,
-		r.Metadata.MarketsVulnerable)
+	fmt.Fprintf(w, "Vulnerable markets (triage): %d   after protocol filter: %d\n",
+		r.Metadata.MarketsAfterCountFlt, r.Metadata.MarketsAfterTVLFlt)
 	fmt.Fprintf(w, "Confirmed: %d   Suspected: %d\n\n",
 		r.Metadata.ConfirmedCount, r.Metadata.SuspectedCount)
 
