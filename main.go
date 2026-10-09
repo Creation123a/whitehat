@@ -147,8 +147,7 @@ func run() int {
 	}
 
 	// ---- Stage 2: oracle triage over ALL markets, BEFORE any
-	//      protocol filtering or TVL filtering. This is the
-	//      critical fix versus v5.0. ----
+	//      protocol filtering or TVL filtering. ----
 	verdicts, triageStats := TriageOracles(runCtx, client, rpcClient, markets)
 	log.Printf("scanner[triage]: oracles=%d ok=%d reverted=%d error=%d shortlisted=%d",
 		triageStats.Total, triageStats.TraceOK,
@@ -180,14 +179,11 @@ func run() int {
 	log.Printf("scanner: %d protocols from Morpho vaults + DefiLlama",
 		len(protocols))
 
-	// ---- Stage 5: attach protocols to every vulnerable market.
-	//      Markets with no matching protocols are kept so the
-	//      report distinguishes "no protocol" from "no vuln". ----
+	// ---- Stage 5: attach protocols to every vulnerable market. ----
 	indexed := AttachProtocolsToMarkets(vulnerableMarkets, protocols)
 	log.Printf("scanner: %d vulnerable markets after protocol attachment",
 		len(indexed))
 
-	// ---- Stage 5b: optional post-join min-protocols filter. ----
 	if *minProt > 0 {
 		indexed = FilterMarketsByProtocolCount(indexed, *minProt)
 		log.Printf("scanner: %d markets after min-protocols=%d filter",
@@ -200,16 +196,13 @@ func run() int {
 		len(afterTVL), *minTVL)
 
 	// ---- Stage 7: differential probing on non-Morpho protocols.
-	//      Protocols with no Morpho allocations are probed directly
-	//      against their own bytecode and any AMM pools they
-	//      reference. Their results flow into the report's
-	//      Evaluated / Skipped sections and into Suspected when
-	//      AMM dependence is confirmed. ----
+	//      Protocols with no Morpho allocations are probed against
+	//      their own bytecode and any AMM pools they reference. ----
 	var probes []ProbeVerdict
 	for _, p := range protocols {
 		if len(p.Allocations) > 0 {
 			// Morpho integrator: already covered by the
-			// oracle-triage + Simulate path above.
+			// oracle-triage + Simulate path.
 			continue
 		}
 		pv := ProbeProtocol(runCtx, client, rpcClient, p)
@@ -237,7 +230,7 @@ func run() int {
 		BlockNumber:          blockNum,
 		MarketsFromAPI:       len(markets),
 		ProtocolsFromAPI:     len(protocols),
-		MarketsAfterCountFlt: len(vulnerableMarkets), // repurposed: after triage
+		MarketsAfterCountFlt: len(vulnerableMarkets),
 		MarketsAfterTVLFlt:   len(afterTVL),
 		MarketsVulnerable:    len(vulnerableMarkets),
 		ConfirmedCount:       len(confirmed),
