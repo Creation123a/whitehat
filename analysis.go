@@ -63,7 +63,7 @@ type TriageStats struct {
 	Shortlisted   int64
 }
 
-const triageWorkers = 2
+const triageWorkers = 1
 
 // TriageOracles traces each market's oracle price() call via
 // debug_traceCall, walks the execution tree, and inspects the
