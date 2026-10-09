@@ -43,7 +43,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -114,8 +114,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: scan-report-${{ steps.fork.outputs.block }}
-          path: |
-            report.json
-            report.txt
+          path: report.json
           if-no-files-found: warn
           retention-days: 30
