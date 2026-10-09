@@ -17,7 +17,7 @@ import (
 
 const (
 	requiredChainID = 31337
-	anvilReadyMax   = 30 * time.Second
+	anvilReadyMax   = 60 * time.Second
 	anvilPollEvery  = 250 * time.Millisecond
 )
 
@@ -37,10 +37,14 @@ func run() int {
 		anvilPort = fs.Int("anvil-port", 8545, "anvil listen port")
 		outPath   = fs.String("out", "", "output file (default stdout)")
 		format    = fs.String("format", "text", "output format: text | json")
-		timeout   = fs.Duration("timeout", 15*time.Minute, "pipeline timeout")
+		timeout   = fs.Duration("timeout", 20*time.Minute, "pipeline timeout")
+		minProt   = fs.Int("min-protocols", MinProtocolsPerMarket,
+			"minimum protocols attached to a market for it to be scanned")
+		minTVL = fs.Float64("min-tvl", MinProtocolTVLUSD,
+			"minimum protocol TVL (USD) to survive dust filter")
 	)
 
-	opsF := registerOpsFlags(fs)
+	_ = registerOpsFlags(fs)
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return 1
@@ -57,26 +61,24 @@ func run() int {
 		cancelRoot()
 	}()
 
-	// ---------- Anvil lifecycle ----------
-
 	var anvil *exec.Cmd
-
 	effectiveRPC := *rpcURL
 	if effectiveRPC == "" {
 		if *forkURL == "" || *forkBlock == 0 {
-			fmt.Fprintln(os.Stderr, "scanner: --fork-url and --fork-block are required unless --rpc is set")
+			fmt.Fprintln(os.Stderr, "scanner: --fork-url and --fork-block required unless --rpc is set")
 			return 1
 		}
-
 		anvil = exec.Command(*anvilBin,
 			"--fork-url", *forkURL,
 			"--fork-block-number", fmt.Sprintf("%d", *forkBlock),
 			"--port", fmt.Sprintf("%d", *anvilPort),
 			"--chain-id", fmt.Sprintf("%d", requiredChainID),
+			"--fork-retry-backoff", "2000",
+			"--retries", "10",
+			"--timeout", "60000",
 		)
 		anvil.Stdout = os.Stderr
 		anvil.Stderr = os.Stderr
-
 		if err := anvil.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "scanner: anvil start: %v\n", err)
 			return 1
@@ -94,11 +96,8 @@ func run() int {
 				_ = anvil.Process.Kill()
 			}
 		}()
-
 		effectiveRPC = fmt.Sprintf("http://127.0.0.1:%d", *anvilPort)
 	}
-
-	// ---------- Connect ----------
 
 	setupCtx, cancelSetup := context.WithTimeout(rootCtx, anvilReadyMax)
 	defer cancelSetup()
@@ -112,8 +111,6 @@ func run() int {
 
 	client := ethclient.NewClient(rpcClient)
 
-	// ---------- Chain-ID guard ----------
-
 	chainID, err := client.ChainID(setupCtx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scanner: chain-id read: %v\n", err)
@@ -125,8 +122,6 @@ func run() int {
 		return 1
 	}
 
-	// ---------- Pipeline ----------
-
 	runCtx, cancelRun := context.WithTimeout(rootCtx, *timeout)
 	defer cancelRun()
 
@@ -135,63 +130,123 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "scanner: block number: %v\n", err)
 		return 2
 	}
-
 	log.Printf("scanner: forked at block %d, chain %d", blockNum, chainID.Int64())
 
-	// Stage 1: inventory.
-	markets, err := Discover(runCtx)
+	// ---- Stage 1: market discovery ----
+	markets, err := DiscoverMarkets(runCtx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "scanner: discovery: %v\n", err)
+		fmt.Fprintf(os.Stderr, "scanner: market discovery: %v\n", err)
 		return 2
 	}
-	log.Printf("scanner: %d markets from API", len(markets))
+	log.Printf("scanner: %d markets from Morpho API", len(markets))
 
-	uniqueCollaterals := len(UniqueCollaterals(markets))
-	uniqueOracles := len(UniqueOracles(markets))
-	log.Printf("scanner: %d unique collateral assets, %d unique oracles",
-		uniqueCollaterals, uniqueOracles)
+	// ---- Stage 2: protocol discovery ----
+	protocols, err := DiscoverProtocols(runCtx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "scanner: protocol discovery: %v\n", err)
+		return 2
+	}
+	log.Printf("scanner: %d protocols from vaults API", len(protocols))
 
-		// Stage 2: trace-based oracle triage.
-	shortlist, triageStats := TriageOracles(runCtx, client, rpcClient, markets)
-	log.Printf("scanner: %d shortlisted markets", len(shortlist))
-	log.Printf("scanner[triage]: total=%d trace_ok=%d trace_reverted=%d trace_error=%d shortlisted=%d",
-		triageStats.Total,
-		triageStats.TraceOK,
-		triageStats.TraceReverted,
-		triageStats.TraceError,
+	// ---- Stage 3: attach protocols to markets ----
+	indexed := BuildMarketProtocolIndex(markets, protocols)
+	log.Printf("scanner: %d markets have at least one protocol attached", len(indexed))
+
+	// ---- Stage 4: filter markets by protocol count ----
+	afterCount := FilterMarketsByProtocolCount(indexed, *minProt)
+	log.Printf("scanner: %d markets after min-protocols=%d filter",
+		len(afterCount), *minProt)
+
+	// ---- Stage 5: dust filter on protocols ----
+	afterTVL := FilterProtocolsByTVL(afterCount, *minTVL)
+	log.Printf("scanner: %d markets after TVL filter (min=$%.0f)",
+		len(afterTVL), *minTVL)
+
+	if len(afterTVL) == 0 {
+		log.Printf("scanner: no markets survived the filters; nothing to scan")
+		writeEmptyReport(*outPath, *format, blockNum, chainID.Int64(),
+			len(markets), len(protocols), len(indexed))
+		return 0
+	}
+
+	// ---- Stage 6: oracle triage (spot AMM check) ----
+	flatMarkets := make([]MorphoMarket, 0, len(afterTVL))
+	for _, mp := range afterTVL {
+		flatMarkets = append(flatMarkets, mp.Market)
+	}
+	verdicts, triageStats := TriageOracles(runCtx, client, rpcClient, flatMarkets)
+	log.Printf("scanner[triage]: oracles=%d ok=%d reverted=%d error=%d shortlisted=%d",
+		triageStats.Total, triageStats.TraceOK,
+		triageStats.TraceReverted, triageStats.TraceError,
 		triageStats.Shortlisted)
 
-	// Stage 3: fork confirmation.
-	confirmed, suspected := Simulate(runCtx, client, rpcClient, shortlist)
-	log.Printf("scanner: %d confirmed, %d suspected", len(confirmed), len(suspected))
-	meta := RunMetadata{
-		ChainID:            chainID.Int64(),
-		BlockNumber:        blockNum,
-		MarketsFromAPI:     len(markets),
-		SuspiciousOracles:  len(markets),
-		UniqueOracles:      uniqueOracles,
-		MarketsShortlisted: len(shortlist),
-		ConfirmedCount:     len(confirmed),
-		SuspectedCount:     len(suspected),
+	// Attach traced pool + selectors back to markets in the joined list.
+	for i := range afterTVL {
+		v, ok := verdicts[afterTVL[i].Market.MarketID]
+		if !ok {
+			continue
+		}
+		afterTVL[i].Market.Selectors = v.Selectors
+		afterTVL[i].Market.TracedPools = v.Pools
 	}
-	ops := DefaultOperationalProperties(opsF.toPresent())
 
-	rep, err := BuildReport(runCtx, client, meta, confirmed, suspected, ops)
+	// ---- Stage 7: keep only vulnerable markets ----
+	vulnSet := make(map[string]bool, len(verdicts))
+	for id := range verdicts {
+		vulnSet[id] = true
+	}
+	vulnerable := FilterMarketsByOracleVulnerability(afterTVL, vulnSet)
+	log.Printf("scanner: %d vulnerable markets after oracle filter", len(vulnerable))
+
+	// ---- Stage 8: fork confirmation ----
+	confirmed, suspected := Simulate(runCtx, client, rpcClient, vulnerable)
+	log.Printf("scanner: %d confirmed, %d suspected", len(confirmed), len(suspected))
+
+	meta := RunMetadata{
+		ChainID:              chainID.Int64(),
+		BlockNumber:          blockNum,
+		MarketsFromAPI:       len(markets),
+		ProtocolsFromAPI:     len(protocols),
+		MarketsAfterCountFlt: len(afterCount),
+		MarketsAfterTVLFlt:   len(afterTVL),
+		MarketsVulnerable:    len(vulnerable),
+		ConfirmedCount:       len(confirmed),
+		SuspectedCount:       len(suspected),
+	}
+
+	rep, err := BuildReport(runCtx, client, meta, confirmed, suspected)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scanner: build report: %v\n", err)
 		return 2
 	}
-
 	return WriteReport(*outPath, *format, rep)
 }
 
-// ---------- RPC readiness ----------
+// writeEmptyReport is called when the filters prune everything.
+// The report is still emitted so the run is auditable.
+func writeEmptyReport(path, format string, block uint64, chainID int64,
+	markets, protocols, indexed int) {
 
+	meta := RunMetadata{
+		ChainID:              chainID,
+		BlockNumber:          block,
+		MarketsFromAPI:       markets,
+		ProtocolsFromAPI:     protocols,
+		MarketsAfterCountFlt: 0,
+		MarketsAfterTVLFlt:   0,
+		MarketsVulnerable:    0,
+		ConfirmedCount:       0,
+		SuspectedCount:       0,
+	}
+	rep, _ := BuildReport(context.Background(), nil, meta, nil, nil)
+	_ = WriteReport(path, format, rep)
+}
+
+// dialReady blocks until the RPC answers eth_chainId.
 func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
 	var lastErr error
 	ticker := time.NewTicker(anvilPollEvery)
 	defer ticker.Stop()
-
 	for {
 		c, err := rpc.DialContext(ctx, url)
 		if err == nil {
@@ -207,7 +262,6 @@ func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
 		} else {
 			lastErr = err
 		}
-
 		select {
 		case <-ctx.Done():
 			if lastErr != nil {
