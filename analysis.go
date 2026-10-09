@@ -25,8 +25,9 @@ type CallFrame struct {
 type OracleTraceVerdict struct {
 	Oracle      common.Address
 	HasSpotRead bool
+	MixedSource bool            // both spot read AND robust feed present
 	Selectors   []string
-	Pool        common.Address
+	Pools       []common.Address // every pool the trace touched via getReserves/slot0
 	TracedAddrs []common.Address
 	Shortlisted bool
 }
@@ -36,12 +37,13 @@ const triageWorkers = 2
 // TriageOracles traces each market's oracle price() call via
 // debug_traceCall, walks the entire execution tree, and inspects the
 // actual calldata of every frame. A frame whose input starts with the
-// getReserves() or slot0() selector is ground truth — the oracle really
-// called that function on that contract.
+// getReserves() or slot0() selector is ground truth.
 //
-// This catches ChainlinkOracleV2 instances that read spot AMM state
-// through an intermediate adapter contract — the exact pattern that
-// bytecode-only scanning misses.
+// IMPORTANT (Bug 1 fix): a Chainlink latestRoundData() anywhere in
+// the tree does NOT whitelist the oracle. Mixed-source oracles —
+// Chainlink for one leg, spot AMM for the other — are exactly the
+// May 2025 Aerodrome cUSDO/USDC pattern. They are shortlisted and
+// flagged MixedSource.
 func TriageOracles(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -49,7 +51,7 @@ func TriageOracles(
 	markets []MorphoMarket,
 ) []MorphoMarket {
 
-	verdicts := traceUniqueOracles(ctx, client, rpcClient, UniqueOracles(markets))
+	verdicts := traceUniqueOracles(ctx, client, rpcClient, markets)
 
 	var out []MorphoMarket
 	for _, m := range markets {
@@ -58,7 +60,7 @@ func TriageOracles(
 			continue
 		}
 		m.Selectors = v.Selectors
-		m.TracedPool = v.Pool
+		m.TracedPools = v.Pools
 		out = append(out, m)
 	}
 	return out
@@ -68,8 +70,23 @@ func traceUniqueOracles(
 	ctx context.Context,
 	client *ethclient.Client,
 	rpcClient *rpc.Client,
-	oracles []common.Address,
+	markets []MorphoMarket,
 ) map[common.Address]OracleTraceVerdict {
+
+	// Dedupe by oracle, keeping the first market we saw for collateral
+	// context (used only by the bytecode fallback).
+	seen := make(map[common.Address]MorphoMarket)
+	var oracles []common.Address
+	for _, m := range markets {
+		if m.Oracle == (common.Address{}) {
+			continue
+		}
+		if _, ok := seen[m.Oracle]; ok {
+			continue
+		}
+		seen[m.Oracle] = m
+		oracles = append(oracles, m.Oracle)
+	}
 
 	in := make(chan common.Address)
 	out := make(chan OracleTraceVerdict)
@@ -80,7 +97,8 @@ func traceUniqueOracles(
 		go func() {
 			defer wg.Done()
 			for o := range in {
-				v := traceOneOracle(ctx, client, rpcClient, o)
+				m := seen[o]
+				v := traceOneOracle(ctx, client, rpcClient, m)
 				select {
 				case out <- v:
 				case <-ctx.Done():
@@ -106,41 +124,33 @@ func traceUniqueOracles(
 		close(out)
 	}()
 
-	m := make(map[common.Address]OracleTraceVerdict)
+	result := make(map[common.Address]OracleTraceVerdict)
 	for v := range out {
-		m[v.Oracle] = v
+		result[v.Oracle] = v
 	}
-	return m
+	return result
 }
 
 func traceOneOracle(
 	ctx context.Context,
 	client *ethclient.Client,
 	rpcClient *rpc.Client,
-	oracle common.Address,
+	m MorphoMarket,
 ) OracleTraceVerdict {
 
-	v := OracleTraceVerdict{Oracle: oracle}
+	v := OracleTraceVerdict{Oracle: m.Oracle}
 
-	frame, err := tracePriceCall(ctx, rpcClient, oracle)
+	frame, err := tracePriceCall(ctx, rpcClient, m.Oracle)
 	if err != nil || frame == nil {
-		return fallbackBytecodeScan(ctx, client, oracle)
+		return fallbackBytecodeScan(ctx, client, m.Oracle, m.CollateralAsset.Address)
 	}
 
-	// Record every address the trace touched (for the report / debug).
 	targets := make(map[common.Address]struct{})
 	collectTargets(frame, targets)
 	for a := range targets {
 		v.TracedAddrs = append(v.TracedAddrs, a)
 	}
 
-	// Ground-truth detection: read the calldata of every frame. A frame
-	// whose input starts with 0x0902f1ac means the oracle (or something
-	// in its subtree) actually invoked getReserves() on frame.To. Same
-	// for 0x3850c7bd and slot0().
-	//
-	// A robust feed (latestRoundData / observe) anywhere in the path
-	// whitelists the market.
 	hasRobust := false
 	walkFrames(frame, func(f *CallFrame) {
 		if f.To == "" {
@@ -155,31 +165,36 @@ func traceOneOracle(
 			v.HasSpotRead = true
 			v.Selectors = append(v.Selectors,
 				"getReserves()@"+to.Hex())
-			if v.Pool == (common.Address{}) {
-				v.Pool = to
-			}
+			v.Pools = append(v.Pools, to)
 		case hasSelectorPrefix(f.Input, SelSlot0):
 			v.HasSpotRead = true
 			v.Selectors = append(v.Selectors,
 				"slot0()@"+to.Hex())
-			if v.Pool == (common.Address{}) {
-				v.Pool = to
-			}
+			v.Pools = append(v.Pools, to)
 		}
 	})
 
-	if hasRobust {
-		v.HasSpotRead = false
-		v.Selectors = nil
-		v.Pool = common.Address{}
+	v.Pools = dedupeAddresses(v.Pools)
+
+	// Bug 1 fix: a robust feed does NOT whitelist the oracle. It only
+	// downgrades the classification to "mixed source".
+	if hasRobust && v.HasSpotRead {
+		v.MixedSource = true
+		v.Selectors = append(v.Selectors, "MIXED_SOURCE")
 	}
 
 	v.Shortlisted = v.HasSpotRead
 	return v
 }
 
-// hasSelectorPrefix reports whether a hex-encoded calldata string starts
-// with the given 4-byte selector.
+// hasSelectorPrefix reports whether a hex-encoded calldata string
+// starts with the given 4-byte selector.
+//
+// NOTE: getReserves() and slot0() take no arguments, so we cannot
+// require argument bytes after the selector — the check is
+// intentionally just the 4-byte prefix. The AMM-kind probe in
+// simulation.go (detectAMMKind) is the real defence against
+// 4-byte selector collisions.
 func hasSelectorPrefix(input string, sel []byte) bool {
 	if len(input) < 10 {
 		return false
@@ -221,7 +236,6 @@ func tracePriceCall(
 	traceCfg := map[string]interface{}{
 		"tracer": "callTracer",
 	}
-
 	var frame CallFrame
 	if err := rpcClient.CallContext(ctx, &frame, "debug_traceCall",
 		callArg, "latest", traceCfg); err != nil {
@@ -241,33 +255,54 @@ func collectTargets(frame *CallFrame, out map[common.Address]struct{}) {
 }
 
 // fallbackBytecodeScan is used when debug_traceCall is unavailable or
-// the oracle reverts. Scans the oracle's own bytecode only — less
-// accurate but better than dropping the market.
+// the oracle reverts. Scans the oracle AND the collateral's bytecode
+// for spot selectors and robust selectors.
+//
+// Bug 4 fix: the previous version scanned only the oracle's own
+// bytecode, which is structurally blind to wrapper-collateral
+// patterns where the AMM read lives in the collateral contract.
 func fallbackBytecodeScan(
 	ctx context.Context,
 	client *ethclient.Client,
 	oracle common.Address,
+	collateral common.Address,
 ) OracleTraceVerdict {
 
 	v := OracleTraceVerdict{Oracle: oracle}
-	code, err := client.CodeAt(ctx, oracle, nil)
-	if err != nil || len(code) == 0 {
-		return v
+
+	targets := []common.Address{oracle}
+	if collateral != (common.Address{}) {
+		targets = append(targets, collateral)
 	}
 
 	hasSpot := false
-	if containsPUSH4(code, SelGetReserves) {
-		hasSpot = true
-		v.Selectors = append(v.Selectors, "getReserves()@self")
+	hasRobust := false
+	for _, t := range targets {
+		code, err := client.CodeAt(ctx, t, nil)
+		if err != nil || len(code) == 0 {
+			continue
+		}
+		if containsPUSH4(code, SelGetReserves) {
+			hasSpot = true
+			v.Selectors = append(v.Selectors, "getReserves()@"+t.Hex())
+			v.Pools = append(v.Pools, t)
+		}
+		if containsPUSH4(code, SelSlot0) {
+			hasSpot = true
+			v.Selectors = append(v.Selectors, "slot0()@"+t.Hex())
+			v.Pools = append(v.Pools, t)
+		}
+		if containsPUSH4(code, SelLatestRound) || containsPUSH4(code, SelObserve) {
+			hasRobust = true
+		}
 	}
-	if containsPUSH4(code, SelSlot0) {
-		hasSpot = true
-		v.Selectors = append(v.Selectors, "slot0()@self")
-	}
-	hasRobust := containsPUSH4(code, SelLatestRound) || containsPUSH4(code, SelObserve)
 
 	v.HasSpotRead = hasSpot
-	v.Shortlisted = hasSpot && !hasRobust
+	if hasRobust && hasSpot {
+		v.MixedSource = true
+		v.Selectors = append(v.Selectors, "MIXED_SOURCE")
+	}
+	v.Shortlisted = hasSpot
 	return v
 }
 
@@ -285,4 +320,18 @@ func containsPUSH4(code, sel []byte) bool {
 		}
 	}
 	return false
+}
+
+// dedupeAddresses preserves order and removes duplicates.
+func dedupeAddresses(in []common.Address) []common.Address {
+	seen := make(map[common.Address]struct{}, len(in))
+	out := in[:0]
+	for _, a := range in {
+		if _, ok := seen[a]; ok {
+			continue
+		}
+		seen[a] = struct{}{}
+		out = append(out, a)
+	}
+	return out
 }
