@@ -1,345 +1,189 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"math/big"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"time"
 
-	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/ethereum/go-ethereum/rpc"
 )
 
 // =============================================================
-// Differential fork probing for non-Morpho protocols
+// Phase 3: Fetch verified source + regex scan
 // =============================================================
 
-type DivergentFunc struct {
-	SelectorHex   string `json:"selector"`
-	FunctionName  string `json:"function,omitempty"`
-	CleanOutput   string `json:"clean_output"`
-	MutatedOutput string `json:"mutated_output"`
-	Pool          string `json:"pool"`
+type RegexFlag struct {
+	RuleID      string   `json:"rule_id"`
+	Category    string   `json:"category"`
+	Severity    string   `json:"severity"`
+	Snippet     string   `json:"snippet"`
+	LineStart   int      `json:"line_start"`
+	LineEnd     int      `json:"line_end"`
+	Suppressors []string `json:"suppressors,omitempty"`
 }
 
-type ProbeVerdict struct {
-	Protocol       common.Address
-	Name           string
-	Category       string
-	TVLUSD         float64
-	AMMDependent   bool
-	DivergentFuncs []DivergentFunc
-	ControlClean   bool
-	Pools          []common.Address
-	Reason         string
-	Skipped        bool
-	SkipReason     string
+// etherscanResponse is the Etherscan V2 getsourcecode response.
+type etherscanResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	Result  []struct {
+		SourceCode string `json:"SourceCode"`
+		ABI        string `json:"ABI"`
+		ContractName string `json:"ContractName"`
+	} `json:"result"`
 }
 
-// callableRead is a selector/args combination that returns data on a
-// clean fork and is therefore a candidate for differential probing.
-type callableRead struct {
-	selector []byte
-	args     []byte
-	baseline []byte
-}
+// FetchVerifiedSource calls Etherscan V2 getsourcecode for the
+// given address on Base.
+func FetchVerifiedSource(ctx context.Context, addr common.Address) (string, error) {
+	q := url.Values{}
+	q.Set("chainid", fmt.Sprintf("%d", EtherscanChainID))
+	q.Set("module", "contract")
+	q.Set("action", "getsourcecode")
+	q.Set("address", addr.Hex())
+	q.Set("apikey", EtherscanAPIKey)
 
-// ProbeProtocol runs differential fork probing on a single protocol.
-//
-// Steps:
-//  1. Fetch bytecode; skip if absent.
-//  2. Scan bytecode for PUSH20 candidates; probe each for AMM
-//     function signatures; the survivors are the pool set.
-//  3. Scan bytecode for PUSH4 selectors; try each with no args and
-//     with a 32-byte arg of 1e18; anything that returns data is a
-//     callable read. Record baseline output.
-//  4. For each pool: snapshot → mutate → re-call every callable →
-//     record divergence → revert.
-//  5. Control: mutate an unrelated AMM and re-call; if the same
-//     callables also move, discard them (timestamp/block dependence).
-//
-// The verdict is safe to consume even when probing fails: check
-// Skipped / SkipReason rather than treating zero divergence as
-// "clean" without confirming the probe ran.
-func ProbeProtocol(
-	ctx context.Context,
-	client *ethclient.Client,
-	rpcClient *rpc.Client,
-	proto Protocol,
-) ProbeVerdict {
-
-	v := ProbeVerdict{
-		Protocol: proto.Address,
-		Name:     proto.Name,
-		Category: proto.Category,
-		TVLUSD:   proto.TotalAssetsUSD,
-	}
-
-	if proto.Address == (common.Address{}) {
-		v.Skipped = true
-		v.SkipReason = "no_address_resolved"
-		return v
-	}
-
-	code, err := client.CodeAt(ctx, proto.Address, nil)
+	full := EtherscanBaseURL + "?" + q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, full, nil)
 	if err != nil {
-		v.Skipped = true
-		v.SkipReason = "code_fetch_failed"
-		return v
+		return "", err
 	}
-	if len(code) == 0 {
-		v.Skipped = true
-		v.SkipReason = "no_bytecode"
-		return v
-	}
-
-	pools := discoverProtocolPools(ctx, client, proto.Address, code)
-	if len(pools) == 0 {
-		v.Skipped = true
-		v.SkipReason = "no_amm_pool_referenced"
-		return v
-	}
-	v.Pools = pools
-
-	callables := enumerateCallableReads(ctx, client, proto.Address, code)
-	if len(callables) == 0 {
-		v.Skipped = true
-		v.SkipReason = "no_callable_reads"
-		return v
-	}
-
-	for _, pool := range pools {
-		kind := detectAMMKind(ctx, client, pool)
-		if kind == "" {
-			continue
-		}
-		snap, err := takeSnapshot(ctx, rpcClient)
-		if err != nil {
-			continue
-		}
-		if _, err := mutatePool(ctx, client, rpcClient, pool, kind); err != nil {
-			_ = revertSnapshot(context.Background(), rpcClient, snap)
-			continue
-		}
-		for _, c := range callables {
-			raw, err := callRaw(ctx, client, proto.Address, c.selector, c.args)
-			if err != nil {
-				continue
-			}
-			if !bytes.Equal(raw, c.baseline) {
-				v.DivergentFuncs = append(v.DivergentFuncs, DivergentFunc{
-					SelectorHex:   common.Bytes2Hex(c.selector),
-					FunctionName:  labelSelector(c.selector),
-					CleanOutput:   common.Bytes2Hex(c.baseline),
-					MutatedOutput: common.Bytes2Hex(raw),
-					Pool:          pool.Hex(),
-				})
-			}
-		}
-		_ = revertSnapshot(context.Background(), rpcClient, snap)
-	}
-
-	// Control mutation: discard divergences that also move under an
-	// unrelated AMM mutation (filters timestamp/block dependence).
-	controlPool := findControlPool(ctx, client, pools)
-	if controlPool != (common.Address{}) && len(v.DivergentFuncs) > 0 {
-		v.ControlClean = runControlCheck(ctx, client, rpcClient,
-			proto.Address, callables, controlPool)
-	} else {
-		v.ControlClean = true
-	}
-
-	if !v.ControlClean {
-		v.DivergentFuncs = nil
-		v.Reason = "control_mutation_also_moved_functions"
-		return v
-	}
-
-	v.AMMDependent = len(v.DivergentFuncs) > 0
-	if !v.AMMDependent {
-		v.Reason = "no_amm_dependence_detected"
-	}
-	return v
-}
-
-// runControlCheck mutates controlPool and re-calls each callable. If
-// any callable moves, the protocol's read path is not AMM-specific.
-func runControlCheck(
-	ctx context.Context,
-	client *ethclient.Client,
-	rpcClient *rpc.Client,
-	target common.Address,
-	callables []callableRead,
-	controlPool common.Address,
-) bool {
-
-	kind := detectAMMKind(ctx, client, controlPool)
-	if kind == "" {
-		return true
-	}
-	snap, err := takeSnapshot(ctx, rpcClient)
+	c := &http.Client{Timeout: 30 * time.Second}
+	resp, err := c.Do(req)
 	if err != nil {
-		return true
+		return "", err
 	}
-	defer func() {
-		_ = revertSnapshot(context.Background(), rpcClient, snap)
-	}()
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
 
-	if _, err := mutatePool(ctx, client, rpcClient, controlPool, kind); err != nil {
-		return true
+	var parsed etherscanResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", fmt.Errorf("etherscan decode: %w", err)
 	}
-	for _, c := range callables {
-		raw, err := callRaw(ctx, client, target, c.selector, c.args)
-		if err != nil {
-			continue
-		}
-		if !bytes.Equal(raw, c.baseline) {
-			return false
-		}
+	if len(parsed.Result) == 0 {
+		return "", fmt.Errorf("etherscan: no result for %s", addr.Hex())
 	}
-	return true
+	src := parsed.Result[0].SourceCode
+	if src == "" || strings.Contains(src, "not verified") {
+		return "", fmt.Errorf("etherscan: source not verified for %s", addr.Hex())
+	}
+	return src, nil
 }
 
-// enumerateCallableReads scans bytecode for PUSH4 selectors and tries
-// each with no args and with a 32-byte arg of 1e18. Anything that
-// returns data is retained as a callable read.
-func enumerateCallableReads(
-	ctx context.Context,
-	client *ethclient.Client,
-	addr common.Address,
-	code []byte,
-) []callableRead {
+// =============================================================
+// Regex rules
+// =============================================================
 
-	candidates := extractPUSH4Selectors(code)
-	argE18 := common.LeftPadBytes(big.NewInt(1e18).Bytes(), 32)
+type regexRule struct {
+	ID       string
+	Category string
+	Severity string
+	Pattern  *regexp.Regexp
+}
 
-	var out []callableRead
-	for _, sel := range candidates {
-		for _, args := range [][]byte{nil, argE18} {
-			raw, err := callRaw(ctx, client, addr, sel, args)
-			if err != nil || len(raw) == 0 {
-				continue
+var regexRules = []regexRule{
+	// Category A — Spot AMM price reads
+	{ID: "A1", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`getReserves\s*\(`)},
+	{ID: "A2", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`slot0\s*\(\)`)},
+	{ID: "A3", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`sqrtPriceX96`)},
+	{ID: "A4", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`latestAnswer\s*\(`)},
+	{ID: "A5", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`get_virtual_price\s*\(`)},
+	{ID: "A6", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`get_dy\s*\(`)},
+	{ID: "A7", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`balanceOf\s*\(\s*address\s*\(\s*this\s*\)\s*\)`)},
+
+	// Category C — Precision / division-before-multiplication
+	{ID: "C1", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`[/]\s*\w+\s*\*`)},
+	{ID: "C2", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`\w+\s*/\s*\w+\s*\*\s*\w+`)},
+	{ID: "C3", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`div\s*\([^)]*\)\s*\.mul\s*\(`)},
+
+	// Category D — Stale oracle
+	{ID: "D1", Category: "stale-oracle", Severity: "medium", Pattern: regexp.MustCompile(`latestRoundData\s*\(`)},
+	{ID: "D2", Category: "stale-oracle", Severity: "medium", Pattern: regexp.MustCompile(`latestAnswer\s*\(`)},
+
+	// Category E — Oracle decimal mismatch
+	{ID: "E1", Category: "decimal-mismatch", Severity: "medium", Pattern: regexp.MustCompile(`/\s*1e8`)},
+	{ID: "E2", Category: "decimal-mismatch", Severity: "medium", Pattern: regexp.MustCompile(`uint256\(price\)\s*\*\s*1e10`)},
+
+	// Category F — Read-only reentrancy
+	{ID: "F1", Category: "reentrancy", Severity: "critical", Pattern: regexp.MustCompile(`get_virtual_price\s*\(`)},
+	{ID: "F2", Category: "reentrancy", Severity: "critical", Pattern: regexp.MustCompile(`getReserves\s*\(`)},
+
+	// Category I — LP token valuation
+	{ID: "I1", Category: "lp-valuation", Severity: "high", Pattern: regexp.MustCompile(`getReserves\s*\(\)[\s\S]{0,200}totalSupply\s*\(\)`)},
+}
+
+// RunRegexScan applies every rule to the source. Returns flags
+// grouped by rule, with snippets and suppressor annotations.
+func RunRegexScan(source string) []RegexFlag {
+	var flags []RegexFlag
+	lines := strings.Split(source, "\n")
+
+	for _, rule := range regexRules {
+		locs := rule.Pattern.FindAllStringIndex(source, -1)
+		for _, loc := range locs {
+			lineStart := strings.Count(source[:loc[0]], "\n")
+			lineEnd := strings.Count(source[:loc[1]], "\n")
+
+			// Extract ±10 lines of context.
+			ctxStart := lineStart - 10
+			if ctxStart < 0 {
+				ctxStart = 0
 			}
-			out = append(out, callableRead{
-				selector: sel,
-				args:     args,
-				baseline: raw,
-			})
-			break
+			ctxEnd := lineEnd + 10
+			if ctxEnd >= len(lines) {
+				ctxEnd = len(lines) - 1
+			}
+			snippet := strings.Join(lines[ctxStart:ctxEnd+1], "\n")
+
+			flag := RegexFlag{
+				RuleID:    rule.ID,
+				Category:  rule.Category,
+				Severity:  rule.Severity,
+				Snippet:   snippet,
+				LineStart: lineStart + 1,
+				LineEnd:   lineEnd + 1,
+			}
+
+			// Suppression markers.
+			flag.Suppressors = checkSuppressors(rule.ID, snippet)
+
+			flags = append(flags, flag)
 		}
+	}
+	return flags
+}
+
+// checkSuppressors returns suppression markers found in the snippet.
+func checkSuppressors(ruleID, snippet string) []string {
+	var out []string
+	lower := strings.ToLower(snippet)
+
+	twapGuard := regexp.MustCompile(`observe\s*\(|consult\s*\(|twap|timeweighted`)
+	reentrancyGuard := regexp.MustCompile(`nonreentrant`)
+	freshnessCheck := regexp.MustCompile(`updatedat|heartbeat|maxdelay|answeredinround`)
+	decimalsCheck := regexp.MustCompile(`decimals\s*\(|10\s*\*\*\s*decimals`)
+	accessRestrict := regexp.MustCompile(`onlyowner|onlyrole|internal\s+view`)
+
+	if twapGuard.MatchString(lower) {
+		out = append(out, "has_twap_guard")
+	}
+	if reentrancyGuard.MatchString(lower) {
+		out = append(out, "has_reentrancy_guard")
+	}
+	if freshnessCheck.MatchString(lower) {
+		out = append(out, "has_freshness_check")
+	}
+	if decimalsCheck.MatchString(lower) {
+		out = append(out, "has_decimals_check")
+	}
+	if accessRestrict.MatchString(lower) {
+		out = append(out, "restricted_access")
 	}
 	return out
-}
-
-// extractPUSH4Selectors scans bytecode for PUSH4 opcodes (0x63) and
-// returns the unique 4-byte values.
-func extractPUSH4Selectors(code []byte) [][]byte {
-	seen := make(map[string]bool)
-	var out [][]byte
-	for i := 0; i+5 <= len(code); i++ {
-		if code[i] != 0x63 {
-			continue
-		}
-		sel := code[i+1 : i+5]
-		key := string(sel)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		cp := make([]byte, 4)
-		copy(cp, sel)
-		out = append(out, cp)
-	}
-	return out
-}
-
-// discoverProtocolPools scans protocol bytecode for PUSH20 addresses
-// and probes each for AMM function signatures.
-func discoverProtocolPools(
-	ctx context.Context,
-	client *ethclient.Client,
-	protocolAddr common.Address,
-	code []byte,
-) []common.Address {
-
-	candidates := extractPUSH20Candidates(code)
-	var out []common.Address
-	for _, c := range candidates {
-		if c == protocolAddr {
-			continue
-		}
-		if detectAMMKind(ctx, client, c) != "" {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-// findControlPool returns a known Base AMM that is not in the
-// protocol's referenced set, for the control mutation. If the
-// reference pool is itself the control candidate, the control check
-// is disabled by returning the zero address.
-func findControlPool(
-	ctx context.Context,
-	client *ethclient.Client,
-	excluded []common.Address,
-) common.Address {
-
-	// Well-known Base Aerodrome WETH/USDC pool. Unrelated to the vast
-	// majority of protocol bytecode; safe as a control target.
-	ctrl := common.HexToAddress("0xd0b53D9277642d899DF5C87A3966A349A798F224")
-	if detectAMMKind(ctx, client, ctrl) == "" {
-		return common.Address{}
-	}
-	for _, e := range excluded {
-		if e == ctrl {
-			return common.Address{}
-		}
-	}
-	return ctrl
-}
-
-// callRaw performs an eth_call and returns the raw output bytes.
-func callRaw(
-	ctx context.Context,
-	client *ethclient.Client,
-	to common.Address,
-	selector []byte,
-	args []byte,
-) ([]byte, error) {
-
-	data := make([]byte, 0, len(selector)+len(args))
-	data = append(data, selector...)
-	data = append(data, args...)
-	msg := ethereum.CallMsg{To: &to, Data: data}
-	return client.CallContract(ctx, msg, nil)
-}
-
-// labelSelector maps a few well-known selectors to human names.
-func labelSelector(sel []byte) string {
-	if len(sel) != 4 {
-		return ""
-	}
-	switch common.Bytes2Hex(sel) {
-	case "01e1a05f":
-		return "totalAssets()"
-	case "18160ddd":
-		return "totalSupply()"
-	case "07a2d324":
-		return "convertToAssets(uint256)"
-	case "0902f1ac":
-		return "getReserves()"
-	case "3850c7bd":
-		return "slot0()"
-	case "a035b1fe":
-		return "price()"
-	case "bb7b8b80":
-		return "get_virtual_price()"
-	case "50d25bcd":
-		return "latestAnswer()"
-	case "feaf968c":
-		return "latestRoundData()"
-	}
-	return ""
 }
