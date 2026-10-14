@@ -15,12 +15,6 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
-const (
-	requiredChainID = 31337
-	anvilReadyMax   = 60 * time.Second
-	anvilPollEvery  = 250 * time.Millisecond
-)
-
 func main() {
 	os.Exit(run())
 }
@@ -30,23 +24,29 @@ func run() int {
 	fs.SetOutput(os.Stderr)
 
 	var (
-		rpcURL    = fs.String("rpc", "", "pre-running RPC URL; skips Anvil spawn")
-		forkURL   = fs.String("fork-url", "", "Base RPC URL to fork (required unless --rpc)")
+		rpcURL   = fs.String("rpc", "", "pre-running RPC URL; skips Anvil spawn")
+		forkURL  = fs.String("fork-url", "", "Base RPC URL to fork (required unless --rpc)")
 		forkBlock = fs.Uint64("fork-block", 0, "pinned fork block number (required unless --rpc)")
-		anvilBin  = fs.String("anvil", "anvil", "path to anvil binary")
+		anvilBin = fs.String("anvil", "anvil", "path to anvil binary")
 		anvilPort = fs.Int("anvil-port", 8545, "anvil listen port")
-		outPath   = fs.String("out", "", "output file (default stdout)")
-		format    = fs.String("format", "text", "output format: text | json")
-		timeout   = fs.Duration("timeout", 20*time.Minute, "pipeline timeout")
-		minProt   = fs.Int("min-protocols", 0,
-			"optional post-join filter: drop markets with fewer than N protocols (0 = off)")
-		minTVL = fs.Float64("min-tvl", MinProtocolTVLUSD,
-			"minimum protocol TVL (USD) to survive dust filter")
+		outPath  = fs.String("out", "report.json", "output file")
+		format   = fs.String("format", "json", "output format: text | json")
+		timeout  = fs.Duration("timeout", 30*time.Minute, "pipeline timeout")
+		category = fs.String("category", "", "DefiLlama category keyword (Lending, Isolated Lending, Yield, Yield Aggregator, CDP, Leveraged Farming)")
 	)
 
 	_ = registerOpsFlags(fs)
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
+		return 1
+	}
+
+	if *category == "" {
+		fmt.Fprintln(os.Stderr, "scanner: --category is required")
+		return 1
+	}
+	if !TargetCategories[*category] {
+		fmt.Fprintf(os.Stderr, "scanner: invalid category %q\n", *category)
 		return 1
 	}
 
@@ -61,6 +61,7 @@ func run() int {
 		cancelRoot()
 	}()
 
+	// ---- Anvil lifecycle ----
 	var anvil *exec.Cmd
 	effectiveRPC := *rpcURL
 	if effectiveRPC == "" {
@@ -132,142 +133,122 @@ func run() int {
 	}
 	log.Printf("scanner: forked at block %d, chain %d", blockNum, chainID.Int64())
 
-	// ---- Stage 1: market discovery (Morpho Blue markets) ----
-	markets, err := DiscoverMarkets(runCtx)
+	// =========================================================
+	// Phase 1: DefiLlama filter
+	// =========================================================
+	log.Printf("scanner[phase1]: fetching DefiLlama category=%q", *category)
+	protocols, err := DiscoverProtocols(runCtx, *category)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "scanner: market discovery: %v\n", err)
+		fmt.Fprintf(os.Stderr, "scanner[phase1]: %v\n", err)
 		return 2
 	}
-	log.Printf("scanner: %d markets from Morpho API", len(markets))
+	log.Printf("scanner[phase1]: %d protocols in [%s] with Base TVL in [$50k, $10M]",
+		len(protocols), *category)
 
-	if len(markets) == 0 {
-		log.Printf("scanner: no markets returned from API; nothing to scan")
-		writeEmptyReport(*outPath, *format, blockNum, chainID.Int64(), 0, 0, 0)
-		return 0
+	if len(protocols) == 0 {
+		rep := BuildReport(RunMetadata{
+			ChainID:         chainID.Int64(),
+			BlockNumber:     blockNum,
+			CategoryKeyword: *category,
+			ProtocolsFound: 0,
+		}, nil, nil)
+		return WriteReport(*outPath, *format, rep)
 	}
 
-	// ---- Stage 2: oracle triage over ALL markets, BEFORE any
-	//      protocol filtering or TVL filtering. ----
-	verdicts, triageStats := TriageOracles(runCtx, client, rpcClient, markets)
-	log.Printf("scanner[triage]: oracles=%d ok=%d reverted=%d error=%d shortlisted=%d",
-		triageStats.Total, triageStats.TraceOK,
-		triageStats.TraceReverted, triageStats.TraceError,
-		triageStats.Shortlisted)
+	// =========================================================
+	// Phase 2 + 3 + 4: per-protocol pipeline
+	// =========================================================
+	var findings []FindingReport
+	var skipped []SkippedProtocol
+	totalFlags := 0
+	scanned := 0
 
-	// ---- Stage 3: keep only markets whose oracle has a spot-AMM
-	//      read anywhere in its pricing path. ----
-	var vulnerableMarkets []MorphoMarket
-	for _, m := range markets {
-		v, ok := verdicts[m.MarketID]
-		if !ok || !v.Shortlisted {
+	for _, proto := range protocols {
+		log.Printf("scanner[phase2]: resolving %q", proto.Name)
+
+		addr, err := ResolveProtocolAddress(runCtx, proto.Name)
+		if err != nil {
+			log.Printf("scanner[phase2]: SKIP %q: %v", proto.Name, err)
+			skipped = append(skipped, SkippedProtocol{Name: proto.Name, Slug: proto.Slug, Reason: err.Error()})
 			continue
 		}
-		m.Selectors = v.Selectors
-		m.TracedPools = v.Pools
-		vulnerableMarkets = append(vulnerableMarkets, m)
-	}
-	log.Printf("scanner: %d vulnerable markets after oracle triage",
-		len(vulnerableMarkets))
+		proto.Address = addr
 
-	// ---- Stage 4: protocol universe discovery (Morpho vaults
-	//      + DefiLlama, with best-effort SQD resolution). ----
-	protocols, err := DiscoverAllProtocols(runCtx, *minTVL)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "scanner: protocol discovery: %v\n", err)
-		return 2
-	}
-	log.Printf("scanner: %d protocols from Morpho vaults + DefiLlama",
-		len(protocols))
-
-	// ---- Stage 5: attach protocols to every vulnerable market. ----
-	indexed := AttachProtocolsToMarkets(vulnerableMarkets, protocols)
-	log.Printf("scanner: %d vulnerable markets after protocol attachment",
-		len(indexed))
-
-	if *minProt > 0 {
-		indexed = FilterMarketsByProtocolCount(indexed, *minProt)
-		log.Printf("scanner: %d markets after min-protocols=%d filter",
-			len(indexed), *minProt)
-	}
-
-	// ---- Stage 6: dust filter on protocol lists. ----
-	afterTVL := FilterProtocolsByTVL(indexed, *minTVL)
-	log.Printf("scanner: %d markets after TVL filter (min=$%.0f)",
-		len(afterTVL), *minTVL)
-
-	// ---- Stage 7: differential probing on non-Morpho protocols.
-	//      Protocols with no Morpho allocations are probed against
-	//      their own bytecode and any AMM pools they reference. ----
-	var probes []ProbeVerdict
-	for _, p := range protocols {
-		if len(p.Allocations) > 0 {
-			// Morpho integrator: already covered by the
-			// oracle-triage + Simulate path.
+		pricingAddrs, err := ScanPricingContracts(runCtx, client, proto)
+		if err != nil {
+			log.Printf("scanner[phase2]: SKIP %q: %v", proto.Name, err)
+			skipped = append(skipped, SkippedProtocol{Name: proto.Name, Slug: proto.Slug, Reason: err.Error()})
 			continue
 		}
-		pv := ProbeProtocol(runCtx, client, rpcClient, p)
-		probes = append(probes, pv)
-		switch {
-		case pv.Skipped:
-			log.Printf("scanner[probe]: SKIP  %-30s (%s) %s",
-				pv.Name, pv.Category, pv.SkipReason)
-		case pv.AMMDependent:
-			log.Printf("scanner[probe]: FLAG  %-30s (%s) %d func(s)",
-				pv.Name, pv.Category, len(pv.DivergentFuncs))
-		default:
-			log.Printf("scanner[probe]: CLEAN %-30s (%s)",
-				pv.Name, pv.Category)
+
+		log.Printf("scanner[phase3]: %q -> %d pricing contract(s)", proto.Name, len(pricingAddrs))
+		scanned++
+
+		var allFlags []FlagReport
+		for _, paddr := range pricingAddrs {
+			src, err := FetchVerifiedSource(runCtx, paddr)
+			if err != nil {
+				log.Printf("scanner[phase3]: %s source fetch failed: %v", paddr.Hex(), err)
+				continue
+			}
+
+			flags := RunRegexScan(src)
+			if len(flags) == 0 {
+				continue
+			}
+
+			log.Printf("scanner[phase4]: %q -> %d flag(s), asking LLM", proto.Name, len(flags))
+			for i := range flags {
+				verdict, err := AskOpenRouterWithFallback(runCtx, flags[i].Snippet)
+				if err != nil {
+					log.Printf("scanner[phase4]: LLM failed for rule %s: %v", flags[i].RuleID, err)
+					flags[i].LLMVerdict = "ERROR"
+					continue
+				}
+				flags[i].LLMVerdict = verdict
+				totalFlags++
+				if verdict == "VULNERABLE" {
+					allFlags = append(allFlags, flags[i])
+				}
+			}
+		}
+
+		if len(allFlags) > 0 {
+			findings = append(findings, FindingReport{
+				Protocol: proto.Name,
+				Slug:     proto.Slug,
+				Category: proto.Category,
+				TVLUSD:   proto.TVLUSD,
+				Address:  proto.Address.Hex(),
+				Chain:    "base",
+				Flags:    allFlags,
+				Summary:  fmt.Sprintf("%d LLM-confirmed vulnerabilities", len(allFlags)),
+			})
 		}
 	}
-	log.Printf("scanner[probe]: probed %d non-Morpho protocols", len(probes))
 
-	// ---- Stage 8: fork confirmation on Morpho markets. ----
-	confirmed, suspected := Simulate(runCtx, client, rpcClient, afterTVL)
-	log.Printf("scanner: %d confirmed, %d suspected", len(confirmed), len(suspected))
+	log.Printf("scanner: scanned=%d skipped=%d findings=%d",
+		scanned, len(skipped), len(findings))
 
+	// =========================================================
+	// Build + write report
+	// =========================================================
 	meta := RunMetadata{
-		ChainID:              chainID.Int64(),
-		BlockNumber:          blockNum,
-		MarketsFromAPI:       len(markets),
-		ProtocolsFromAPI:     len(protocols),
-		MarketsAfterCountFlt: len(vulnerableMarkets),
-		MarketsAfterTVLFlt:   len(afterTVL),
-		MarketsVulnerable:    len(vulnerableMarkets),
-		ConfirmedCount:       len(confirmed),
-		SuspectedCount:       len(suspected),
-		ProtocolsProbed:      len(probes),
+		ChainID:          chainID.Int64(),
+		BlockNumber:      blockNum,
+		CategoryKeyword:  *category,
+		ProtocolsFound:   len(protocols),
+		ProtocolsScanned: scanned,
+		TotalFlags:       totalFlags,
 	}
-
-	rep, err := BuildReport(runCtx, client, meta, confirmed, suspected, probes)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "scanner: build report: %v\n", err)
-		return 2
-	}
+	rep := BuildReport(meta, findings, skipped)
 	return WriteReport(*outPath, *format, rep)
 }
 
-// writeEmptyReport is called when discovery returns nothing at all.
-// The report is still emitted so the run is auditable.
-func writeEmptyReport(path, format string, block uint64, chainID int64,
-	markets, protocols, indexed int) {
+// =============================================================
+// Dial helper
+// =============================================================
 
-	meta := RunMetadata{
-		ChainID:              chainID,
-		BlockNumber:          block,
-		MarketsFromAPI:       markets,
-		ProtocolsFromAPI:     protocols,
-		MarketsAfterCountFlt: 0,
-		MarketsAfterTVLFlt:   0,
-		MarketsVulnerable:    0,
-		ConfirmedCount:       0,
-		SuspectedCount:       0,
-		ProtocolsProbed:      0,
-	}
-	rep, _ := BuildReport(context.Background(), nil, meta, nil, nil, nil)
-	_ = WriteReport(path, format, rep)
-}
-
-// dialReady blocks until the RPC answers eth_chainId.
 func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
 	var lastErr error
 	ticker := time.NewTicker(anvilPollEvery)
