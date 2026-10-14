@@ -1,424 +1,150 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"log"
-	"math/big"
-
-	"github.com/ethereum/go-ethereum"
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/ethereum/go-ethereum/rpc"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"time"
 )
 
-const (
-	ammUniswapV2        = "uniswap-v2"
-	ammUniswapV3        = "uniswap-v3"
-	ammAerodromeV2      = "aerodrome-v2"
-	ammAerodromeSlipstr = "aerodrome-slipstream"
-)
+// =============================================================
+// Phase 4: OpenRouter LLM filter
+// =============================================================
 
-var (
-	slotUniswapV2Reserves        = common.BigToHash(big.NewInt(int64(SlotUniswapV2Reserves)))
-	slotUniswapV3Slot0           = common.BigToHash(big.NewInt(int64(SlotUniswapV3Slot0)))
-	slotAerodromeV2Reserve0      = common.BigToHash(big.NewInt(int64(SlotAerodromeV2Reserve0)))
-	slotAerodromeSlipstreamSlot0 = common.BigToHash(big.NewInt(int64(SlotAerodromeSlipstreamSlot0)))
-)
-
-var (
-	shiftV2Num = big.NewInt(110)
-	shiftV2Den = big.NewInt(100)
-	shiftV3Num = big.NewInt(95)
-	shiftV3Den = big.NewInt(100)
-	mask112    = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 112), big.NewInt(1))
-	mask160    = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 160), big.NewInt(1))
-)
-
-type ConfirmedMarket struct {
-	Market      MorphoMarket
-	Protocols   []Protocol
-	Pool        common.Address
-	PoolKind    string
-	PriceBefore *big.Int
-	PriceAfter  *big.Int
-	DeltaPct    float64
-	Evidence    string
+type llmMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
-type SuspectedMarket struct {
-	Market    MorphoMarket
-	Protocols []Protocol
-	Reason    string
+type llmRequest struct {
+	Model       string       `json:"model"`
+	Messages    []llmMessage `json:"messages"`
+	Temperature float64      `json:"temperature"`
+	MaxTokens   int          `json:"max_tokens"`
 }
 
-func Simulate(
-	ctx context.Context,
-	client *ethclient.Client,
-	rpcClient *rpc.Client,
-	in []MarketWithProtocols,
-) ([]ConfirmedMarket, []SuspectedMarket) {
+type llmResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
 
-	var confirmed []ConfirmedMarket
-	var suspected []SuspectedMarket
+const systemPrompt = `You are a smart contract security auditor. You will receive a Solidity code snippet flagged by a regex scanner. Your job is to determine if the snippet contains a vulnerability that could enable a flash loan attack, oracle manipulation, or math precision error.
 
-	for _, mp := range in {
-		cm, reason, ok := simulateOne(ctx, client, rpcClient, mp)
-		if ok {
-			confirmed = append(confirmed, cm)
-			continue
-		}
-		suspected = append(suspected, SuspectedMarket{
-			Market:    mp.Market,
-			Protocols: mp.Protocols,
-			Reason:    reason,
+Respond with EXACTLY ONE WORD:
+- VULNERABLE (if the snippet contains exploitable logic)
+- SAFE (if the snippet is safe despite matching a pattern)
+
+Do not explain. Do not add punctuation. One word only.`
+
+// AskOpenRouter sends a snippet to the LLM and returns VULNERABLE or SAFE.
+// Tries each model in LLMModels until one succeeds.
+func AskOpenRouter(ctx context.Context, snippet string) (string, error) {
+	apiKey := OpenRouterAPIKey
+	if env := os.Getenv("OPENROUTER_API_KEY"); env != "" {
+		apiKey = env
+	}
+	if apiKey == "" {
+		return "", fmt.Errorf("OPENROUTER_API_KEY not set")
+	}
+
+	userPrompt := fmt.Sprintf("Snippet:\n```solidity\n%s\n```", snippet)
+
+	body, _ := json.Marshal(llmRequest{
+		Model:       LLMModels[0],
+		Messages:    []llmMessage{{Role: "system", Content: systemPrompt}, {Role: "user", Content: userPrompt}},
+		Temperature: 0,
+		MaxTokens:   8,
+	})
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		OpenRouterURL, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	c := &http.Client{Timeout: 30 * time.Second}
+	resp, err := c.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	var parsed llmResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", fmt.Errorf("llm decode: %w", err)
+	}
+	if parsed.Error != nil {
+		return "", fmt.Errorf("llm error: %s", parsed.Error.Message)
+	}
+	if len(parsed.Choices) == 0 {
+		return "", fmt.Errorf("llm: no choices")
+	}
+
+	result := strings.TrimSpace(strings.ToUpper(parsed.Choices[0].Message.Content))
+	if result == "VULNERABLE" || result == "SAFE" {
+		return result, nil
+	}
+	return "", fmt.Errorf("llm: unexpected response %q", result)
+}
+
+// AskOpenRouterWithFallback tries each model in sequence.
+func AskOpenRouterWithFallback(ctx context.Context, snippet string) (string, error) {
+	var lastErr error
+	for _, model := range LLMModels {
+		body, _ := json.Marshal(llmRequest{
+			Model:       model,
+			Messages:    []llmMessage{{Role: "system", Content: systemPrompt}, {Role: "user", Content: fmt.Sprintf("Snippet:\n```solidity\n%s\n```", snippet)}},
+			Temperature: 0,
+			MaxTokens:   8,
 		})
-	}
-	return confirmed, suspected
-}
 
-func simulateOne(
-	ctx context.Context,
-	client *ethclient.Client,
-	rpcClient *rpc.Client,
-	mp MarketWithProtocols,
-) (ConfirmedMarket, string, bool) {
-
-	m := mp.Market
-
-	pools := m.TracedPools
-	if len(pools) == 0 {
-		pool, _, err := locateAMMPoolDual(ctx, client, m.Oracle, m.CollateralAsset.Address)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			OpenRouterURL, bytes.NewReader(body))
 		if err != nil {
-			return ConfirmedMarket{}, "pool_not_resolved: " + err.Error(), false
-		}
-		pools = []common.Address{pool}
-	}
-
-	base, err := callBig(ctx, client, m.Oracle, SelPrice)
-	if err != nil || base.Sign() == 0 {
-		return ConfirmedMarket{}, "oracle_call_failed", false
-	}
-
-	threshold := minDeltaForPair(m.LoanAsset, m.CollateralAsset)
-	lastReason := "no_pool_confirmed"
-	for _, pool := range pools {
-		kind := detectAMMKind(ctx, client, pool)
-		if kind == "" {
-			lastReason = "traced_pool_not_amm"
+			lastErr = err
 			continue
 		}
-		cm, reason, ok := tryPool(ctx, client, rpcClient, m, mp.Protocols,
-			pool, kind, base, threshold)
-		if ok {
-			return cm, "", true
-		}
-		lastReason = reason
-	}
-	return ConfirmedMarket{}, lastReason, false
-}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+OpenRouterAPIKey)
 
-func tryPool(
-	ctx context.Context,
-	client *ethclient.Client,
-	rpcClient *rpc.Client,
-	m MorphoMarket,
-	protocols []Protocol,
-	pool common.Address,
-	kind string,
-	base *big.Int,
-	threshold float64,
-) (ConfirmedMarket, string, bool) {
-
-	snap, err := takeSnapshot(ctx, rpcClient)
-	if err != nil {
-		return ConfirmedMarket{}, "snapshot_failed: " + err.Error(), false
-	}
-	defer func() {
-		if err := revertSnapshot(context.Background(), rpcClient, snap); err != nil {
-			log.Printf("simulate %s: revert failed: %v", m.Oracle.Hex(), err)
-		}
-	}()
-
-	label, err := mutatePool(ctx, client, rpcClient, pool, kind)
-	if err != nil {
-		return ConfirmedMarket{}, "mutation_failed: " + err.Error(), false
-	}
-
-	after, err := callBig(ctx, client, m.Oracle, SelPrice)
-	if err != nil {
-		return ConfirmedMarket{}, "oracle_call_after_failed", false
-	}
-
-	pct := pctDelta(base, after)
-	if pct < threshold {
-		return ConfirmedMarket{},
-			fmt.Sprintf("delta_below_threshold: %.4f%% < %.2f%%", pct, threshold), false
-	}
-
-	evidence := fmt.Sprintf(
-		"oracle.price() moved %.2f%% (%s -> %s) when %s shifted (%s pool %s); "+
-			"%d protocol(s) supply to this market and are exposed",
-		pct, base.String(), after.String(), label, kind, pool.Hex(), len(protocols))
-
-	return ConfirmedMarket{
-		Market:      m,
-		Protocols:   protocols,
-		Pool:        pool,
-		PoolKind:    kind,
-		PriceBefore: base,
-		PriceAfter:  after,
-		DeltaPct:    pct,
-		Evidence:    evidence,
-	}, "", true
-}
-
-func pctDelta(base, after *big.Int) float64 {
-	if base.Sign() == 0 {
-		return 0
-	}
-	d := new(big.Int).Sub(after, base)
-	abs := new(big.Int).Abs(d)
-	f := new(big.Float).Quo(new(big.Float).SetInt(abs), new(big.Float).SetInt(base))
-	f.Mul(f, big.NewFloat(100))
-	v, _ := f.Float64()
-	return v
-}
-
-func mutatePool(ctx context.Context, client *ethclient.Client, rpcClient *rpc.Client, pool common.Address, kind string) (string, error) {
-	switch kind {
-	case ammUniswapV2:
-		slot := slotUniswapV2Reserves
-		original, err := readSlot(ctx, client, pool, slot)
+		c := &http.Client{Timeout: 30 * time.Second}
+		resp, err := c.Do(req)
 		if err != nil {
-			return "", err
-		}
-		mutated, label, err := shiftV2ReservesPacked(original, mask112, 112)
-		if err != nil {
-			return "", err
-		}
-		return label, setStorage(ctx, rpcClient, pool, slot, mutated)
-	case ammUniswapV3:
-		slot := slotUniswapV3Slot0
-		original, err := readSlot(ctx, client, pool, slot)
-		if err != nil {
-			return "", err
-		}
-		mutated, label, err := shiftV3Slot0(original, mask160, 160)
-		if err != nil {
-			return "", err
-		}
-		return label, setStorage(ctx, rpcClient, pool, slot, mutated)
-	case ammAerodromeV2:
-		slot := slotAerodromeV2Reserve0
-		original, err := readSlot(ctx, client, pool, slot)
-		if err != nil {
-			return "", err
-		}
-		mutated, label, err := shiftAerodromeV2Reserve0(original)
-		if err != nil {
-			return "", err
-		}
-		return label, setStorage(ctx, rpcClient, pool, slot, mutated)
-	case ammAerodromeSlipstr:
-		slot := slotAerodromeSlipstreamSlot0
-		original, err := readSlot(ctx, client, pool, slot)
-		if err != nil {
-			return "", err
-		}
-		mutated, label, err := shiftSlipstreamSlot0(original)
-		if err != nil {
-			return "", err
-		}
-		return label, setStorage(ctx, rpcClient, pool, slot, mutated)
-	}
-	return "", fmt.Errorf("unknown_amm_kind")
-}
-
-func locateAMMPoolDual(ctx context.Context, client *ethclient.Client, oracle, collateral common.Address) (common.Address, string, error) {
-	if collateral != (common.Address{}) {
-		if _, err := callBig(ctx, client, collateral, SelGetReserves); err == nil {
-			if _, err := callBig(ctx, client, collateral, SelStable); err == nil {
-				return collateral, ammAerodromeV2, nil
-			}
-			return collateral, ammUniswapV2, nil
-		}
-		if _, err := callBig(ctx, client, collateral, SelSlot0); err == nil {
-			if _, err := callBig(ctx, client, collateral, SelFeeProtocol); err == nil {
-				return collateral, ammUniswapV3, nil
-			}
-			return collateral, ammAerodromeSlipstr, nil
-		}
-	}
-	for _, target := range []common.Address{oracle, collateral} {
-		if target == (common.Address{}) {
+			lastErr = err
 			continue
 		}
-		code, err := client.CodeAt(ctx, target, nil)
-		if err != nil || len(code) == 0 {
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var parsed llmResponse
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			lastErr = err
 			continue
 		}
-		for _, addr := range extractPUSH20Candidates(code) {
-			if _, err := callBig(ctx, client, addr, SelGetReserves); err == nil {
-				if _, err := callBig(ctx, client, addr, SelStable); err == nil {
-					return addr, ammAerodromeV2, nil
-				}
-				return addr, ammUniswapV2, nil
-			}
-			if _, err := callBig(ctx, client, addr, SelSlot0); err == nil {
-				if _, err := callBig(ctx, client, addr, SelFeeProtocol); err == nil {
-					return addr, ammUniswapV3, nil
-				}
-				return addr, ammAerodromeSlipstr, nil
-			}
-		}
-	}
-	return common.Address{}, "", fmt.Errorf("no AMM pool resolved")
-}
-
-func extractPUSH20Candidates(code []byte) []common.Address {
-	seen := make(map[common.Address]struct{})
-	var out []common.Address
-	for i := 0; i+21 <= len(code); i++ {
-		if code[i] != 0x73 {
+		if parsed.Error != nil || len(parsed.Choices) == 0 {
+			lastErr = fmt.Errorf("model %s failed", model)
 			continue
 		}
-		addr := common.BytesToAddress(code[i+1 : i+21])
-		if addr == (common.Address{}) {
-			continue
+
+		result := strings.TrimSpace(strings.ToUpper(parsed.Choices[0].Message.Content))
+		if result == "VULNERABLE" || result == "SAFE" {
+			return result, nil
 		}
-		if _, ok := seen[addr]; ok {
-			continue
-		}
-		seen[addr] = struct{}{}
-		out = append(out, addr)
+		lastErr = fmt.Errorf("model %s: unexpected %q", model, result)
 	}
-	return out
-}
-
-func shiftV2ReservesPacked(old common.Hash, mask *big.Int, width uint) (common.Hash, string, error) {
-	v := new(big.Int).SetBytes(old.Bytes())
-	r0 := new(big.Int).And(v, mask)
-	if r0.Sign() == 0 {
-		return common.Hash{}, "", fmt.Errorf("zero reserve0")
-	}
-	nr0 := new(big.Int).Mul(r0, shiftV2Num)
-	nr0.Div(nr0, shiftV2Den)
-	if nr0.BitLen() > int(width) {
-		return common.Hash{}, "", fmt.Errorf("reserve0 overflow")
-	}
-	cleared := new(big.Int).And(v, new(big.Int).Not(mask))
-	return common.BigToHash(new(big.Int).Or(cleared, nr0)),
-		fmt.Sprintf("+%d%% reserve0", shiftV2Num.Int64()-100), nil
-}
-
-func shiftAerodromeV2Reserve0(old common.Hash) (common.Hash, string, error) {
-	v := new(big.Int).SetBytes(old.Bytes())
-	if v.Sign() == 0 {
-		return common.Hash{}, "", fmt.Errorf("zero reserve0")
-	}
-	nr0 := new(big.Int).Mul(v, shiftV2Num)
-	nr0.Div(nr0, shiftV2Den)
-	return common.BigToHash(nr0),
-		fmt.Sprintf("+%d%% reserve0", shiftV2Num.Int64()-100), nil
-}
-
-func shiftV3Slot0(old common.Hash, mask *big.Int, width uint) (common.Hash, string, error) {
-	v := new(big.Int).SetBytes(old.Bytes())
-	sp := new(big.Int).And(v, mask)
-	if sp.Sign() == 0 {
-		return common.Hash{}, "", fmt.Errorf("zero sqrtPriceX96")
-	}
-	ns := new(big.Int).Mul(sp, shiftV3Num)
-	ns.Div(ns, shiftV3Den)
-	cleared := new(big.Int).And(v, new(big.Int).Not(mask))
-	return common.BigToHash(new(big.Int).Or(cleared, ns)),
-		fmt.Sprintf("sqrtPriceX96 -%d%%", 100-shiftV3Num.Int64()), nil
-}
-
-func shiftSlipstreamSlot0(old common.Hash) (common.Hash, string, error) {
-	return shiftV3Slot0(old, mask160, 160)
-}
-
-func readSlot(ctx context.Context, client *ethclient.Client, addr common.Address, slot common.Hash) (common.Hash, error) {
-	raw, err := client.StorageAt(ctx, addr, slot, nil)
-	if err != nil {
-		return common.Hash{}, err
-	}
-	if len(raw) != 32 {
-		return common.Hash{}, fmt.Errorf("bad slot response: %d bytes", len(raw))
-	}
-	return common.BytesToHash(raw), nil
-}
-
-func setStorage(ctx context.Context, c *rpc.Client, addr common.Address, slot, value common.Hash) error {
-	var res interface{}
-	if err := c.CallContext(ctx, &res, "anvil_setStorageAt", addr.Hex(), slot.Hex(), value.Hex()); err == nil {
-		return nil
-	}
-	return c.CallContext(ctx, &res, "hardhat_setStorageAt", addr.Hex(), slot.Hex(), value.Hex())
-}
-
-func takeSnapshot(ctx context.Context, c *rpc.Client) (string, error) {
-	var id string
-	if err := c.CallContext(ctx, &id, "anvil_snapshot"); err == nil {
-		return id, nil
-	}
-	return id, c.CallContext(ctx, &id, "evm_snapshot")
-}
-
-func revertSnapshot(ctx context.Context, c *rpc.Client, id string) error {
-	var ok bool
-	if err := c.CallContext(ctx, &ok, "anvil_revert", id); err == nil {
-		return nil
-	}
-	return c.CallContext(ctx, &ok, "evm_revert", id)
-}
-
-func detectAMMKind(ctx context.Context, client *ethclient.Client, pool common.Address) string {
-	if _, err := callBig(ctx, client, pool, SelGetReserves); err == nil {
-		if _, err := callBig(ctx, client, pool, SelStable); err == nil {
-			return ammAerodromeV2
-		}
-		return ammUniswapV2
-	}
-	if _, err := callBig(ctx, client, pool, SelSlot0); err == nil {
-		if _, err := callBig(ctx, client, pool, SelFeeProtocol); err == nil {
-			return ammUniswapV3
-		}
-		return ammAerodromeSlipstr
-	}
-	return ""
-}
-
-// ---------- eth_call helpers (moved from report.go) ----------
-
-// callMsgData packs a selector plus pre-encoded 32-byte arguments
-// into an eth_call message.
-func callMsgData(to common.Address, selector []byte, args ...[]byte) ethereum.CallMsg {
-	data := make([]byte, 0, 4+32*len(args))
-	data = append(data, selector...)
-	for _, a := range args {
-		data = append(data, a...)
-	}
-	return ethereum.CallMsg{To: &to, Data: data}
-}
-
-// callBig performs an eth_call against `to` with `selector` as
-// calldata and decodes the first 32 bytes of the return value as
-// a big.Int.
-func callBig(
-	ctx context.Context,
-	client *ethclient.Client,
-	to common.Address,
-	selector []byte,
-) (*big.Int, error) {
-	raw, err := client.CallContract(ctx, callMsgData(to, selector), nil)
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) < 32 {
-		return nil, fmt.Errorf("short response")
-	}
-	return new(big.Int).SetBytes(raw[:32]), nil
+	return "", lastErr
 }
