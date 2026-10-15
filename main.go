@@ -184,7 +184,7 @@ func run() int {
 		log.Printf("scanner[phase3]: %q -> %d pricing contract(s)", proto.Name, len(pricingAddrs))
 		scanned++
 
-		var allFlags []FlagReport
+				var allFlags []FlagReport
 		for _, paddr := range pricingAddrs {
 			src, err := FetchVerifiedSource(runCtx, paddr)
 			if err != nil {
@@ -192,22 +192,24 @@ func run() int {
 				continue
 			}
 
-			flags := RunRegexScan(src)
+			flags := RunRegexScan(src) // now returns []FlagReport
 			if len(flags) == 0 {
 				continue
 			}
 
 			log.Printf("scanner[phase4]: %q -> %d flag(s), asking LLM", proto.Name, len(flags))
 			for i := range flags {
-				verdict, err := AskOpenRouterWithFallback(runCtx, flags[i].Snippet)
+				raw, err := AskGeminiWithFallback(runCtx, flags[i].Snippet)
 				if err != nil {
 					log.Printf("scanner[phase4]: LLM failed for rule %s: %v", flags[i].RuleID, err)
 					flags[i].LLMVerdict = "ERROR"
 					continue
 				}
-				flags[i].LLMVerdict = verdict
+				flags[i].LLMVerdict = raw
 				totalFlags++
-				if verdict == "VULNERABLE" {
+
+				// Check the structured response for VULNERABLE.
+				if ParseVerdict(raw) == "VULNERABLE" {
 					allFlags = append(allFlags, flags[i])
 				}
 			}
