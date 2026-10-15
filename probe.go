@@ -17,24 +17,18 @@ import (
 // =============================================================
 // Phase 3: Fetch verified source + regex scan
 // =============================================================
-
-type RegexFlag struct {
-	RuleID      string   `json:"rule_id"`
-	Category    string   `json:"category"`
-	Severity    string   `json:"severity"`
-	Snippet     string   `json:"snippet"`
-	LineStart   int      `json:"line_start"`
-	LineEnd     int      `json:"line_end"`
-	Suppressors []string `json:"suppressors,omitempty"`
-}
+// NOTE: RegexFlag was removed. RunRegexScan now returns []FlagReport
+// (defined in report.go). This avoids a duplicate-type compile error
+// in main.go where allFlags is []FlagReport.
+// =============================================================
 
 // etherscanResponse is the Etherscan V2 getsourcecode response.
 type etherscanResponse struct {
 	Status  string `json:"status"`
 	Message string `json:"message"`
 	Result  []struct {
-		SourceCode string `json:"SourceCode"`
-		ABI        string `json:"ABI"`
+		SourceCode   string `json:"SourceCode"`
+		ABI          string `json:"ABI"`
 		ContractName string `json:"ContractName"`
 	} `json:"result"`
 }
@@ -118,10 +112,11 @@ var regexRules = []regexRule{
 	{ID: "I1", Category: "lp-valuation", Severity: "high", Pattern: regexp.MustCompile(`getReserves\s*\(\)[\s\S]{0,200}totalSupply\s*\(\)`)},
 }
 
-// RunRegexScan applies every rule to the source. Returns flags
-// grouped by rule, with snippets and suppressor annotations.
-func RunRegexScan(source string) []RegexFlag {
-	var flags []RegexFlag
+// RunRegexScan applies every rule to the source. Returns FlagReport
+// structs (defined in report.go) with snippets and suppressor
+// annotations. LLMVerdict is filled in later by main.go.
+func RunRegexScan(source string) []FlagReport {
+	var flags []FlagReport
 	lines := strings.Split(source, "\n")
 
 	for _, rule := range regexRules {
@@ -130,7 +125,6 @@ func RunRegexScan(source string) []RegexFlag {
 			lineStart := strings.Count(source[:loc[0]], "\n")
 			lineEnd := strings.Count(source[:loc[1]], "\n")
 
-			// Extract ±10 lines of context.
 			ctxStart := lineStart - 10
 			if ctxStart < 0 {
 				ctxStart = 0
@@ -141,7 +135,7 @@ func RunRegexScan(source string) []RegexFlag {
 			}
 			snippet := strings.Join(lines[ctxStart:ctxEnd+1], "\n")
 
-			flag := RegexFlag{
+			flag := FlagReport{
 				RuleID:    rule.ID,
 				Category:  rule.Category,
 				Severity:  rule.Severity,
@@ -149,10 +143,7 @@ func RunRegexScan(source string) []RegexFlag {
 				LineStart: lineStart + 1,
 				LineEnd:   lineEnd + 1,
 			}
-
-			// Suppression markers.
 			flag.Suppressors = checkSuppressors(rule.ID, snippet)
-
 			flags = append(flags, flag)
 		}
 	}
