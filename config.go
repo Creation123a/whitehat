@@ -19,8 +19,10 @@ const (
 	EtherscanChainID = 8453
 
 	OpenRouterURL = "https://openrouter.ai/api/v1/chat/completions"
-
-	SQDPortalURL      = "https://portal.sqd.dev"
+	// SQD Portal MCP endpoint. The scanner talks to the portal
+	// over the stateless MCP 2026-07-28 protocol via the official
+	// Go MCP SDK.
+	SQDPortalMCPURL   = "https://portal.sqd.dev/mcp"
 	SQDBaseNetwork    = "base-mainnet"
 )
 
