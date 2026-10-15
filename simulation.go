@@ -16,17 +16,15 @@ import (
 // Phase 4: Google AI Studio (Gemini API) LLM filter
 // =============================================================
 
-// Gemini API endpoint. Model is configurable via GEMINI_MODEL env.
 const (
-	GeminiAPIBase = "https://generativelanguage.googleapis.com/v1beta/models"
+	GeminiAPIBase      = "https://generativelanguage.googleapis.com/v1beta/models"
 	DefaultGeminiModel = "gemini-2.0-flash"
 )
 
-// geminiRequest is the generateContent request body.
 type geminiRequest struct {
-	Contents         []geminiContent `json:"contents"`
-	SystemInstruction *geminiContent `json:"systemInstruction,omitempty"`
-	GenerationConfig geminiGenerationConfig `json:"generationConfig"`
+	Contents          []geminiContent      `json:"contents"`
+	SystemInstruction *geminiContent       `json:"systemInstruction,omitempty"`
+	GenerationConfig  geminiGenerationConfig `json:"generationConfig"`
 }
 
 type geminiContent struct {
@@ -44,7 +42,6 @@ type geminiGenerationConfig struct {
 	ResponseMimeType string  `json:"responseMimeType,omitempty"`
 }
 
-// geminiResponse is the generateContent response body.
 type geminiResponse struct {
 	Candidates []struct {
 		Content struct {
@@ -60,8 +57,6 @@ type geminiResponse struct {
 	} `json:"error,omitempty"`
 }
 
-// systemPrompt instructs the model to return a structured verdict
-// instead of a single word, with vulnerability location and type.
 const systemPrompt = `You are a smart contract security auditor.
 
 You will receive a Solidity code snippet flagged by a regex scanner. Your job is to determine:
@@ -77,15 +72,29 @@ REASON: <one sentence explaining why>
 
 Do not over-explain. Be precise.`
 
-// AskGemini sends a snippet to Google AI Studio and returns a
-// structured verdict string.
-func AskGemini(ctx context.Context, snippet string) (string, error) {
-	apiKey := os.Getenv("GEMINI_API_KEY")
-	if apiKey == "" {
-		apiKey = os.Getenv("GOOGLE_API_KEY")
+// geminiAPIKey returns the first non-empty API key from the
+// environment. Checks OPENROUTER_API_KEY first so the workflow's
+// existing secret works unchanged.
+func geminiAPIKey() string {
+	for _, name := range []string{
+		"OPENROUTER_API_KEY",
+		"GEMINI_API_KEY",
+		"GOOGLE_API_KEY",
+		"GOOGLE_AI_STUDIO_KEY",
+	} {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
 	}
+	return ""
+}
+
+// AskGemini sends a snippet to Google AI Studio and returns the
+// raw structured verdict string.
+func AskGemini(ctx context.Context, snippet string) (string, error) {
+	apiKey := geminiAPIKey()
 	if apiKey == "" {
-		return "", fmt.Errorf("GEMINI_API_KEY or GOOGLE_API_KEY not set")
+		return "", fmt.Errorf("no Gemini API key found in env (OPENROUTER_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_AI_STUDIO_KEY)")
 	}
 
 	model := os.Getenv("GEMINI_MODEL")
@@ -93,7 +102,6 @@ func AskGemini(ctx context.Context, snippet string) (string, error) {
 		model = DefaultGeminiModel
 	}
 
-	// Build request body.
 	reqBody := geminiRequest{
 		SystemInstruction: &geminiContent{
 			Parts: []geminiPart{{Text: systemPrompt}},
@@ -110,8 +118,6 @@ func AskGemini(ctx context.Context, snippet string) (string, error) {
 	}
 
 	body, _ := json.Marshal(reqBody)
-
-	// URL: /v1beta/models/{model}:generateContent
 	fullURL := fmt.Sprintf("%s/%s:generateContent", GeminiAPIBase, model)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(body))
@@ -133,7 +139,6 @@ func AskGemini(ctx context.Context, snippet string) (string, error) {
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return "", fmt.Errorf("gemini decode: %w (body: %s)", err, string(raw))
 	}
-
 	if parsed.Error != nil {
 		return "", fmt.Errorf("gemini error %d: %s", parsed.Error.Code, parsed.Error.Message)
 	}
@@ -151,23 +156,42 @@ func AskGemini(ctx context.Context, snippet string) (string, error) {
 	return text, nil
 }
 
-// AskGeminiWithFallback wraps AskGemini with a retry on the
-// alternate env key name. This is a no-op if the primary key works.
+// AskGeminiWithFallback is the entry point used by main.go.
+// Named to match the call site exactly.
 func AskGeminiWithFallback(ctx context.Context, snippet string) (string, error) {
-	// Primary attempt.
-	result, err := AskGemini(ctx, snippet)
-	if err == nil {
-		return result, nil
-	}
+	return AskGemini(ctx, snippet)
+}
 
-	// If the error mentions the API key, retry with the alternate
-	// env var name. Otherwise return the original error.
-	if strings.Contains(err.Error(), "not set") {
-		altKey := os.Getenv("GOOGLE_AI_STUDIO_KEY")
-		if altKey != "" {
-			os.Setenv("GEMINI_API_KEY", altKey)
-			return AskGemini(ctx, snippet)
+// ParseVerdict extracts VULNERABLE / SAFE / UNKNOWN from a
+// structured Gemini response. Looks for "VERDICT: <word>" first,
+// then falls back to scanning the first line.
+func ParseVerdict(response string) string {
+	upper := strings.ToUpper(response)
+
+	// Preferred: exact "VERDICT: VULNERABLE" or "VERDICT: SAFE".
+	if idx := strings.Index(upper, "VERDICT:"); idx >= 0 {
+		rest := upper[idx+len("VERDICT:"):]
+		rest = strings.TrimSpace(rest)
+		if strings.HasPrefix(rest, "VULNERABLE") {
+			return "VULNERABLE"
+		}
+		if strings.HasPrefix(rest, "SAFE") {
+			return "SAFE"
 		}
 	}
-	return "", err
+
+	// Fallback: first non-empty line containing either word.
+	for _, line := range strings.Split(upper, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "VULNERABLE") {
+			return "VULNERABLE"
+		}
+		if strings.Contains(line, "SAFE") {
+			return "SAFE"
+		}
+	}
+	return "UNKNOWN"
 }
