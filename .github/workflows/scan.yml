@@ -3,6 +3,18 @@ name: Base Protocol Spot-AMM Exposure Scan
 on:
   workflow_dispatch:
     inputs:
+      category:
+        description: 'DefiLlama category keyword (one per run)'
+        required: true
+        default: 'Lending'
+        type: choice
+        options:
+          - Lending
+          - Isolated Lending
+          - Yield
+          - Yield Aggregator
+          - CDP
+          - Leveraged Farming
       fork_block:
         description: 'Override fork block (leave empty to auto-fetch latest)'
         required: false
@@ -16,17 +28,9 @@ on:
           - json
           - text
       timeout:
-        description: 'Pipeline timeout (e.g. 20m, 30m, 1h) — probing may need 30m+'
+        description: 'Pipeline timeout (e.g. 20m, 30m, 1h) — regex + LLM stage may need 30m+'
         required: true
         default: '30m'
-      min_protocols:
-        description: 'Minimum protocols attached to a market to scan it (0 = off)'
-        required: true
-        default: '0'
-      min_tvl:
-        description: 'Minimum protocol TVL in USD to survive dust filter'
-        required: true
-        default: '50000'
 
 jobs:
   scan:
@@ -51,8 +55,10 @@ jobs:
       - name: Build scanner
         run: go build -o scanner .
 
-      - name: Mask RPC URL
-        run: echo "::add-mask::${{ secrets.BASE_FORK_URL }}"
+      - name: Mask secrets
+        run: |
+          echo "::add-mask::${{ secrets.BASE_FORK_URL }}"
+          echo "::add-mask::${{ secrets.OPENROUTER_API_KEY }}"
 
       - name: Resolve fork block
         id: fork
@@ -73,22 +79,21 @@ jobs:
 
       - name: Run scan
         env:
-          BASE_FORK_URL: ${{ secrets.BASE_FORK_URL }}
-          FORK_BLOCK:    ${{ steps.fork.outputs.block }}
-          FORMAT:        ${{ inputs.format }}
-          TIMEOUT:       ${{ inputs.timeout }}
-          MIN_PROTOCOLS: ${{ inputs.min_protocols }}
-          MIN_TVL:       ${{ inputs.min_tvl }}
+          BASE_FORK_URL:      ${{ secrets.BASE_FORK_URL }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          FORK_BLOCK:         ${{ steps.fork.outputs.block }}
+          CATEGORY:           ${{ inputs.category }}
+          FORMAT:             ${{ inputs.format }}
+          TIMEOUT:            ${{ inputs.timeout }}
         run: |
           set -euo pipefail
           ARGS=()
           ARGS+=(--fork-url "$BASE_FORK_URL")
           ARGS+=(--fork-block "$FORK_BLOCK")
+          ARGS+=(--category "$CATEGORY")
           ARGS+=(--format "$FORMAT")
           ARGS+=(--out report.json)
           ARGS+=(--timeout "$TIMEOUT")
-          ARGS+=(--min-protocols "$MIN_PROTOCOLS")
-          ARGS+=(--min-tvl "$MIN_TVL")
           ./scanner "${ARGS[@]}"
 
       - name: Show report summary
@@ -106,7 +111,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scan-report-${{ steps.fork.outputs.block }}
+          name: scan-report-${{ inputs.category }}-${{ steps.fork.outputs.block }}
           path: report.json
           if-no-files-found: warn
           retention-days: 30
