@@ -35,8 +35,6 @@ func run() int {
 		category = fs.String("category", "", "DefiLlama category keyword (Lending, Isolated Lending, Yield, Yield Aggregator, CDP, Leveraged Farming)")
 	)
 
-	_ = registerOpsFlags(fs)
-
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return 1
 	}
