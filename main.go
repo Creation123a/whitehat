@@ -120,6 +120,7 @@ func run() int {
 			chainID.Int64(), requiredChainID)
 		return 1
 	}
+	defer CloseSQD()
 
 	runCtx, cancelRun := context.WithTimeout(rootCtx, *timeout)
 	defer cancelRun()
