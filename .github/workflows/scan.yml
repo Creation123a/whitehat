@@ -44,7 +44,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.25'
           cache: true
 
       - name: Install Foundry (Anvil)
@@ -52,8 +52,15 @@ jobs:
         with:
           version: v1.0.0
 
+      - name: Tidy modules
+        run: go mod tidy
+
       - name: Build scanner
         run: go build -o scanner .
+
+      - name: Show go.sum for manual sync
+        if: always()
+        run: cat go.sum || true
 
       - name: Mask secrets
         run: |
