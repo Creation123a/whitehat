@@ -1,9 +1,11 @@
 module scanner
 
-go 1.25.0
+go 1.25
 
-require github.com/ethereum/go-ethereum v1.17.7
-
+require (
+	github.com/ethereum/go-ethereum v1.15.11
+	github.com/modelcontextprotocol/go-sdk v1.8.0
+)
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20251001021608-1fe7b43fc4d6 // indirect
