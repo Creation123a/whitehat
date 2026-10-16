@@ -10,11 +10,16 @@ on:
         type: choice
         options:
           - Lending
-          - Isolated Lending
           - Yield
           - Yield Aggregator
           - CDP
           - Leveraged Farming
+          - Dexs
+          - Basis Trading
+          - Derivatives
+          - Farm
+          - Liquid Staking
+          - RWA
       fork_block:
         description: 'Override fork block (leave empty to auto-fetch latest)'
         required: false
