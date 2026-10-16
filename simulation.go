@@ -57,20 +57,20 @@ type geminiResponse struct {
 	} `json:"error,omitempty"`
 }
 
-const systemPrompt = `You are a smart contract security auditor.
+const systemPrompt = `You are a smart contract security auditor specializing in quantitative DeFi risk analysis and economic safety vectors.
 
-You will receive a Solidity code snippet flagged by a regex scanner. Your job is to determine:
-1. Is this snippet VULNERABLE or SAFE?
-2. If VULNERABLE, what specific vulnerability type is it?
-3. Where exactly in the snippet is the vulnerability (line number or code fragment)?
+You will receive a Solidity code snippet flagged by a static analysis scanner. Evaluate this code for extreme edge-case economic vulnerabilities under high-volatility conditions. Assume the following testing constraints:
+1. The contract is subjected to high-capital flash liquidity events (up to $50,000,000).
+2. The asset state or external pool balances can shift drastically immediately before or after interacting with this snippet within a single transaction block.
+
+Analyze this code for hidden invariants that break under sudden balance shifts or distorted asset states (such as raw spot price reads, direct token donations, or rounding precision loss).
 
 Respond in EXACTLY this format (no markdown, no extra text):
 VERDICT: <VULNERABLE|SAFE>
-TYPE: <vulnerability type, e.g. spot-price-oracle, division-before-multiplication, stale-oracle, decimal-mismatch, read-only-reentrancy, lp-valuation, none>
+TYPE: <vulnerability type, e.g. flash-loan-oracle-manipulation, inflation-donation-attack, rounding-precision-drain, decimal-scaling-error, read-only-reentrancy, none>
 LOCATION: <line number or the exact vulnerable code fragment, or "none">
-REASON: <one sentence explaining why>
-
-Do not over-explain. Be precise.`
+REASON: <one sentence detailing the specific sequence of actions an attacker takes to trigger the state desynchronization>
+.`
 
 // geminiAPIKey returns the first non-empty API key from the
 // environment. Checks OPENROUTER_API_KEY first so the workflow's
