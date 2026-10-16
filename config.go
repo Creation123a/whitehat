@@ -43,12 +43,17 @@ var (
 // accepts per run. The workflow passes one keyword; the scanner
 // matches DefiLlama's `category` field against it exactly.
 var TargetCategories = map[string]bool{
-	"Lending":            true,
-	"Isolated Lending":   true,
-	"Yield":              true,
-	"Yield Aggregator":   true,
-	"CDP":                true,
-	"Leveraged Farming":  true,
+	"Lending":           true,
+	"Yield":             true,
+	"Yield Aggregator":  true,
+	"CDP":               true,
+	"Leveraged Farming": true,
+	"Dexs":              true,
+	"Basis Trading":     true,
+	"Derivatives":       true,
+	"Farm":              true,
+	"Liquid Staking":    true,
+	"RWA":               true,
 }
 
 // TVL bounds (USD), enforced from DefiLlama chainTvls["Base"].
