@@ -14,7 +14,7 @@ import (
 
 const (
 	GroqAPIBase      = "https://api.groq.com/openai/v1/chat/completions"
-	DefaultGroqModel = "llama-3.3-70b-versatile"
+	DefaultGroqModel = "openai/gpt-oss-120b"
 )
 
 type groqRequest struct {
