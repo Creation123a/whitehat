@@ -85,6 +85,9 @@ func extractSourcesFromJSON(jsonStr string) string {
 	return sb.String()
 }
 
+// FetchVerifiedSource calls Etherscan V2 getsourcecode for the
+// given address on Base. It handles both the success case (an
+// array) and the error case (a string) in the `result` field.
 func FetchVerifiedSource(ctx context.Context, addr common.Address) (string, string, error) {
 	q := url.Values{}
 	q.Set("chainid", fmt.Sprintf("%d", EtherscanChainID))
