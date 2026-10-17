@@ -7,23 +7,19 @@ import (
 	"os"
 	"sort"
 	"time"
-
-	"github.com/ethereum/go-ethereum/common"
 )
 
-// =============================================================
-// Report types
-// =============================================================
-
 type FlagReport struct {
-	RuleID      string   `json:"rule_id"`
-	Category    string   `json:"category"`
-	Severity    string   `json:"severity"`
-	Snippet     string   `json:"snippet"`
-	LineStart   int      `json:"line_start"`
-	LineEnd     int      `json:"line_end"`
-	Suppressors []string `json:"suppressors,omitempty"`
-	LLMVerdict  string   `json:"llm_verdict"`
+	RuleID            string   `json:"rule_id"`
+	Category          string   `json:"category"`
+	Severity          string   `json:"severity"`
+	Snippet           string   `json:"snippet"`
+	LineStart         int      `json:"line_start"`
+	LineEnd           int      `json:"line_end"`
+	Suppressors       []string `json:"suppressors,omitempty"`
+	LLMVerdict        string   `json:"llm_verdict"`
+	ContractAddress   string   `json:"contract_address"`
+	ContractRole      string   `json:"contract_role"`
 }
 
 type FindingReport struct {
@@ -32,10 +28,7 @@ type FindingReport struct {
 	Slug       string       `json:"slug"`
 	Category   string       `json:"category"`
 	TVLUSD     float64      `json:"tvl_usd"`
-	Address    string       `json:"address"`
-	Chain      string       `json:"chain"`
 	Flags      []FlagReport `json:"flags"`
-	Summary    string       `json:"summary"`
 }
 
 type RunMetadata struct {
@@ -58,20 +51,12 @@ type SkippedProtocol struct {
 }
 
 type Report struct {
-	Metadata  RunMetadata      `json:"metadata"`
-	Findings  []FindingReport  `json:"findings"`
-	Skipped   []SkippedProtocol `json:"skipped"`
+	Metadata RunMetadata       `json:"metadata"`
+	Findings []FindingReport   `json:"findings"`
+	Skipped  []SkippedProtocol `json:"skipped"`
 }
 
-// =============================================================
-// Build report
-// =============================================================
-
-func BuildReport(
-	meta RunMetadata,
-	findings []FindingReport,
-	skipped []SkippedProtocol,
-) *Report {
+func BuildReport(meta RunMetadata, findings []FindingReport, skipped []SkippedProtocol) *Report {
 	sort.SliceStable(findings, func(i, j int) bool {
 		return findings[i].TVLUSD > findings[j].TVLUSD
 	})
@@ -79,24 +64,16 @@ func BuildReport(
 		findings[i].Rank = i + 1
 	}
 
-	meta.SchemaVersion = "7.0"
+	meta.SchemaVersion = "8.0"
 	meta.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	meta.VulnerableCount = len(findings)
 	meta.ProtocolsSkipped = len(skipped)
 
-	return &Report{
-		Metadata: meta,
-		Findings: findings,
-		Skipped:  skipped,
-	}
+	return &Report{Metadata: meta, Findings: findings, Skipped: skipped}
 }
 
-// =============================================================
-// Rendering
-// =============================================================
-
 func RenderText(w io.Writer, r *Report) {
-	fmt.Fprintf(w, "=== BASE PROTOCOL SPOT-AMM EXPOSURE SCAN (v7.0) ===\n")
+	fmt.Fprintf(w, "=== BASE PROTOCOL SPOT-AMM EXPOSURE SCAN (v8.0) ===\n")
 	fmt.Fprintf(w, "Category: %s   Block: %d   %s\n",
 		r.Metadata.CategoryKeyword, r.Metadata.BlockNumber, r.Metadata.Timestamp)
 	fmt.Fprintf(w, "Protocols found: %d   scanned: %d   skipped: %d\n",
@@ -109,11 +86,10 @@ func RenderText(w io.Writer, r *Report) {
 	}
 	for _, f := range r.Findings {
 		fmt.Fprintf(w, "\n[%d] %s  [%s]  tvl=$%.0f\n", f.Rank, f.Protocol, f.Category, f.TVLUSD)
-		fmt.Fprintf(w, "     Address: %s\n", f.Address)
-		fmt.Fprintf(w, "     Flags:   %d\n", len(f.Flags))
 		for _, fl := range f.Flags {
-			fmt.Fprintf(w, "       - %s [%s] LLM=%s  lines %d-%d\n",
-				fl.RuleID, fl.Severity, fl.LLMVerdict, fl.LineStart, fl.LineEnd)
+			fmt.Fprintf(w, "     - %s [%s] @ %s (%s)\n",
+				fl.RuleID, fl.Severity, fl.ContractAddress, fl.ContractRole)
+			fmt.Fprintf(w, "       LLM: %s\n", fl.LLMVerdict)
 		}
 	}
 
@@ -152,5 +128,3 @@ func WriteReport(path, format string, r *Report) int {
 	}
 	return 0
 }
-
-var _ = common.Address{}
