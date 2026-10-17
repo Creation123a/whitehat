@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
 )
@@ -24,27 +25,23 @@ func run() int {
 	fs.SetOutput(os.Stderr)
 
 	var (
-		rpcURL   = fs.String("rpc", "", "pre-running RPC URL; skips Anvil spawn")
-		forkURL  = fs.String("fork-url", "", "Base RPC URL to fork (required unless --rpc)")
-		forkBlock = fs.Uint64("fork-block", 0, "pinned fork block number (required unless --rpc)")
-		anvilBin = fs.String("anvil", "anvil", "path to anvil binary")
+		rpcURL    = fs.String("rpc", "", "pre-running RPC URL")
+		forkURL   = fs.String("fork-url", "", "Base RPC URL to fork")
+		forkBlock = fs.Uint64("fork-block", 0, "pinned fork block")
+		anvilBin  = fs.String("anvil", "anvil", "path to anvil binary")
 		anvilPort = fs.Int("anvil-port", 8545, "anvil listen port")
-		outPath  = fs.String("out", "report.json", "output file")
-		format   = fs.String("format", "json", "output format: text | json")
-		timeout  = fs.Duration("timeout", 30*time.Minute, "pipeline timeout")
-		category = fs.String("category", "", "DefiLlama category keyword (Lending, Isolated Lending, Yield, Yield Aggregator, CDP, Leveraged Farming)")
+		outPath   = fs.String("out", "report.json", "output file")
+		format    = fs.String("format", "json", "output format: text | json")
+		timeout   = fs.Duration("timeout", 30*time.Minute, "pipeline timeout")
+		category  = fs.String("category", "", "DefiLlama category keyword")
 	)
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return 1
 	}
 
-	if *category == "" {
-		fmt.Fprintln(os.Stderr, "scanner: --category is required")
-		return 1
-	}
-	if !TargetCategories[*category] {
-		fmt.Fprintf(os.Stderr, "scanner: invalid category %q\n", *category)
+	if *category == "" || !TargetCategories[*category] {
+		fmt.Fprintln(os.Stderr, "scanner: valid --category is required")
 		return 1
 	}
 
@@ -55,18 +52,12 @@ func run() int {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Fprintln(os.Stderr, "scanner: signal received, shutting down")
 		cancelRoot()
 	}()
 
-	// ---- Anvil lifecycle ----
 	var anvil *exec.Cmd
 	effectiveRPC := *rpcURL
 	if effectiveRPC == "" {
-		if *forkURL == "" || *forkBlock == 0 {
-			fmt.Fprintln(os.Stderr, "scanner: --fork-url and --fork-block required unless --rpc is set")
-			return 1
-		}
 		anvil = exec.Command(*anvilBin,
 			"--fork-url", *forkURL,
 			"--fork-block-number", fmt.Sprintf("%d", *forkBlock),
@@ -83,16 +74,9 @@ func run() int {
 			return 1
 		}
 		defer func() {
-			if anvil.Process == nil {
-				return
-			}
-			_ = anvil.Process.Signal(syscall.SIGTERM)
-			done := make(chan struct{})
-			go func() { _ = anvil.Wait(); close(done) }()
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				_ = anvil.Process.Kill()
+			if anvil.Process != nil {
+				_ = anvil.Process.Signal(syscall.SIGTERM)
+				_, _ = anvil.Process.Wait()
 			}
 		}()
 		effectiveRPC = fmt.Sprintf("http://127.0.0.1:%d", *anvilPort)
@@ -110,18 +94,6 @@ func run() int {
 
 	client := ethclient.NewClient(rpcClient)
 
-	chainID, err := client.ChainID(setupCtx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "scanner: chain-id read: %v\n", err)
-		return 1
-	}
-	if chainID.Int64() != requiredChainID {
-		fmt.Fprintf(os.Stderr, "scanner: chain-id guard failed: got %d, want %d\n",
-			chainID.Int64(), requiredChainID)
-		return 1
-	}
-	defer CloseSQD()
-
 	runCtx, cancelRun := context.WithTimeout(rootCtx, *timeout)
 	defer cancelRun()
 
@@ -130,112 +102,55 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "scanner: block number: %v\n", err)
 		return 2
 	}
-	log.Printf("scanner: forked at block %d, chain %d", blockNum, chainID.Int64())
+	log.Printf("scanner: forked at block %d", blockNum)
 
-	// =========================================================
-	// Phase 1: DefiLlama filter
-	// =========================================================
-	log.Printf("scanner[phase1]: fetching DefiLlama category=%q", *category)
 	protocols, err := DiscoverProtocols(runCtx, *category)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scanner[phase1]: %v\n", err)
 		return 2
 	}
-	log.Printf("scanner[phase1]: %d protocols in [%s] with Base TVL in [$50k, $10M]",
-		len(protocols), *category)
+	log.Printf("scanner[phase1]: %d protocols in [%s]", len(protocols), *category)
 
 	if len(protocols) == 0 {
-		rep := BuildReport(RunMetadata{
-			ChainID:         chainID.Int64(),
-			BlockNumber:     blockNum,
-			CategoryKeyword: *category,
-			ProtocolsFound: 0,
-		}, nil, nil)
+		rep := BuildReport(RunMetadata{ChainID: requiredChainID, BlockNumber: blockNum, CategoryKeyword: *category}, nil, nil)
 		return WriteReport(*outPath, *format, rep)
 	}
 
-	// =========================================================
-	// Phase 2 + 3 + 4: per-protocol pipeline
-	// =========================================================
 	var findings []FindingReport
 	var skipped []SkippedProtocol
 	totalFlags := 0
 	scanned := 0
 
 	for _, proto := range protocols {
-		log.Printf("scanner[phase2]: resolving %q", proto.Name)
-
-		addr, err := ResolveProtocolAddress(runCtx, proto.Name)
-		if err != nil {
-			log.Printf("scanner[phase2]: SKIP %q: %v", proto.Name, err)
-			skipped = append(skipped, SkippedProtocol{Name: proto.Name, Slug: proto.Slug, Reason: err.Error()})
-			continue
-		}
-		proto.Address = addr
-
-		pricingAddrs, err := ScanPricingContracts(runCtx, client, proto)
-		if err != nil {
-			log.Printf("scanner[phase2]: SKIP %q: %v", proto.Name, err)
-			skipped = append(skipped, SkippedProtocol{Name: proto.Name, Slug: proto.Slug, Reason: err.Error()})
+		addrs := BaseProtocolRegistry[proto.Slug]
+		if len(addrs) == 0 {
+			log.Printf("scanner[phase2]: SKIP %q: no hardcoded addresses", proto.Name)
+			skipped = append(skipped, SkippedProtocol{Name: proto.Name, Slug: proto.Slug, Reason: "no hardcoded addresses"})
 			continue
 		}
 
-		log.Printf("scanner[phase3]: %q -> %d pricing contract(s)", proto.Name, len(pricingAddrs))
-		scanned++
+		log.Printf("scanner[phase2]: %q -> %d entry contract(s)", proto.Name, len(addrs))
+		visited := make(map[common.Address]bool)
+		var protoFlags []FlagReport
 
-				var allFlags []FlagReport
-		for _, paddr := range pricingAddrs {
-			src, err := FetchVerifiedSource(runCtx, paddr)
-			if err != nil {
-				log.Printf("scanner[phase3]: %s source fetch failed: %v", paddr.Hex(), err)
-				continue
-			}
-
-			flags := RunRegexScan(src) // now returns []FlagReport
-			if len(flags) == 0 {
-				continue
-			}
-
-			log.Printf("scanner[phase4]: %q -> %d flag(s), asking LLM", proto.Name, len(flags))
-			for i := range flags {
-				raw, err := AskGeminiWithFallback(runCtx, flags[i].Snippet)
-				if err != nil {
-					log.Printf("scanner[phase4]: LLM failed for rule %s: %v", flags[i].RuleID, err)
-					flags[i].LLMVerdict = "ERROR"
-					continue
-				}
-				flags[i].LLMVerdict = raw
-				totalFlags++
-
-				// Check the structured response for VULNERABLE.
-				if ParseVerdict(raw) == "VULNERABLE" {
-					allFlags = append(allFlags, flags[i])
-				}
-			}
+		for _, addr := range addrs {
+			scanContract(runCtx, client, proto, addr, "entry", 0, visited, &protoFlags, &totalFlags)
 		}
 
-		if len(allFlags) > 0 {
+		if len(protoFlags) > 0 {
+			scanned++
 			findings = append(findings, FindingReport{
 				Protocol: proto.Name,
 				Slug:     proto.Slug,
 				Category: proto.Category,
 				TVLUSD:   proto.TVLUSD,
-				Address:  proto.Address.Hex(),
-				Chain:    "base",
-				Flags:    allFlags,
-				Summary:  fmt.Sprintf("%d LLM-confirmed vulnerabilities", len(allFlags)),
+				Flags:    protoFlags,
 			})
 		}
 	}
 
-	log.Printf("scanner: scanned=%d skipped=%d findings=%d",
-		scanned, len(skipped), len(findings))
-
-	// =========================================================
-	// Build + write report
-	// =========================================================
 	meta := RunMetadata{
-		ChainID:          chainID.Int64(),
+		ChainID:          requiredChainID,
 		BlockNumber:      blockNum,
 		CategoryKeyword:  *category,
 		ProtocolsFound:   len(protocols),
@@ -246,9 +161,76 @@ func run() int {
 	return WriteReport(*outPath, *format, rep)
 }
 
-// =============================================================
-// Dial helper
-// =============================================================
+// scanContract recursively resolves proxies, fetches source,
+// extracts dependencies, and runs regex + LLM.
+func scanContract(
+	ctx context.Context,
+	client *ethclient.Client,
+	proto Protocol,
+	addr common.Address,
+	role string,
+	depth int,
+	visited map[common.Address]bool,
+	flags *[]FlagReport,
+	totalFlags *int,
+) {
+	if depth > 3 || visited[addr] {
+		return
+	}
+	visited[addr] = true
+
+	// 1. Resolve proxy implementation.
+	impl := ResolveImplementation(ctx, client, addr)
+	target := addr
+	if impl != (common.Address{}) {
+		log.Printf("scanner[proxy]: %s -> impl %s", addr.Hex(), impl.Hex())
+		target = impl
+		role = role + " (implementation)"
+	}
+
+	// 2. Fetch verified source.
+	src, contractName, err := FetchVerifiedSource(ctx, target)
+	if err != nil {
+		log.Printf("scanner[source]: %s: %v", target.Hex(), err)
+		return
+	}
+
+	// 3. Extract and recurse into dependencies (oracles, helpers).
+	deps := ExtractDependencies(src, target)
+	for _, dep := range deps {
+		depRole := "dependency"
+		lower := strings.ToLower(dep.Hex())
+		if strings.Contains(lower, "oracle") || strings.Contains(lower, "price") {
+			depRole = "oracle"
+		} else if strings.Contains(lower, "pool") {
+			depRole = "pool"
+		}
+		scanContract(ctx, client, proto, dep, depRole, depth+1, visited, flags, totalFlags)
+	}
+
+	// 4. Run regex on clean source.
+	rawFlags := RunRegexScan(src)
+	if len(rawFlags) == 0 {
+		return
+	}
+
+	// 5. LLM verification with context.
+	for i := range rawFlags {
+		verdict, err := AskGemini(ctx, rawFlags[i].Snippet, contractName, role)
+		if err != nil {
+			log.Printf("scanner[llm]: %s: %v", rawFlags[i].RuleID, err)
+			continue
+		}
+		rawFlags[i].LLMVerdict = verdict
+		rawFlags[i].ContractAddress = target.Hex()
+		rawFlags[i].ContractRole = role
+		*totalFlags++
+
+		if ParseVerdict(verdict) == "VULNERABLE" {
+			*flags = append(*flags, rawFlags[i])
+		}
+	}
+}
 
 func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
 	var lastErr error
