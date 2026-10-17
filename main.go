@@ -229,7 +229,7 @@ func scanContract(
 
 	// 5. LLM verification with context.
 	for i := range rawFlags {
-		verdict, err := AskGemini(ctx, rawFlags[i].Snippet, contractName, role)
+		verdict, err := AskLLM(ctx, rawFlags[i].Snippet, contractName, role)
 		if err != nil {
 			log.Printf("scanner[llm]: %s: %v", rawFlags[i].RuleID, err)
 			continue
