@@ -92,7 +92,7 @@ jobs:
       - name: Run scan
         env:
           BASE_FORK_URL:      ${{ secrets.BASE_FORK_URL }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           FORK_BLOCK:         ${{ steps.fork.outputs.block }}
           CATEGORY:           ${{ inputs.category }}
           FORMAT:             ${{ inputs.format }}
