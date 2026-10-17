@@ -224,7 +224,7 @@ func scanContract(
 		rawFlags[i].LLMVerdict = verdict
 		rawFlags[i].ContractAddress = target.Hex()
 		rawFlags[i].ContractRole = role
-		*totalFlags++
+		(*totalFlags)++
 
 		if ParseVerdict(verdict) == "VULNERABLE" {
 			*flags = append(*flags, rawFlags[i])
