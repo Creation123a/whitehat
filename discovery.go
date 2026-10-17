@@ -7,8 +7,6 @@ import (
 	"io"
 	"net/http"
 	"time"
-
-	"github.com/ethereum/go-ethereum/common"
 )
 
 // =============================================================
@@ -16,19 +14,17 @@ import (
 // =============================================================
 
 type AssetInfo struct {
-	Address  common.Address
+	Address  string
 	Symbol   string
 	Name     string
 	Decimals uint8
 }
 
 type Protocol struct {
-	Address  common.Address
 	Name     string
 	Slug     string
 	Category string
 	TVLUSD   float64
-	Chains   []string
 }
 
 // =============================================================
@@ -42,23 +38,15 @@ type defiLlamaProtocol struct {
 	Category  string             `json:"category"`
 	Chains    []string           `json:"chains"`
 	ChainTvls map[string]float64 `json:"chainTvls"`
-	URL       string             `json:"url"`
 }
 
 // =============================================================
 // Phase 1: DefiLlama discovery + filter
 // =============================================================
 
-// DiscoverProtocols fetches DefiLlama protocols and filters to:
-//   - one category keyword (per run)
-//   - chain == Base
-//   - Base chainTvls in [$50k, $10M]
-//
-// Returns protocols with names and Base TVL. Address resolution
-// happens in Phase 2.
 func DiscoverProtocols(ctx context.Context, category string) ([]Protocol, error) {
 	if !TargetCategories[category] {
-		return nil, fmt.Errorf("invalid category %q; valid: Lending, Isolated Lending, Yield, Yield Aggregator, CDP, Leveraged Farming", category)
+		return nil, fmt.Errorf("invalid category %q", category)
 	}
 
 	raw, err := httpGet(ctx, DefiLlamaProtocolsURL)
@@ -91,15 +79,10 @@ func DiscoverProtocols(ctx context.Context, category string) ([]Protocol, error)
 			Slug:     p.Slug,
 			Category: p.Category,
 			TVLUSD:   baseTVL,
-			Chains:   p.Chains,
 		})
 	}
 	return out, nil
 }
-
-// =============================================================
-// HTTP helpers
-// =============================================================
 
 func httpGet(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
