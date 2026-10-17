@@ -131,6 +131,9 @@ func FetchVerifiedSource(ctx context.Context, addr common.Address) (string, stri
 	if src == "" || strings.Contains(src, "not verified") {
 		return "", "", fmt.Errorf("etherscan: source not verified for %s", addr.Hex())
 	}
+	// Add this right before return UnwrapSource(src)...
+time.Sleep(350 * time.Millisecond) 
+
 	return UnwrapSource(src), results[0].ContractName, nil
 }
 
