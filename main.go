@@ -133,13 +133,26 @@ func run() int {
 		log.Printf("scanner[phase2]: %q -> %d entry contract(s)", proto.Name, len(addrs))
 		visited := make(map[common.Address]bool)
 		var protoFlags []FlagReport
+		scannedSuccessfully := false
 
 		for _, addr := range addrs {
-			scanContract(runCtx, client, proto, addr, "entry", 0, visited, &protoFlags, &totalFlags)
+			if scanContract(runCtx, client, proto, addr, "entry", 0, visited, &protoFlags, &totalFlags) {
+				scannedSuccessfully = true
+			}
 		}
 
+		if !scannedSuccessfully {
+			skipped = append(skipped, SkippedProtocol{
+				Name:   proto.Name,
+				Slug:   proto.Slug,
+				Reason: "no verifiable source code for any entry contract",
+			})
+			continue
+		}
+
+		// It was scanned successfully (even if 0 flags were found)
+		scanned++
 		if len(protoFlags) > 0 {
-			scanned++
 			findings = append(findings, FindingReport{
 				Protocol: proto.Name,
 				Slug:     proto.Slug,
@@ -162,8 +175,7 @@ func run() int {
 	return WriteReport(*outPath, *format, rep)
 }
 
-// scanContract recursively resolves proxies, fetches source,
-// extracts dependencies, and runs regex + LLM.
+// scanContract returns true if at least one contract source code was downloaded and scanned.
 func scanContract(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -174,9 +186,9 @@ func scanContract(
 	visited map[common.Address]bool,
 	flags *[]FlagReport,
 	totalFlags *int,
-) {
+) bool {
 	if depth > 3 || visited[addr] {
-		return
+		return false
 	}
 	visited[addr] = true
 
@@ -193,11 +205,11 @@ func scanContract(
 	src, contractName, err := FetchVerifiedSource(ctx, target)
 	if err != nil {
 		log.Printf("scanner[source]: %s: %v", target.Hex(), err)
-		return
+		return false // <-- Return false on fetch failure
 	}
 
 	// 3. Extract and recurse into dependencies (oracles, helpers).
-	deps := ExtractDependencies(src, target)
+	deps := ExtractDependencies(ctx, client, src, target)
 	for _, dep := range deps {
 		depRole := "dependency"
 		lower := strings.ToLower(dep.Hex())
@@ -212,7 +224,7 @@ func scanContract(
 	// 4. Run regex on clean source.
 	rawFlags := RunRegexScan(src)
 	if len(rawFlags) == 0 {
-		return
+		return true // <-- Return true (source downloaded successfully, just no matches)
 	}
 
 	// 5. LLM verification with context.
@@ -231,6 +243,8 @@ func scanContract(
 			*flags = append(*flags, rawFlags[i])
 		}
 	}
+	
+	return true // <-- Return true
 }
 
 func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
