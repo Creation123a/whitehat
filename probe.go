@@ -1,54 +1,122 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"regexp"
+	"os"
 	"strings"
 	"time"
-
-	"github.com/ethereum/go-ethereum/common"
 )
 
-// =============================================================
-// Phase 3: Fetch verified source + regex scan
-// =============================================================
-// NOTE: RegexFlag was removed. RunRegexScan now returns []FlagReport
-// (defined in report.go). This avoids a duplicate-type compile error
-// in main.go where allFlags is []FlagReport.
-// =============================================================
+const (
+	GeminiAPIBase      = "https://generativelanguage.googleapis.com/v1beta/models"
+	DefaultGeminiModel = "gemini-2.0-flash"
+)
 
-// etherscanResponse is the Etherscan V2 getsourcecode response.
-type etherscanResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message"`
-	Result  []struct {
-		SourceCode   string `json:"SourceCode"`
-		ABI          string `json:"ABI"`
-		ContractName string `json:"ContractName"`
-	} `json:"result"`
+type geminiRequest struct {
+	Contents          []geminiContent      `json:"contents"`
+	SystemInstruction *geminiContent       `json:"systemInstruction,omitempty"`
+	GenerationConfig  geminiGenerationConfig `json:"generationConfig"`
 }
 
-// FetchVerifiedSource calls Etherscan V2 getsourcecode for the
-// given address on Base.
-func FetchVerifiedSource(ctx context.Context, addr common.Address) (string, error) {
-	q := url.Values{}
-	q.Set("chainid", fmt.Sprintf("%d", EtherscanChainID))
-	q.Set("module", "contract")
-	q.Set("action", "getsourcecode")
-	q.Set("address", addr.Hex())
-	q.Set("apikey", EtherscanAPIKey)
+type geminiContent struct {
+	Parts []geminiPart `json:"parts"`
+	Role  string       `json:"role,omitempty"`
+}
 
-	full := EtherscanBaseURL + "?" + q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, full, nil)
+type geminiPart struct {
+	Text string `json:"text"`
+}
+
+type geminiGenerationConfig struct {
+	Temperature      float64 `json:"temperature"`
+	MaxOutputTokens  int     `json:"maxOutputTokens"`
+	ResponseMimeType string  `json:"responseMimeType,omitempty"`
+}
+
+type geminiResponse struct {
+	Candidates []struct {
+		Content struct {
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"content"`
+		FinishReason string `json:"finishReason"`
+	} `json:"candidates"`
+	Error *struct {
+		Message string `json:"message"`
+		Code    int    `json:"code"`
+	} `json:"error,omitempty"`
+}
+
+const systemPromptTemplate = `You are a smart contract security auditor.
+You are analyzing a specific contract within a protocol.
+Contract Role: %s
+Contract Name: %s
+
+Analyze the following Solidity snippet for economic vulnerabilities that can be exploited via flash loans, oracle manipulation, or mathematical precision errors.
+
+Respond in EXACTLY this format:
+VERDICT: <VULNERABLE|SAFE>
+TYPE: <vulnerability type>
+LOCATION: <line number or code fragment>
+REASON: <one sentence>`
+
+func geminiAPIKey() string {
+	for _, name := range []string{
+		"OPENROUTER_API_KEY",
+		"GEMINI_API_KEY",
+		"GOOGLE_API_KEY",
+	} {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// AskGemini sends a snippet with contract context to the LLM.
+func AskGemini(ctx context.Context, snippet, contractName, contractRole string) (string, error) {
+	apiKey := geminiAPIKey()
+	if apiKey == "" {
+		return "", fmt.Errorf("no Gemini API key found")
+	}
+
+	model := os.Getenv("GEMINI_MODEL")
+	if model == "" {
+		model = DefaultGeminiModel
+	}
+
+	sysPrompt := fmt.Sprintf(systemPromptTemplate, contractRole, contractName)
+
+	reqBody := geminiRequest{
+		SystemInstruction: &geminiContent{Parts: []geminiPart{{Text: sysPrompt}}},
+		Contents: []geminiContent{{
+			Role:  "user",
+			Parts: []geminiPart{{Text: fmt.Sprintf("Snippet:\n```solidity\n%s\n```", snippet)}},
+		}},
+		GenerationConfig: geminiGenerationConfig{
+			Temperature:      0,
+			MaxOutputTokens:  256,
+			ResponseMimeType: "text/plain",
+		},
+	}
+
+	body, _ := json.Marshal(reqBody)
+	fullURL := fmt.Sprintf("%s/%s:generateContent", GeminiAPIBase, model)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
-	c := &http.Client{Timeout: 30 * time.Second}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", apiKey)
+
+	c := &http.Client{Timeout: 60 * time.Second}
 	resp, err := c.Do(req)
 	if err != nil {
 		return "", err
@@ -56,125 +124,30 @@ func FetchVerifiedSource(ctx context.Context, addr common.Address) (string, erro
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 
-	var parsed etherscanResponse
+	var parsed geminiResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return "", fmt.Errorf("etherscan decode: %w", err)
+		return "", fmt.Errorf("gemini decode: %w", err)
 	}
-	if len(parsed.Result) == 0 {
-		return "", fmt.Errorf("etherscan: no result for %s", addr.Hex())
+	if parsed.Error != nil {
+		return "", fmt.Errorf("gemini error %d: %s", parsed.Error.Code, parsed.Error.Message)
 	}
-	src := parsed.Result[0].SourceCode
-	if src == "" || strings.Contains(src, "not verified") {
-		return "", fmt.Errorf("etherscan: source not verified for %s", addr.Hex())
+	if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
+		return "", fmt.Errorf("gemini: empty response")
 	}
-	return src, nil
+
+	return strings.TrimSpace(parsed.Candidates[0].Content.Parts[0].Text), nil
 }
 
-// =============================================================
-// Regex rules
-// =============================================================
-
-type regexRule struct {
-	ID       string
-	Category string
-	Severity string
-	Pattern  *regexp.Regexp
-}
-
-var regexRules = []regexRule{
-	// Category A — Spot AMM price reads
-	{ID: "A1", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`getReserves\s*\(`)},
-	{ID: "A2", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`slot0\s*\(\)`)},
-	{ID: "A3", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`sqrtPriceX96`)},
-	{ID: "A4", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`latestAnswer\s*\(`)},
-	{ID: "A5", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`get_virtual_price\s*\(`)},
-	{ID: "A6", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`get_dy\s*\(`)},
-	{ID: "A7", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`balanceOf\s*\(\s*address\s*\(\s*this\s*\)\s*\)`)},
-
-	// Category C — Precision / division-before-multiplication
-	{ID: "C1", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`[/]\s*\w+\s*\*`)},
-	{ID: "C2", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`\w+\s*/\s*\w+\s*\*\s*\w+`)},
-	{ID: "C3", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`div\s*\([^)]*\)\s*\.mul\s*\(`)},
-
-	// Category D — Stale oracle
-	{ID: "D1", Category: "stale-oracle", Severity: "medium", Pattern: regexp.MustCompile(`latestRoundData\s*\(`)},
-	{ID: "D2", Category: "stale-oracle", Severity: "medium", Pattern: regexp.MustCompile(`latestAnswer\s*\(`)},
-
-	// Category E — Oracle decimal mismatch
-	{ID: "E1", Category: "decimal-mismatch", Severity: "medium", Pattern: regexp.MustCompile(`/\s*1e8`)},
-	{ID: "E2", Category: "decimal-mismatch", Severity: "medium", Pattern: regexp.MustCompile(`uint256\(price\)\s*\*\s*1e10`)},
-
-	// Category F — Read-only reentrancy
-	{ID: "F1", Category: "reentrancy", Severity: "critical", Pattern: regexp.MustCompile(`get_virtual_price\s*\(`)},
-	{ID: "F2", Category: "reentrancy", Severity: "critical", Pattern: regexp.MustCompile(`getReserves\s*\(`)},
-
-	// Category I — LP token valuation
-	{ID: "I1", Category: "lp-valuation", Severity: "high", Pattern: regexp.MustCompile(`getReserves\s*\(\)[\s\S]{0,200}totalSupply\s*\(\)`)},
-}
-
-// RunRegexScan applies every rule to the source. Returns FlagReport
-// structs (defined in report.go) with snippets and suppressor
-// annotations. LLMVerdict is filled in later by main.go.
-func RunRegexScan(source string) []FlagReport {
-	var flags []FlagReport
-	lines := strings.Split(source, "\n")
-
-	for _, rule := range regexRules {
-		locs := rule.Pattern.FindAllStringIndex(source, -1)
-		for _, loc := range locs {
-			lineStart := strings.Count(source[:loc[0]], "\n")
-			lineEnd := strings.Count(source[:loc[1]], "\n")
-
-			ctxStart := lineStart - 10
-			if ctxStart < 0 {
-				ctxStart = 0
-			}
-			ctxEnd := lineEnd + 10
-			if ctxEnd >= len(lines) {
-				ctxEnd = len(lines) - 1
-			}
-			snippet := strings.Join(lines[ctxStart:ctxEnd+1], "\n")
-
-			flag := FlagReport{
-				RuleID:    rule.ID,
-				Category:  rule.Category,
-				Severity:  rule.Severity,
-				Snippet:   snippet,
-				LineStart: lineStart + 1,
-				LineEnd:   lineEnd + 1,
-			}
-			flag.Suppressors = checkSuppressors(rule.ID, snippet)
-			flags = append(flags, flag)
+func ParseVerdict(response string) string {
+	upper := strings.ToUpper(response)
+	if idx := strings.Index(upper, "VERDICT:"); idx >= 0 {
+		rest := strings.TrimSpace(upper[idx+len("VERDICT:"):])
+		if strings.HasPrefix(rest, "VULNERABLE") {
+			return "VULNERABLE"
+		}
+		if strings.HasPrefix(rest, "SAFE") {
+			return "SAFE"
 		}
 	}
-	return flags
-}
-
-// checkSuppressors returns suppression markers found in the snippet.
-func checkSuppressors(ruleID, snippet string) []string {
-	var out []string
-	lower := strings.ToLower(snippet)
-
-	twapGuard := regexp.MustCompile(`observe\s*\(|consult\s*\(|twap|timeweighted`)
-	reentrancyGuard := regexp.MustCompile(`nonreentrant`)
-	freshnessCheck := regexp.MustCompile(`updatedat|heartbeat|maxdelay|answeredinround`)
-	decimalsCheck := regexp.MustCompile(`decimals\s*\(|10\s*\*\*\s*decimals`)
-	accessRestrict := regexp.MustCompile(`onlyowner|onlyrole|internal\s+view`)
-
-	if twapGuard.MatchString(lower) {
-		out = append(out, "has_twap_guard")
-	}
-	if reentrancyGuard.MatchString(lower) {
-		out = append(out, "has_reentrancy_guard")
-	}
-	if freshnessCheck.MatchString(lower) {
-		out = append(out, "has_freshness_check")
-	}
-	if decimalsCheck.MatchString(lower) {
-		out = append(out, "has_decimals_check")
-	}
-	if accessRestrict.MatchString(lower) {
-		out = append(out, "restricted_access")
-	}
-	return out
+	return "UNKNOWN"
 }
