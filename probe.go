@@ -14,7 +14,7 @@ import (
 
 const (
 	GeminiAPIBase      = "https://generativelanguage.googleapis.com/v1beta/models"
-	DefaultGeminiModel = "gemini-2.0-flash"
+	DefaultGeminiModel = "gemini-3.8-flash"
 )
 
 type geminiRequest struct {
