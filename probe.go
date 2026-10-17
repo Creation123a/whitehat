@@ -14,7 +14,7 @@ import (
 
 const (
 	GeminiAPIBase      = "https://generativelanguage.googleapis.com/v1beta/models"
-	DefaultGeminiModel = "gemini-3.8-flash"
+	DefaultGeminiModel = "gemini-3.8-flash" // Or whatever model you are using
 )
 
 type geminiRequest struct {
@@ -79,7 +79,6 @@ func geminiAPIKey() string {
 	return ""
 }
 
-// AskGemini sends a snippet with contract context to the LLM.
 func AskGemini(ctx context.Context, snippet, contractName, contractRole string) (string, error) {
 	apiKey := geminiAPIKey()
 	if apiKey == "" {
@@ -101,7 +100,7 @@ func AskGemini(ctx context.Context, snippet, contractName, contractRole string) 
 		}},
 		GenerationConfig: geminiGenerationConfig{
 			Temperature:      0,
-			MaxOutputTokens:  256,
+			MaxOutputTokens:  512, // FIXED: Increased from 256 to prevent truncation
 			ResponseMimeType: "text/plain",
 		},
 	}
