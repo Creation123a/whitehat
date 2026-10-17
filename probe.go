@@ -13,43 +13,29 @@ import (
 )
 
 const (
-	GeminiAPIBase      = "https://generativelanguage.googleapis.com/v1beta/models"
-	DefaultGeminiModel = "gemini-3.8-flash" // Or whatever model you are using
+	GroqAPIBase      = "https://api.groq.com/openai/v1/chat/completions"
+	DefaultGroqModel = "llama-3.3-70b-versatile"
 )
 
-type geminiRequest struct {
-	Contents          []geminiContent      `json:"contents"`
-	SystemInstruction *geminiContent       `json:"systemInstruction,omitempty"`
-	GenerationConfig  geminiGenerationConfig `json:"generationConfig"`
+type groqRequest struct {
+	Model       string        `json:"model"`
+	Messages    []groqMessage `json:"messages"`
+	Temperature float64       `json:"temperature"`
 }
 
-type geminiContent struct {
-	Parts []geminiPart `json:"parts"`
-	Role  string       `json:"role,omitempty"`
+type groqMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
-type geminiPart struct {
-	Text string `json:"text"`
-}
-
-type geminiGenerationConfig struct {
-	Temperature      float64 `json:"temperature"`
-	MaxOutputTokens  int     `json:"maxOutputTokens"`
-	ResponseMimeType string  `json:"responseMimeType,omitempty"`
-}
-
-type geminiResponse struct {
-	Candidates []struct {
-		Content struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		} `json:"content"`
-		FinishReason string `json:"finishReason"`
-	} `json:"candidates"`
+type groqResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
-		Code    int    `json:"code"`
 	} `json:"error,omitempty"`
 }
 
@@ -66,11 +52,10 @@ TYPE: <vulnerability type>
 LOCATION: <line number or code fragment>
 REASON: <one sentence>`
 
-func geminiAPIKey() string {
+func groqAPIKey() string {
 	for _, name := range []string{
-		"OPENROUTER_API_KEY",
-		"GEMINI_API_KEY",
-		"GOOGLE_API_KEY",
+		"GROQ_API_KEY",
+		"OPENROUTER_API_KEY", // Fallback just in case
 	} {
 		if v := os.Getenv(name); v != "" {
 			return v
@@ -79,41 +64,37 @@ func geminiAPIKey() string {
 	return ""
 }
 
-func AskGemini(ctx context.Context, snippet, contractName, contractRole string) (string, error) {
-	apiKey := geminiAPIKey()
+// AskLLM sends a snippet with contract context to Groq.
+func AskLLM(ctx context.Context, snippet, contractName, contractRole string) (string, error) {
+	apiKey := groqAPIKey()
 	if apiKey == "" {
-		return "", fmt.Errorf("no Gemini API key found")
+		return "", fmt.Errorf("no Groq API key found in env (GROQ_API_KEY)")
 	}
 
-	model := os.Getenv("GEMINI_MODEL")
+	model := os.Getenv("GROQ_MODEL")
 	if model == "" {
-		model = DefaultGeminiModel
+		model = DefaultGroqModel
 	}
 
 	sysPrompt := fmt.Sprintf(systemPromptTemplate, contractRole, contractName)
 
-	reqBody := geminiRequest{
-		SystemInstruction: &geminiContent{Parts: []geminiPart{{Text: sysPrompt}}},
-		Contents: []geminiContent{{
-			Role:  "user",
-			Parts: []geminiPart{{Text: fmt.Sprintf("Snippet:\n```solidity\n%s\n```", snippet)}},
-		}},
-		GenerationConfig: geminiGenerationConfig{
-			Temperature:      0,
-			MaxOutputTokens:  512, // FIXED: Increased from 256 to prevent truncation
-			ResponseMimeType: "text/plain",
+	reqBody := groqRequest{
+		Model: model,
+		Messages: []groqMessage{
+			{Role: "system", Content: sysPrompt},
+			{Role: "user", Content: fmt.Sprintf("Snippet:\n```solidity\n%s\n```", snippet)},
 		},
+		Temperature: 0,
 	}
 
 	body, _ := json.Marshal(reqBody)
-	fullURL := fmt.Sprintf("%s/%s:generateContent", GeminiAPIBase, model)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GroqAPIBase, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 
 	c := &http.Client{Timeout: 60 * time.Second}
 	resp, err := c.Do(req)
@@ -123,18 +104,18 @@ func AskGemini(ctx context.Context, snippet, contractName, contractRole string) 
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 
-	var parsed geminiResponse
+	var parsed groqResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return "", fmt.Errorf("gemini decode: %w", err)
+		return "", fmt.Errorf("groq decode: %w", err)
 	}
 	if parsed.Error != nil {
-		return "", fmt.Errorf("gemini error %d: %s", parsed.Error.Code, parsed.Error.Message)
+		return "", fmt.Errorf("groq error: %s", parsed.Error.Message)
 	}
-	if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
-		return "", fmt.Errorf("gemini: empty response")
+	if len(parsed.Choices) == 0 {
+		return "", fmt.Errorf("groq: empty response")
 	}
 
-	return strings.TrimSpace(parsed.Candidates[0].Content.Parts[0].Text), nil
+	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
 }
 
 func ParseVerdict(response string) string {
