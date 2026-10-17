@@ -20,26 +20,23 @@ import (
 // =============================================================
 
 type etherscanSourceResult struct {
-	SourceCode   string `json:"SourceCode"`
-	ABI          string `json:"ABI"`
-	ContractName string `json:"ContractName"`
-	Proxy        string `json:"Proxy"`
+	SourceCode     string `json:"SourceCode"`
+	ABI            string `json:"ABI"`
+	ContractName   string `json:"ContractName"`
+	Proxy          string `json:"Proxy"`
 	Implementation string `json:"Implementation"`
 }
 
 type etherscanResponse struct {
-	Status  string                 `json:"status"`
-	Message string                 `json:"message"`
-	Result  []etherscanSourceResult `json:"result"`
+	Status  string          `json:"status"`
+	Message string          `json:"message"`
+	Result  json.RawMessage `json:"result"`
 }
 
 // =============================================================
 // Proxy & Source Resolution
 // =============================================================
 
-// ResolveImplementation reads the EIP-1967 slot to find the
-// implementation address of a proxy. Returns the zero address if
-// the address is not a proxy.
 func ResolveImplementation(ctx context.Context, client *ethclient.Client, addr common.Address) common.Address {
 	slot := common.HexToHash(EIP1967ImplementationSlot)
 	raw, err := client.StorageAt(ctx, addr, slot, nil)
@@ -47,7 +44,6 @@ func ResolveImplementation(ctx context.Context, client *ethclient.Client, addr c
 		return common.Address{}
 	}
 	impl := common.BytesToAddress(raw)
-	// Return the implementation only if it has bytecode.
 	if impl != (common.Address{}) {
 		code, err := client.CodeAt(ctx, impl, nil)
 		if err == nil && len(code) > 0 {
@@ -57,31 +53,21 @@ func ResolveImplementation(ctx context.Context, client *ethclient.Client, addr c
 	return common.Address{}
 }
 
-// UnwrapSource parses Etherscan's multi-file JSON envelope into
-// plain Solidity source. Handles single-file, {{...}}, and
-// standard JSON input formats.
 func UnwrapSource(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return raw
 	}
-
-	// Standard JSON input format starts with {"language": ...}
 	if strings.HasPrefix(raw, "{") && !strings.HasPrefix(raw, "{{") {
 		return extractSourcesFromJSON(raw)
 	}
-
-	// Multi-file format wraps JSON in {{...}}
 	if strings.HasPrefix(raw, "{{") && strings.HasSuffix(raw, "}}") {
 		inner := raw[1 : len(raw)-1]
 		return extractSourcesFromJSON(inner)
 	}
-
 	return raw
 }
 
-// extractSourcesFromJSON parses a JSON object with a "sources" key
-// and concatenates all file contents.
 func extractSourcesFromJSON(jsonStr string) string {
 	var parsed struct {
 		Sources map[string]struct {
@@ -99,8 +85,6 @@ func extractSourcesFromJSON(jsonStr string) string {
 	return sb.String()
 }
 
-// FetchVerifiedSource calls Etherscan V2 getsourcecode and returns
-// the unwrapped Solidity source and the contract name.
 func FetchVerifiedSource(ctx context.Context, addr common.Address) (string, string, error) {
 	q := url.Values{}
 	q.Set("chainid", fmt.Sprintf("%d", EtherscanChainID))
@@ -126,14 +110,25 @@ func FetchVerifiedSource(ctx context.Context, addr common.Address) (string, stri
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return "", "", fmt.Errorf("etherscan decode: %w", err)
 	}
-	if len(parsed.Result) == 0 {
+
+	// Etherscan returns Status "0" and a string in Result when it fails.
+	if parsed.Status == "0" {
+		return "", "", fmt.Errorf("etherscan: %s", string(parsed.Result))
+	}
+
+	var results []etherscanSourceResult
+	if err := json.Unmarshal(parsed.Result, &results); err != nil {
+		return "", "", fmt.Errorf("etherscan result decode: %w", err)
+	}
+	if len(results) == 0 {
 		return "", "", fmt.Errorf("etherscan: no result for %s", addr.Hex())
 	}
-	src := parsed.Result[0].SourceCode
+	
+	src := results[0].SourceCode
 	if src == "" || strings.Contains(src, "not verified") {
 		return "", "", fmt.Errorf("etherscan: source not verified for %s", addr.Hex())
 	}
-	return UnwrapSource(src), parsed.Result[0].ContractName, nil
+	return UnwrapSource(src), results[0].ContractName, nil
 }
 
 // =============================================================
@@ -142,9 +137,10 @@ func FetchVerifiedSource(ctx context.Context, addr common.Address) (string, stri
 
 var addressRegex = regexp.MustCompile(`0x[a-fA-F0-9]{40}`)
 
-// ExtractDependencies scans source code for all 0x addresses
-// (excluding the contract's own address and zero address).
-func ExtractDependencies(source string, self common.Address) []common.Address {
+// ExtractDependencies scans source code for addresses and checks
+// if they have bytecode on the fork to filter out fake addresses,
+// masks, and hex constants.
+func ExtractDependencies(ctx context.Context, client *ethclient.Client, source string, self common.Address) []common.Address {
 	matches := addressRegex.FindAllString(source, -1)
 	seen := make(map[common.Address]bool)
 	var out []common.Address
@@ -153,6 +149,23 @@ func ExtractDependencies(source string, self common.Address) []common.Address {
 		if a == (common.Address{}) || a == self {
 			continue
 		}
+		
+		lower := strings.ToLower(m)
+		// Skip obvious masks and placeholders
+		if strings.HasPrefix(lower, "0x000") || strings.HasPrefix(lower, "0xfff") || 
+		   strings.HasPrefix(lower, "0xaaa") || strings.HasPrefix(lower, "0x777") {
+			continue
+		}
+		if lower == "0x360894a13ba1a3210667c828492db98dca3e2076" { // Sliced EIP1967 slot
+			continue
+		}
+
+		// Check if it actually has code on-chain
+		code, err := client.CodeAt(ctx, a, nil)
+		if err != nil || len(code) == 0 {
+			continue
+		}
+
 		if !seen[a] {
 			seen[a] = true
 			out = append(out, a)
@@ -180,15 +193,21 @@ var regexRules = []regexRule{
 	{ID: "A5", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`get_virtual_price\s*\(`)},
 	{ID: "A6", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`get_dy\s*\(`)},
 	{ID: "A7", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`balanceOf\s*\(\s*address\s*\(\s*this\s*\)\s*\)`)},
-	{ID: "C1", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`[/]\s*\w+\s*\*`)},
+	
+	// Fixed C1 to ignore ** (exponentiation)
+	{ID: "C1", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`[/]\s*[\w()]+\s*\*\s*[^*/]`)},
 	{ID: "C2", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`\w+\s*/\s*\w+\s*\*\s*\w+`)},
 	{ID: "C3", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`div\s*\([^)]*\)\s*\.mul\s*\(`)},
+	
 	{ID: "D1", Category: "stale-oracle", Severity: "medium", Pattern: regexp.MustCompile(`latestRoundData\s*\(`)},
 	{ID: "D2", Category: "stale-oracle", Severity: "medium", Pattern: regexp.MustCompile(`latestAnswer\s*\(`)},
+	
 	{ID: "E1", Category: "decimal-mismatch", Severity: "medium", Pattern: regexp.MustCompile(`/\s*1e8`)},
 	{ID: "E2", Category: "decimal-mismatch", Severity: "medium", Pattern: regexp.MustCompile(`uint256\(price\)\s*\*\s*1e10`)},
+	
 	{ID: "F1", Category: "reentrancy", Severity: "critical", Pattern: regexp.MustCompile(`get_virtual_price\s*\(`)},
 	{ID: "F2", Category: "reentrancy", Severity: "critical", Pattern: regexp.MustCompile(`getReserves\s*\(`)},
+	
 	{ID: "I1", Category: "lp-valuation", Severity: "high", Pattern: regexp.MustCompile(`getReserves\s*\(\)[\s\S]{0,200}totalSupply\s*\(\)`)},
 }
 
