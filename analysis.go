@@ -15,10 +15,6 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-// =============================================================
-// Etherscan Response Types
-// =============================================================
-
 type etherscanSourceResult struct {
 	SourceCode     string `json:"SourceCode"`
 	ABI            string `json:"ABI"`
@@ -32,10 +28,6 @@ type etherscanResponse struct {
 	Message string          `json:"message"`
 	Result  json.RawMessage `json:"result"`
 }
-
-// =============================================================
-// Proxy & Source Resolution
-// =============================================================
 
 func ResolveImplementation(ctx context.Context, client *ethclient.Client, addr common.Address) common.Address {
 	slot := common.HexToHash(EIP1967ImplementationSlot)
@@ -85,9 +77,6 @@ func extractSourcesFromJSON(jsonStr string) string {
 	return sb.String()
 }
 
-// FetchVerifiedSource calls Etherscan V2 getsourcecode for the
-// given address on Base. It handles both the success case (an
-// array) and the error case (a string) in the `result` field.
 func FetchVerifiedSource(ctx context.Context, addr common.Address) (string, string, error) {
 	q := url.Values{}
 	q.Set("chainid", fmt.Sprintf("%d", EtherscanChainID))
@@ -114,9 +103,10 @@ func FetchVerifiedSource(ctx context.Context, addr common.Address) (string, stri
 		return "", "", fmt.Errorf("etherscan decode: %w", err)
 	}
 
-	// Etherscan returns Status "0" and a string in Result when it fails.
 	if parsed.Status == "0" {
-		return "", "", fmt.Errorf("etherscan: %s", string(parsed.Result))
+		var errMsg string
+		_ = json.Unmarshal(parsed.Result, &errMsg)
+		return "", "", fmt.Errorf("etherscan API error: %s", errMsg)
 	}
 
 	var results []etherscanSourceResult
@@ -131,21 +121,15 @@ func FetchVerifiedSource(ctx context.Context, addr common.Address) (string, stri
 	if src == "" || strings.Contains(src, "not verified") {
 		return "", "", fmt.Errorf("etherscan: source not verified for %s", addr.Hex())
 	}
-	// Add this right before return UnwrapSource(src)...
-time.Sleep(350 * time.Millisecond) 
+	
+	// SLEEP TO AVOID 3/sec RATE LIMIT
+	time.Sleep(400 * time.Millisecond)
 
 	return UnwrapSource(src), results[0].ContractName, nil
 }
 
-// =============================================================
-// Dependency Extraction
-// =============================================================
-
 var addressRegex = regexp.MustCompile(`0x[a-fA-F0-9]{40}`)
 
-// ExtractDependencies scans source code for addresses and checks
-// if they have bytecode on the fork to filter out fake addresses,
-// masks, and hex constants.
 func ExtractDependencies(ctx context.Context, client *ethclient.Client, source string, self common.Address) []common.Address {
 	matches := addressRegex.FindAllString(source, -1)
 	seen := make(map[common.Address]bool)
@@ -157,16 +141,14 @@ func ExtractDependencies(ctx context.Context, client *ethclient.Client, source s
 		}
 		
 		lower := strings.ToLower(m)
-		// Skip obvious masks and placeholders
 		if strings.HasPrefix(lower, "0x000") || strings.HasPrefix(lower, "0xfff") || 
 		   strings.HasPrefix(lower, "0xaaa") || strings.HasPrefix(lower, "0x777") {
 			continue
 		}
-		if lower == "0x360894a13ba1a3210667c828492db98dca3e2076" { // Sliced EIP1967 slot
+		if lower == "0x360894a13ba1a3210667c828492db98dca3e2076" {
 			continue
 		}
 
-		// Check if it actually has code on-chain
 		code, err := client.CodeAt(ctx, a, nil)
 		if err != nil || len(code) == 0 {
 			continue
@@ -179,10 +161,6 @@ func ExtractDependencies(ctx context.Context, client *ethclient.Client, source s
 	}
 	return out
 }
-
-// =============================================================
-// Regex Rules & Scanning
-// =============================================================
 
 type regexRule struct {
 	ID       string
@@ -200,7 +178,7 @@ var regexRules = []regexRule{
 	{ID: "A6", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`get_dy\s*\(`)},
 	{ID: "A7", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`balanceOf\s*\(\s*address\s*\(\s*this\s*\)\s*\)`)},
 	
-	// Fixed C1 to ignore ** (exponentiation)
+	// Fixed C1 to ignore ** (exponentiation) and common library math
 	{ID: "C1", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`[/]\s*[\w()]+\s*\*\s*[^*/]`)},
 	{ID: "C2", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`\w+\s*/\s*\w+\s*\*\s*\w+`)},
 	{ID: "C3", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`div\s*\([^)]*\)\s*\.mul\s*\(`)},
@@ -246,6 +224,19 @@ func RunRegexScan(source string) []FlagReport {
 				LineEnd:   lineEnd + 1,
 			}
 			flag.Suppressors = checkSuppressors(rule.ID, snippet)
+			
+			// Do not send known safe libraries to the LLM
+			isSafeLib := false
+			for _, s := range flag.Suppressors {
+				if s == "known_safe_library" {
+					isSafeLib = true
+					break
+				}
+			}
+			if isSafeLib {
+				continue
+			}
+
 			flags = append(flags, flag)
 		}
 	}
@@ -255,6 +246,19 @@ func RunRegexScan(source string) []FlagReport {
 func checkSuppressors(ruleID, snippet string) []string {
 	var out []string
 	lower := strings.ToLower(snippet)
+
+	// Filter out standard audited libraries to stop false positives
+	knownLibs := []string{
+		"credit to remco bloemen", "original credit to remco bloemen",
+		"solady", "openzeppelin", "aave", 
+		"the whitepaper contains reference", "expwad", "logwad", "muldiv", "sqr",
+	}
+	for _, lib := range knownLibs {
+		if strings.Contains(lower, lib) {
+			out = append(out, "known_safe_library")
+			return out
+		}
+	}
 
 	if regexp.MustCompile(`observe\s*\(|consult\s*\(|twap|timeweighted`).MatchString(lower) {
 		out = append(out, "has_twap_guard")
