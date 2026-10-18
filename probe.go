@@ -7,115 +7,102 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 )
 
 const (
-	GroqAPIBase      = "https://api.groq.com/openai/v1/chat/completions"
-	DefaultGroqModel = "openai/gpt-oss-120b"
+	OllamaAPIBase = "http://localhost:11434/api/chat"
+	OllamaModel   = "qwen2.5-coder:0.5b-instruct-q4_K_M"
 )
 
-type groqRequest struct {
-	Model       string        `json:"model"`
-	Messages    []groqMessage `json:"messages"`
-	Temperature float64       `json:"temperature"`
+type ollamaRequest struct {
+	Model    string          `json:"model"`
+	Messages []ollamaMessage `json:"messages"`
+	Stream   bool            `json:"stream"`
+	Options  ollamaOptions   `json:"options"`
 }
 
-type groqMessage struct {
+type ollamaMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-type groqResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
+type ollamaOptions struct {
+	Temperature float64 `json:"temperature"`
+}
+
+type ollamaResponse struct {
+	Message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	} `json:"message"`
+	Done bool `json:"done"`
 }
 
 const systemPromptTemplate = `You are a smart contract security auditor.
-You are analyzing a specific contract within a protocol.
 Contract Role: %s
 Contract Name: %s
 
-Analyze the following Solidity snippet for economic vulnerabilities that can be exploited via flash loans, oracle manipulation, or mathematical precision errors.
+CRITICAL INSTRUCTION: Only mark VULNERABLE if the code shows a genuine exploitable flaw. 
+Standard library code (Solady FixedPointMathLib, OpenZeppelin Math, Aave MathUtils, Morpho UtilsLib) is battle-tested and MUST be marked SAFE even if you see division or multiplication patterns. Known safe patterns include:
+- mulDiv with assembly (Chinese Remainder Theorem) — SAFE
+- ceilDiv/floorDiv — SAFE  
+- expWad/logWad — SAFE
+- Compounded interest binomial approximation — SAFE
 
-Respond in EXACTLY this format:
-VERDICT: <VULNERABLE|SAFE>
-TYPE: <vulnerability type>
-LOCATION: <line number or code fragment>
-REASON: <one sentence>`
+Only flag as VULNERABLE if the exploit path is:
+1. Direct spot AMM read (getReserves, slot0, get_virtual_price) without TWAP
+2. Oracle returns manipulable price fed directly into liquidation/borrow math
+3. LP valuation without geometric mean (sqrt)
+4. Balance-of-self accounting without virtual shares
+5. Missing math bounds in admin setters
 
-func groqAPIKey() string {
-	for _, name := range []string{
-		"GROQ_API_KEY",
-		"OPENROUTER_API_KEY", // Fallback just in case
-	} {
-		if v := os.Getenv(name); v != "" {
-			return v
-		}
-	}
-	return ""
-}
+If the code is a standard math utility, respond with:
+VERDICT: SAFE
+TYPE: none
+LOCATION: none
+REASON: standard audited math library
 
-// AskLLM sends a snippet with contract context to Groq.
-func AskLLM(ctx context.Context, snippet, contractName, contractRole string) (string, error) {
-	apiKey := groqAPIKey()
-	if apiKey == "" {
-		return "", fmt.Errorf("no Groq API key found in env (GROQ_API_KEY)")
-	}
+Analyze: `
 
-	model := os.Getenv("GROQ_MODEL")
-	if model == "" {
-		model = DefaultGroqModel
-	}
-
+// AskLocalLLM sends a snippet to the local Ollama instance.
+func AskLocalLLM(ctx context.Context, snippet, contractName, contractRole string) (string, error) {
 	sysPrompt := fmt.Sprintf(systemPromptTemplate, contractRole, contractName)
 
-	reqBody := groqRequest{
-		Model: model,
-		Messages: []groqMessage{
+	reqBody := ollamaRequest{
+		Model: OllamaModel,
+		Messages: []ollamaMessage{
 			{Role: "system", Content: sysPrompt},
 			{Role: "user", Content: fmt.Sprintf("Snippet:\n```solidity\n%s\n```", snippet)},
 		},
-		Temperature: 0,
+		Stream: false,
+		Options: ollamaOptions{
+			Temperature: 0,
+		},
 	}
 
 	body, _ := json.Marshal(reqBody)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GroqAPIBase, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, OllamaAPIBase, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	c := &http.Client{Timeout: 60 * time.Second}
+	c := &http.Client{Timeout: 120 * time.Second} // Local generation can take a moment
 	resp, err := c.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("ollama connection failed (is it running?): %w", err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 
-	var parsed groqResponse
+	var parsed ollamaResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return "", fmt.Errorf("groq decode: %w", err)
-	}
-	if parsed.Error != nil {
-		return "", fmt.Errorf("groq error: %s", parsed.Error.Message)
-	}
-	if len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("groq: empty response")
+		return "", fmt.Errorf("ollama decode: %w", err)
 	}
 
-	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
+	return strings.TrimSpace(parsed.Message.Content), nil
 }
 
 func ParseVerdict(response string) string {
