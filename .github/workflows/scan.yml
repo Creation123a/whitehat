@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       category:
-        description: 'DefiLlama category keyword (one per run)'
+        description: 'DefiLlama category keyword'
         required: true
         default: 'Lending'
         type: choice
@@ -33,9 +33,9 @@ on:
           - json
           - text
       timeout:
-        description: 'Pipeline timeout (e.g. 20m, 30m, 1h) — regex + LLM stage may need 30m+'
+        description: 'Pipeline timeout (e.g. 30m, 1h)'
         required: true
-        default: '30m'
+        default: '45m'
 
 jobs:
   scan:
@@ -49,8 +49,47 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.24'
           cache: true
+
+      - name: Setup Python Environment (For Slither)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Slither
+        run: |
+          pip install slither-analyzer
+
+      - name: Cache Cargo Dependencies (For Aderyn)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Aderyn
+        run: |
+          if ! command -v aderyn &> /dev/null; then
+            cargo install aderyn
+          fi
+
+      - name: Cache Ollama Models
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama
+          key: ${{ runner.os }}-ollama-qwen-0.5b
+
+      - name: Install and Run Ultra-Lightweight Local LLM
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          sleep 5
+          ollama pull qwen2.5-coder:0.5b-instruct-q4_K_M
 
       - name: Install Foundry (Anvil)
         uses: foundry-rs/foundry-toolchain@v1
@@ -63,14 +102,10 @@ jobs:
       - name: Build scanner
         run: go build -o scanner .
 
-      - name: Show go.sum for manual sync
-        if: always()
-        run: cat go.sum || true
-
       - name: Mask secrets
         run: |
           echo "::add-mask::${{ secrets.BASE_FORK_URL }}"
-          echo "::add-mask::${{ secrets.OPENROUTER_API_KEY }}"
+          echo "::add-mask::${{ secrets.ETHERSCAN_API_KEY }}"
 
       - name: Resolve fork block
         id: fork
@@ -92,7 +127,7 @@ jobs:
       - name: Run scan
         env:
           BASE_FORK_URL:      ${{ secrets.BASE_FORK_URL }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ETHERSCAN_API_KEY:  ${{ secrets.ETHERSCAN_API_KEY }}
           FORK_BLOCK:         ${{ steps.fork.outputs.block }}
           CATEGORY:           ${{ inputs.category }}
           FORMAT:             ${{ inputs.format }}
