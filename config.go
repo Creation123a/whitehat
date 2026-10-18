@@ -7,10 +7,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// =============================================================
-// External APIs
-// =============================================================
-
 const (
 	DefiLlamaProtocolsURL = "https://api.llama.fi/protocols"
 	DefiLlamaBaseChain    = "Base"
@@ -18,35 +14,24 @@ const (
 	EtherscanBaseURL = "https://api.etherscan.io/v2/api"
 	EtherscanChainID = 8453
 
-	// EIP-1967 implementation storage slot.
 	EIP1967ImplementationSlot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
 )
-
-// =============================================================
-// API Keys
-// =============================================================
 
 var (
 	EtherscanAPIKey = "ETN9EBPSA2P7QMWF1GM9MEITN14HVXIYUE"
 )
 
-// =============================================================
-// Hardcoded Address Registry
-// =============================================================
-
 var BaseProtocolRegistry = map[string][]common.Address{
 	// Lending
 	"native-credit-pool": {
-		common.HexToAddress("0x9706D3fff42571305Fc201F996ADC0e768d72911"),
-		common.HexToAddress("0x72574feeFB0197271f63E263CC158D8941f12454"),
-		common.HexToAddress("0xe745b0565CECB4612A41EaE78319Bf3Ca8063e6f"),
+		common.HexToAddress("0x74a4Cd023e5AfB88369E3f22b02440F2614a1367"),
 	},
 	"exactly": {
 		common.HexToAddress("0x0Aeb0BCB919858C0a4dceC3EeD879985034A597c"),
 		common.HexToAddress("0x85c21fA8AeE39891E115E2b28c3dB2dE5B0AaF4f"),
 	},
 	"morpho-midnight": {
-		common.HexToAddress("0x471686c42792F93528B000beF54bC10E3aa2045f"),
+		common.HexToAddress("0xAdedD8ab6dE832766Fedf0FaC4992E5C4D3EA18A"),
 	},
 	"revert-lend": {
 		common.HexToAddress("0x36AEAe0E411a1E28372e0d66f02E57744EbE7599"),
@@ -82,7 +67,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x5D64926bEF21BD772e7d6F89AED16d8c1A93dD66"),
 	},
 	"ripe-protocol": {
-		common.HexToAddress("0x9215CF3316c162cFaF78b6669D9eEbEA4FBcAb4d"),
+		common.HexToAddress("0x6162df1b329E157479F8f1407E888260E0EC3d2b"),
 	},
 	"astaria-v2": {
 		common.HexToAddress("0x0000000000A6F0986c92cf1EC4d2e77aFBE1466D"),
@@ -194,6 +179,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 	},
 	"autopilot": {
 		common.HexToAddress("0x31A421271414641cb5063B71594b642D2666dB6B"),
+		common.HexToAddress("0xEd5d22F133bB20deE41629b84348F60925E8bDE0"),
 	},
 	"maxapy": {
 		common.HexToAddress("0x7a63e8FC1d0A5E9BE52f05817E8C49D9e2d6efAe"),
@@ -218,7 +204,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x252d36f435582ecb01686448d21e8c9ea0b2ca65"),
 	},
 	"vaultedge": {
-		common.HexToAddress("0x7E1252E762c8b72E0553b0291a5814eFb21B628F"),
+		common.HexToAddress("0x89AbeeE01B8c544cc7516B1e44102a063D79cd4D"),
 	},
 
 	// Basis Trading
@@ -269,14 +255,11 @@ var BaseProtocolRegistry = map[string][]common.Address{
 
 	// Liquid Staking
 	"ether.fi-stake": {
-		common.HexToAddress("0x04C0599Ae5A44757c0af6F9eC3b93da8976c150A"),
+		common.HexToAddress("0x1a44076050125825900e736c501f859c50fE728c"),
 	},
 	"origin-ether": {
 		common.HexToAddress("0xD8724322f44E5c58D7A815F542036fb17DbbF839"),
 		common.HexToAddress("0xDBFeFD2e8460a6Ee4955A68582F85708BAEA60A3"),
-	},
-	"glif": {
-		common.HexToAddress("0x83f7A48e206dF38C62Beb1A770Bb85a035a33840"),
 	},
 	"iaero-protocol": {
 		common.HexToAddress("0x81034Fb34009115F215f5d5F564AAc9FfA46a1Dc"),
@@ -291,7 +274,8 @@ var BaseProtocolRegistry = map[string][]common.Address{
 
 	// RWA
 	"re": {
-		common.HexToAddress("0x5086Bf358635b81D8c47C66d1c8b9e567dB70c72"),
+		common.HexToAddress("0x7D214438D0F27AfCcC23B3d1e1a53906aCE5CFEa"),
+		common.HexToAddress("0xaDC4794909605570D4C43040EB2bd5c0871feDDA"),
 	},
 	"anemoy-capital": {
 		common.HexToAddress("0x8c213ee79581ff4984583c6a801e5263418c4b86"),
@@ -306,10 +290,6 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x55F9C8992fc4AbCE5ACa585bf8F18284a2379D4C"),
 	},
 }
-
-// =============================================================
-// Categories & Constants
-// =============================================================
 
 var TargetCategories = map[string]bool{
 	"Lending":           true,
@@ -336,11 +316,6 @@ const (
 	anvilPollEvery  = 250 * time.Millisecond
 )
 
-// =============================================================
-// Helpers
-// =============================================================
-
-// FIXED: AssetInfo.Address is now a string, so we convert it for the map lookup.
 func isStableAsset(a AssetInfo) bool {
 	if a.Address != "" {
 		addr := common.HexToAddress(a.Address)
