@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math/big"
 	"os"
 	"os/exec"
 	"os/signal"
