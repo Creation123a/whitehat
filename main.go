@@ -174,7 +174,6 @@ func run() int {
 	return WriteReport(*outPath, *format, rep)
 }
 
-
 // scanTarget executes the full triaging pipeline on a single contract.
 func scanTarget(
 	ctx context.Context,
@@ -246,8 +245,7 @@ func scanTarget(
 		combinedContext.WriteString(fmt.Sprintf("REGEX FINDING (%s):\n%s\n", f.RuleID, f.Snippet))
 	}
 
-	
-		// Phase 2: Dynamic Anvil Validation
+	// Phase 2: Dynamic Anvil Validation
 	var exploitContext string
 
 	// 1. Always try the Flash Loan AMM Distortion (fails safely if not an AMM)
