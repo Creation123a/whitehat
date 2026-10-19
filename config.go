@@ -11,15 +11,10 @@ const (
 	DefiLlamaProtocolsURL = "https://api.llama.fi/protocols"
 	DefiLlamaBaseChain    = "Base"
 
-	EtherscanBaseURL = "https://api.etherscan.io/v2/api"
-	EtherscanChainID = 8453
 
 	EIP1967ImplementationSlot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
 )
 
-var (
-	EtherscanAPIKey = "ETN9EBPSA2P7QMWF1GM9MEITN14HVXIYUE"
-)
 
 var BaseProtocolRegistry = map[string][]common.Address{
 	// Lending
