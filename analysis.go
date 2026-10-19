@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"log"
 	"regexp"
 	"strings"
 
@@ -12,10 +10,9 @@ import (
 )
 
 // =============================================================
-// RPC & Decompilation Source Resolution
+// RPC & Bytecode Resolution
 // =============================================================
 
-// ResolveImplementation finds the implementation address of a proxy via RPC.
 func ResolveImplementation(ctx context.Context, client *ethclient.Client, addr common.Address) common.Address {
 	// 1. EIP-1967 Slot
 	slot := common.HexToHash(EIP1967ImplementationSlot)
@@ -52,20 +49,16 @@ func ResolveImplementation(ctx context.Context, client *ethclient.Client, addr c
 	return common.Address{}
 }
 
-// FetchBytecode fetches the raw bytecode via RPC. No APIs involved.
 func FetchBytecode(ctx context.Context, client *ethclient.Client, addr common.Address) ([]byte, error) {
 	code, err := client.CodeAt(ctx, addr, nil)
 	if err != nil {
 		return nil, err
 	}
-	if len(code) == 0 {
-		return nil, fmt.Errorf("no bytecode at %s", addr.Hex())
-	}
 	return code, nil
 }
 
 // =============================================================
-// Dependency Extraction (AST string match)
+// Dependency Extraction & Regex
 // =============================================================
 
 var addressRegex = regexp.MustCompile(`0x[a-fA-F0-9]{40}`)
@@ -79,7 +72,6 @@ func ExtractDependencies(ctx context.Context, client *ethclient.Client, source s
 		if a == (common.Address{}) || a == self {
 			continue
 		}
-		
 		lower := strings.ToLower(m)
 		if strings.HasPrefix(lower, "0x000") || strings.HasPrefix(lower, "0xfff") || 
 		   strings.HasPrefix(lower, "0xaaa") || strings.HasPrefix(lower, "0x777") {
@@ -102,16 +94,13 @@ func ExtractDependencies(ctx context.Context, client *ethclient.Client, source s
 	return out
 }
 
-// =============================================================
-// Regex Rules & Scanning
-// =============================================================
-
 type regexRule struct {
 	ID       string
 	Category string
 	Severity string
 	Pattern  *regexp.Regexp
 }
+
 
 var regexRules = []regexRule{
 	{ID: "A1", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`getReserves\s*\(`)},
