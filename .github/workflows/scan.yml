@@ -61,6 +61,21 @@ jobs:
         run: |
           pip install vandal
 
+      - name: Cache Cargo Dependencies (For Heimdall)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+          key: ${{ runner.os }}-cargo-heimdall
+
+      - name: Install Heimdall-rs
+        run: |
+          if ! command -v heimdall &> /dev/null; then
+            cargo install heimdall-rs
+          fi
+
       - name: Cache Ollama Models
         uses: actions/cache@v4
         with:
