@@ -52,30 +52,14 @@ jobs:
           go-version: '1.24'
           cache: true
 
-      - name: Setup Python Environment (For Slither)
+      - name: Setup Python Environment (For Vandal)
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install Slither
+      - name: Install Vandal
         run: |
-          pip install slither-analyzer
-
-      - name: Cache Cargo Dependencies (For Aderyn)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install Aderyn
-        run: |
-          if ! command -v aderyn &> /dev/null; then
-            cargo install aderyn
-          fi
+          pip install vandal
 
       - name: Cache Ollama Models
         uses: actions/cache@v4
@@ -101,11 +85,6 @@ jobs:
       - name: Build scanner
         run: go build -o scanner .
 
-      - name: Mask secrets
-        run: |
-          echo "::add-mask::${{ secrets.BASE_FORK_URL }}"
-          echo "::add-mask::${{ secrets.ETHERSCAN_API_KEY }}"
-
       - name: Resolve fork block
         id: fork
         env:
@@ -115,18 +94,15 @@ jobs:
           set -euo pipefail
           if [ -n "${OVERRIDE:-}" ]; then
             BLOCK="$OVERRIDE"
-            echo "Using explicit override block: $BLOCK"
           else
             HEAD=$(cast block-number --rpc-url "$BASE_FORK_URL")
             BLOCK=$((HEAD - 100))
-            echo "Fetched head: $HEAD, using: $BLOCK"
           fi
           echo "block=$BLOCK" >> "$GITHUB_OUTPUT"
 
       - name: Run scan
         env:
           BASE_FORK_URL:      ${{ secrets.BASE_FORK_URL }}
-          ETHERSCAN_API_KEY:  ${{ secrets.ETHERSCAN_API_KEY }}
           FORK_BLOCK:         ${{ steps.fork.outputs.block }}
           CATEGORY:           ${{ inputs.category }}
           FORMAT:             ${{ inputs.format }}
@@ -148,9 +124,6 @@ jobs:
           if [ -f report.json ]; then
             echo "--- report.json (first 8 KB) ---"
             head -c 8192 report.json || true
-            echo
-          else
-            echo "report.json not produced"
           fi
 
       - name: Upload report
@@ -159,5 +132,3 @@ jobs:
         with:
           name: scan-report-${{ inputs.category }}-${{ steps.fork.outputs.block }}
           path: report.json
-          if-no-files-found: warn
-          retention-days: 30
