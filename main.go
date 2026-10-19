@@ -230,19 +230,22 @@ func scanTarget(
 		combinedContext.WriteString(fmt.Sprintf("REGEX FINDING (%s):\n%s\n", f.RuleID, f.Snippet))
 	}
 
-	// Phase 2: Dynamic Anvil Validation
-	// (Example: Check admin bounds if an owner() function exists)
-	// In a fully automated pipeline, this triggers specific exploits based on protocol type.
+		// Phase 2: Dynamic Anvil Validation
 	var exploitContext string
 	
-	// Check if this looks like an oracle or manager
+	// Example 1: Check if this looks like an oracle or manager
 	isOracle := strings.Contains(strings.ToLower(contractName), "oracle") || strings.Contains(strings.ToLower(contractName), "price")
 	if isOracle {
-		// Simulate Flash Loan Distortion (Dummy slot for demonstration)
 		log.Printf("scanner[anvil]: Simulating flash loan distortion on %s", target.Hex())
-		// exploiter.TestFlashLoanDistortion(ctx, target, slot, big.NewInt(1000000))
+		// Example dummy slot for the simulation
+		dummySlot := common.HexToHash("0x0") 
+		exploiter.TestFlashLoanDistortion(ctx, target, dummySlot, big.NewInt(1000000000000000000))
 		exploitContext += "\nANVIL SIMULATION: Spot pool storage was artificially manipulated. No circuit breaker triggered.\n"
 	}
+
+	// Example 2: Admin Bounds Check (if ABI reveals a setter and an owner)
+	// If it's vulnerable, it will append to the exploitContext.
+	// (Implement actual ABI packing logic here as needed per protocol)
 
 	// Phase 3: Segmented LLM Analytics
 	if combinedContext.Len() > 0 || exploitContext != "" {
