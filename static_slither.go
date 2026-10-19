@@ -65,15 +65,29 @@ func RunStaticAnalyzers(sourceCode string, contractName string) (string, error) 
 	aderynCmd.Dir = tmpDir
 	_ = aderynCmd.Run()
 
+		// Inside RunStaticAnalyzers function:
 	aderynReport, err := os.ReadFile(filepath.Join(tmpDir, "report.json"))
 	if err == nil {
 		var aderynRes struct {
-			HighIssues []struct{ Title string; Description string }
-			CriticalIssues []struct{ Title string; Description string }
+			HighIssues struct {
+				Issues []struct {
+					Title       string `json:"title"`
+					Description string `json:"description"`
+				} `json:"issues"`
+			} `json:"high_issues"`
+			CriticalIssues struct {
+				Issues []struct {
+					Title       string `json:"title"`
+					Description string `json:"description"`
+				} `json:"issues"`
+			} `json:"critical_issues"`
 		}
 		if json.Unmarshal(aderynReport, &aderynRes) == nil {
-			for _, i := range aderynRes.CriticalIssues {
+			for _, i := range aderynRes.CriticalIssues.Issues {
 				summary += fmt.Sprintf("- [ADERYN - CRITICAL] %s: %s\n", i.Title, i.Description)
+			}
+			for _, i := range aderynRes.HighIssues.Issues {
+				summary += fmt.Sprintf("- [ADERYN - HIGH] %s: %s\n", i.Title, i.Description)
 			}
 		}
 	}
