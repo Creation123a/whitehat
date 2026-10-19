@@ -249,41 +249,31 @@ func scanTarget(
 		combinedContext.WriteString(fmt.Sprintf("REGEX FINDING (%s):\n%s\n", f.RuleID, f.Snippet))
 	}
 
-	// Phase 2: Dynamic Anvil Validation
+		// Phase 2: Dynamic Anvil Validation
 	var exploitContext string
-	
-	isOracleOrPool := strings.Contains(strings.ToLower(contractName), "oracle") || 
-	                  strings.Contains(strings.ToLower(contractName), "price") ||
-	                  strings.Contains(strings.ToLower(contractName), "pool") ||
-	                  strings.Contains(strings.ToLower(contractName), "pair")
-	                  
-	if isOracleOrPool {
-		log.Printf("scanner[anvil]: Running Flash Loan distortion on %s...", target.Hex())
-		msg, err := exploiter.TestFlashLoanDistortion(ctx, target)
-		if err == nil {
-			log.Printf("scanner[anvil]: RESULT: %s", msg)
-			exploitContext += "\nANVIL SIMULATION: " + msg + " No circuit breaker triggered.\n"
-		} else {
-			log.Printf("scanner[anvil]: Simulation failed: %v", err)
-		}
+
+	// 1. Always try the Flash Loan AMM Distortion (fails safely if not an AMM)
+	log.Printf("scanner[anvil]: Testing Flash Loan distortion on %s...", target.Hex())
+	msg, err := exploiter.TestFlashLoanDistortion(ctx, target)
+	if err == nil {
+		log.Printf("scanner[anvil]: RESULT: %s", msg)
+		exploitContext += "\nANVIL SIMULATION: " + msg + " No circuit breaker triggered.\n"
+	} else {
+		log.Printf("scanner[anvil]: Simulation skipped/failed: %v", err)
 	}
 
-	isVault := strings.Contains(strings.ToLower(contractName), "vault") || 
-	           strings.Contains(strings.ToLower(contractName), "4626")
-	           
-	if isVault {
-		log.Printf("scanner[anvil]: Running ERC-4626 inflation test on %s...", target.Hex())
-		attacker := common.HexToAddress("0x1111111111111111111111111111111111111111")
-		victim := common.HexToAddress("0x2222222222222222222222222222222222222222")
-		dummyAsset := common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
-		
-		vulnerable, err := exploiter.TestERC4626Inflation(ctx, target, dummyAsset, attacker, victim)
-		if err == nil && vulnerable {
-			log.Printf("scanner[anvil]: VULNERABLE! Victim received 0 shares.")
-			exploitContext += "\nANVIL SIMULATION: ERC-4626 First Depositor Inflation attack succeeded. Victim received 0 shares.\n"
-		} else if err == nil {
-			log.Printf("scanner[anvil]: SAFE. Inflation attack failed.")
-		}
+	// 2. Always try the ERC-4626 Inflation Attack (fails safely if not a vault)
+	log.Printf("scanner[anvil]: Testing ERC-4626 inflation on %s...", target.Hex())
+	attacker := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	victim := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	dummyAsset := common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+	
+	vulnerable, err := exploiter.TestERC4626Inflation(ctx, target, dummyAsset, attacker, victim)
+	if err == nil && vulnerable {
+		log.Printf("scanner[anvil]: VULNERABLE! Victim received 0 shares.")
+		exploitContext += "\nANVIL SIMULATION: ERC-4626 First Depositor Inflation attack succeeded. Victim received 0 shares.\n"
+	} else if err == nil {
+		log.Printf("scanner[anvil]: SAFE. Inflation attack failed or not a valid 4626 vault.")
 	}
 
 	// Phase 3: Segmented LLM Analytics
