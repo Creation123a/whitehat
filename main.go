@@ -107,12 +107,13 @@ func run() int {
 	}
 	log.Printf("scanner: forked at block %d", blockNum)
 
+	// Phase 1: Discovery
 	protocols, err := DiscoverProtocols(runCtx, *category)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scanner[phase1]: %v\n", err)
 		return 2
 	}
-	log.Printf("scanner[phase1]: %d protocols in [%s]", len(protocols), *category)
+	log.Printf("scanner[phase1]: Found %d protocols in [%s]", len(protocols), *category)
 
 	if len(protocols) == 0 {
 		rep := BuildReport(RunMetadata{ChainID: requiredChainID, BlockNumber: blockNum, CategoryKeyword: *category}, nil, nil)
@@ -124,9 +125,11 @@ func run() int {
 	totalFlags := 0
 	scanned := 0
 
+	// Loop through all protocols
 	for _, proto := range protocols {
 		addrs := BaseProtocolRegistry[proto.Slug]
 		if len(addrs) == 0 {
+			log.Printf("scanner[phase1]: SKIPPED %q - no hardcoded addresses in registry", proto.Name)
 			skipped = append(skipped, SkippedProtocol{Name: proto.Name, Slug: proto.Slug, Reason: "no hardcoded addresses"})
 			continue
 		}
@@ -137,13 +140,13 @@ func run() int {
 		scannedSuccessfully := false
 
 		for _, addr := range addrs {
-			if scanTarget(runCtx, client, exploiter, proto, addr, visited, &protoFlags, &totalFlags) {
+			if scanTarget(runCtx, client, rpcClient, effectiveRPC, exploiter, proto, addr, visited, &protoFlags, &totalFlags) {
 				scannedSuccessfully = true
 			}
 		}
 
 		if !scannedSuccessfully {
-			skipped = append(skipped, SkippedProtocol{Name: proto.Name, Slug: proto.Slug, Reason: "source not verified or compilation failed"})
+			skipped = append(skipped, SkippedProtocol{Name: proto.Name, Slug: proto.Slug, Reason: "decompilation or RPC failed"})
 			continue
 		}
 
@@ -171,10 +174,12 @@ func run() int {
 	return WriteReport(*outPath, *format, rep)
 }
 
-// scanTarget executes the 3-phase triaging pipeline on a single contract.
+// scanTarget executes the full triaging pipeline on a single contract.
 func scanTarget(
 	ctx context.Context,
 	client *ethclient.Client,
+	rpcClient *rpc.Client,
+	rpcURL string,
 	exploiter *AnvilExploiter,
 	proto Protocol,
 	addr common.Address,
@@ -187,84 +192,100 @@ func scanTarget(
 	}
 	visited[addr] = true
 
-	// Step 2: Proxy Resolution
+	// Step 1: Proxy Resolution
 	impl := ResolveImplementation(ctx, client, addr)
 	target := addr
 	if impl != (common.Address{}) {
 		target = impl
+		log.Printf("scanner[proxy]: Resolved %s -> Impl %s", addr.Hex(), target.Hex())
 	}
 
-	// Step 3: Bytecode Pre-Filter (Skip ERC-20s, require Math/Oracle selectors)
-	code, err := client.CodeAt(ctx, target, nil)
-	if err != nil || len(code) == 0 {
-		return false
-	}
-	if isStandardToken(code) {
-		return false // Skip standard tokens
-	}
-
-	// Download Source Code
-	src, contractName, err := FetchVerifiedSource(ctx, client, target)
+	// Step 2: Fetch Bytecode via RPC
+	code, err := FetchBytecode(ctx, client, target)
 	if err != nil {
 		log.Printf("scanner[source]: %s: %v", target.Hex(), err)
 		return false
 	}
+	
+	// Step 3: Bytecode Pre-Filter (Skip standard tokens)
+	if isStandardToken(code) {
+		log.Printf("scanner[filter]: %s is a standard ERC-20/721. Skipping.", target.Hex())
+		return false 
+	}
 
-	// Step 4: State Variable Reader (Find Oracles/Managers dynamically)
-	dependencies := ReadStateDependencies(ctx, client, target)
+	// Step 4: Decompile with Heimdall (No API)
+	var src string
+	var contractName string = "DecompiledContract" // Heimdall does not return a name
+	
+	log.Printf("scanner[heimdall]: Decompiling %s via RPC...", target.Hex())
+	decompiledSrc, err := DecompileWithHeimdall(ctx, target.Hex(), rpcURL)
+	if err != nil {
+		log.Printf("scanner[heimdall]: Decompilation failed for %s: %v", target.Hex(), err)
+		return false
+	}
+	src = decompiledSrc
+
+	// Step 5: Dynamic Dependency Traversal
+	dependencies := ExtractDependencies(ctx, client, src, target)
 	for _, dep := range dependencies {
-		log.Printf("scanner[state]: Discovered dependency %s", dep.Hex())
-		// Recursively scan dependencies (Oracles, RateProviders)
-		scanTarget(ctx, client, exploiter, proto, dep, visited, flags, totalFlags)
+		log.Printf("scanner[state]: Discovered dynamic dependency %s from decompiled AST", dep.Hex())
+		scanTarget(ctx, client, rpcClient, rpcURL, exploiter, proto, dep, visited, flags, totalFlags)
 	}
 
 	// Phase 1: Static Triage (Slither/Aderyn + Regex)
+	// Note: Slither/Aderyn will likely fail on decompiled code because it's pseudo-Solidity. 
+	// We run them for completeness, but rely heavily on Regex + LLM here.
 	slitherSummary, _ := RunStaticAnalyzers(src, contractName)
 	regexFlags := RunRegexScan(src)
+	
+	log.Printf("scanner[regex]: Triggered %d regex rules on %s", len(regexFlags), contractName)
 
 	var combinedContext strings.Builder
 	if slitherSummary != "" && slitherSummary != "No high/critical issues found by static analyzers." {
 		combinedContext.WriteString("STATIC ANALYZER FINDINGS:\n" + slitherSummary + "\n")
 	}
 	for _, f := range regexFlags {
+		log.Printf("scanner[regex]: FLAG [%s] on line %d", f.RuleID, f.LineStart)
 		combinedContext.WriteString(fmt.Sprintf("REGEX FINDING (%s):\n%s\n", f.RuleID, f.Snippet))
 	}
 
-		// Phase 2: Dynamic Anvil Validation
+	// Phase 2: Dynamic Anvil Validation
 	var exploitContext string
 	
-		// Example 1: Check if this looks like an AMM pool or Oracle
 	isOracleOrPool := strings.Contains(strings.ToLower(contractName), "oracle") || 
 	                  strings.Contains(strings.ToLower(contractName), "price") ||
 	                  strings.Contains(strings.ToLower(contractName), "pool") ||
 	                  strings.Contains(strings.ToLower(contractName), "pair")
 	                  
 	if isOracleOrPool {
-		log.Printf("scanner[anvil]: Simulating flash loan distortion on %s", target.Hex())
-		
+		log.Printf("scanner[anvil]: Running Flash Loan distortion on %s...", target.Hex())
 		msg, err := exploiter.TestFlashLoanDistortion(ctx, target)
 		if err == nil {
+			log.Printf("scanner[anvil]: RESULT: %s", msg)
 			exploitContext += "\nANVIL SIMULATION: " + msg + " No circuit breaker triggered.\n"
+		} else {
+			log.Printf("scanner[anvil]: Simulation failed: %v", err)
 		}
 	}
 
-	// Example 2: ERC-4626 Inflation Attack (If contract looks like a vault)
 	isVault := strings.Contains(strings.ToLower(contractName), "vault") || 
 	           strings.Contains(strings.ToLower(contractName), "4626")
 	           
 	if isVault {
-		log.Printf("scanner[anvil]: Testing ERC-4626 inflation on %s", target.Hex())
-		// We use dummy addresses for the attacker and victim
+		log.Printf("scanner[anvil]: Running ERC-4626 inflation test on %s...", target.Hex())
 		attacker := common.HexToAddress("0x1111111111111111111111111111111111111111")
 		victim := common.HexToAddress("0x2222222222222222222222222222222222222222")
-		// Assuming target is the vault, and we pull the underlying asset from the ABI (dummy for now)
-		dummyAsset := common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913") // Default to USDC
+		dummyAsset := common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
 		
-		vulnerable, _ := exploiter.TestERC4626Inflation(ctx, target, dummyAsset, attacker, victim)
-		if vulnerable {
+		vulnerable, err := exploiter.TestERC4626Inflation(ctx, target, dummyAsset, attacker, victim)
+		if err == nil && vulnerable {
+			log.Printf("scanner[anvil]: VULNERABLE! Victim received 0 shares.")
 			exploitContext += "\nANVIL SIMULATION: ERC-4626 First Depositor Inflation attack succeeded. Victim received 0 shares.\n"
+		} else if err == nil {
+			log.Printf("scanner[anvil]: SAFE. Inflation attack failed.")
 		}
 	}
+
 	// Phase 3: Segmented LLM Analytics
 	if combinedContext.Len() > 0 || exploitContext != "" {
 		fullPrompt := combinedContext.String() + exploitContext
@@ -272,6 +293,9 @@ func scanTarget(
 		
 		verdict, err := AskLocalLLM(ctx, fullPrompt, contractName, "Target Contract")
 		if err == nil {
+			parsedVerdict := ParseVerdict(verdict)
+			log.Printf("scanner[llm]: Qwen Verdict -> %s", parsedVerdict)
+			
 			flag := FlagReport{
 				RuleID:          "DYNAMIC_TRACE",
 				Category:        "combined",
@@ -282,7 +306,7 @@ func scanTarget(
 				ContractRole:    "main",
 			}
 			(*totalFlags)++
-			if ParseVerdict(verdict) == "VULNERABLE" {
+			if parsedVerdict == "VULNERABLE" {
 				*flags = append(*flags, flag)
 			}
 		} else {
@@ -295,14 +319,25 @@ func scanTarget(
 
 // isStandardToken checks if the bytecode is just a standard ERC-20/721.
 func isStandardToken(code []byte) bool {
-	hasTransfer := strings.Contains(common.Bytes2Hex(code), "a9059cbb")
-	hasApprove := strings.Contains(common.Bytes2Hex(code), "095ea7b3")
-	hasMath := strings.Contains(common.Bytes2Hex(code), "3850c7bd") || // slot0
-			   strings.Contains(common.Bytes2Hex(code), "0902f1ac") || // getReserves
-			   strings.Contains(common.Bytes2Hex(code), "8a889156")    // latestRoundData
+	hexCode := common.Bytes2Hex(code)
+	
+	hasTransfer := strings.Contains(hexCode, "a9059cbb")
+	hasApprove := strings.Contains(hexCode, "095ea7b3")
+	
+	// Check for AMM Math
+	hasAmmMath := strings.Contains(hexCode, "3850c7bd") || // slot0
+			      strings.Contains(hexCode, "0902f1ac") || // getReserves
+			      strings.Contains(hexCode, "bb7b8b80")    // get_virtual_price
 
-	// If it has transfer and approve but NO math/oracle selectors, it's just a token.
-	return hasTransfer && hasApprove && !hasMath
+	// Check for Lending/Oracle Math
+	hasLendingMath := strings.Contains(hexCode, "b3596f07") || // getAssetPrice (Aave)
+			          strings.Contains(hexCode, "fc57d4df") || // getUnderlyingPrice (Compound/Sonne)
+			          strings.Contains(hexCode, "8a889156") || // latestRoundData (Chainlink)
+			          strings.Contains(hexCode, "50d25bcd") || // latestAnswer
+			          strings.Contains(hexCode, "a035b1fe")    // price() (Morpho)
+
+	// If it has transfer and approve but NO amm math and NO lending math, it's just a token.
+	return hasTransfer && hasApprove && !hasAmmMath && !hasLendingMath
 }
 
 func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
