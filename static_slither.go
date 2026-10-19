@@ -29,22 +29,25 @@ type SlitherJSON struct {
 // RunStaticAnalyzers runs Slither and Aderyn on the raw source code.
 // It returns a summary string of high-impact findings to feed into the LLM prompt.
 func RunStaticAnalyzers(sourceCode string, contractName string) (string, error) {
-	tmpDir, err := os.MkdirTemp("", "slither-audit")
+	tmpDir, err := os.MkdirTemp("", "foundry-audit")
 	if err != nil {
 		return "", err
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Write the source code to a .sol file
-	solFile := filepath.Join(tmpDir, fmt.Sprintf("%s.sol", contractName))
-	if err := os.WriteFile(solFile, []byte(sourceCode), 0644); err != nil {
-		return "", err
-	}
+	// 1. Initialize a dummy Foundry project
+	cmdInit := exec.Command("forge", "init", "--force")
+	cmdInit.Dir = tmpDir
+	_ = cmdInit.Run()
 
-	// 1. Run Slither
-	// Note: Slither might fail on missing imports (like OpenZeppelin) without a full project setup.
-	cmd := exec.Command("slither", solFile, "--json", "-")
-	out, _ := cmd.Output() // Ignore error as Slither returns non-zero on findings
+	// 2. Write the target contract to src/
+	solFile := filepath.Join(tmpDir, "src", fmt.Sprintf("%s.sol", contractName))
+	_ = os.WriteFile(solFile, []byte(sourceCode), 0644)
+
+	// 3. Run Slither inside the project
+	cmd := exec.Command("slither", ".", "--json", "-")
+	cmd.Dir = tmpDir
+	out, _ := cmd.Output()
 
 	var slitherRes SlitherJSON
 	_ = json.Unmarshal(out, &slitherRes)
@@ -57,12 +60,11 @@ func RunStaticAnalyzers(sourceCode string, contractName string) (string, error) 
 		}
 	}
 
-	// 2. Run Aderyn (Aderyn is a Rust-based Solidity AST scanner)
-	// (Assuming Aderyn is installed globally in the runner as per the workflow)
-	aderynCmd := exec.Command("aderyn", tmpDir, "--output", filepath.Join(tmpDir, "report.json"))
-	_ = aderynCmd.Run() // Run silently
+	// 4. Run Aderyn
+	aderynCmd := exec.Command("aderyn", ".", "--output", "report.json")
+	aderynCmd.Dir = tmpDir
+	_ = aderynCmd.Run()
 
-	// Read Aderyn report if it exists
 	aderynReport, err := os.ReadFile(filepath.Join(tmpDir, "report.json"))
 	if err == nil {
 		var aderynRes struct {
@@ -72,9 +74,6 @@ func RunStaticAnalyzers(sourceCode string, contractName string) (string, error) 
 		if json.Unmarshal(aderynReport, &aderynRes) == nil {
 			for _, i := range aderynRes.CriticalIssues {
 				summary += fmt.Sprintf("- [ADERYN - CRITICAL] %s: %s\n", i.Title, i.Description)
-			}
-			for _, i := range aderynRes.HighIssues {
-				summary += fmt.Sprintf("- [ADERYN - HIGH] %s: %s\n", i.Title, i.Description)
 			}
 		}
 	}
