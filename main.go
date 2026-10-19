@@ -174,6 +174,7 @@ func run() int {
 	return WriteReport(*outPath, *format, rep)
 }
 
+
 // scanTarget executes the full triaging pipeline on a single contract.
 func scanTarget(
 	ctx context.Context,
@@ -202,53 +203,50 @@ func scanTarget(
 
 	// Step 2: Fetch Bytecode via RPC
 	code, err := FetchBytecode(ctx, client, target)
-	if err != nil {
-		log.Printf("scanner[source]: %s: %v", target.Hex(), err)
+	if err != nil || len(code) == 0 {
+		log.Printf("scanner[source]: No bytecode at %s", target.Hex())
 		return false
 	}
 	
-	// Step 3: Bytecode Pre-Filter (Skip standard tokens)
+	// Step 3: Bytecode Pre-Filter
 	if isStandardToken(code) {
 		log.Printf("scanner[filter]: %s is a standard ERC-20/721. Skipping.", target.Hex())
 		return false 
 	}
 
-	// Step 4: Decompile with Heimdall (No API)
-	var src string
-	var contractName string = "DecompiledContract" // Heimdall does not return a name
-	
+	// Step 4: Decompile with Heimdall
 	log.Printf("scanner[heimdall]: Decompiling %s via RPC...", target.Hex())
 	decompiledSrc, err := DecompileWithHeimdall(ctx, target.Hex(), rpcURL)
 	if err != nil {
 		log.Printf("scanner[heimdall]: Decompilation failed for %s: %v", target.Hex(), err)
 		return false
 	}
-	src = decompiledSrc
+	src := decompiledSrc
+	contractName := "DecompiledContract"
 
 	// Step 5: Dynamic Dependency Traversal
 	dependencies := ExtractDependencies(ctx, client, src, target)
 	for _, dep := range dependencies {
-		log.Printf("scanner[state]: Discovered dynamic dependency %s from decompiled AST", dep.Hex())
+		log.Printf("scanner[state]: Discovered dependency %s", dep.Hex())
 		scanTarget(ctx, client, rpcClient, rpcURL, exploiter, proto, dep, visited, flags, totalFlags)
 	}
 
-	// Phase 1: Static Triage (Slither/Aderyn + Regex)
-	// Note: Slither/Aderyn will likely fail on decompiled code because it's pseudo-Solidity. 
-	// We run them for completeness, but rely heavily on Regex + LLM here.
-	slitherSummary, _ := RunStaticAnalyzers(src, contractName)
+	// Phase 1: Static Triage (Vandal + Regex)
+	vandalSummary, _ := RunVandal(ctx, target.Hex(), rpcURL)
 	regexFlags := RunRegexScan(src)
 	
 	log.Printf("scanner[regex]: Triggered %d regex rules on %s", len(regexFlags), contractName)
 
 	var combinedContext strings.Builder
-	if slitherSummary != "" && slitherSummary != "No high/critical issues found by static analyzers." {
-		combinedContext.WriteString("STATIC ANALYZER FINDINGS:\n" + slitherSummary + "\n")
+	if vandalSummary != "" {
+		combinedContext.WriteString("VANDAL BYTECODE ANALYZER FINDINGS:\n" + vandalSummary + "\n")
 	}
 	for _, f := range regexFlags {
 		log.Printf("scanner[regex]: FLAG [%s] on line %d", f.RuleID, f.LineStart)
 		combinedContext.WriteString(fmt.Sprintf("REGEX FINDING (%s):\n%s\n", f.RuleID, f.Snippet))
 	}
 
+	
 		// Phase 2: Dynamic Anvil Validation
 	var exploitContext string
 
