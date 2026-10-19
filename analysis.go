@@ -119,45 +119,41 @@ func LinkProxyToImplementation(ctx context.Context, proxyAddress, implAddress st
 // =============================================================
 
 func ResolveImplementation(ctx context.Context, client *ethclient.Client, addr common.Address) common.Address {
-	// 1. EIP-1967 Storage Slot
-	slot1967 := common.HexToHash("0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc")
-	raw, err := client.StorageAt(ctx, addr, slot1967, nil)
-	if err == nil && len(raw) == 32 {
+	// 1. EIP-1967 Slot
+	slot := common.HexToHash(EIP1967ImplementationSlot)
+	raw, _ := client.StorageAt(ctx, addr, slot, nil)
+	if len(raw) > 0 {
 		impl := common.BytesToAddress(raw)
 		if impl != (common.Address{}) {
-			if code, err := client.CodeAt(ctx, impl, nil); err == nil && len(code) > 0 {
-				return impl
-			}
+			return impl
 		}
 	}
 
-	// 2. Legacy Transparent Storage Slot
-	slotLegacy := common.HexToHash("0xa3f1a74d20ba3f5bb237cc54f6b8a73377b2212d7959d3317549ad8f949247df")
-	raw, err = client.StorageAt(ctx, addr, slotLegacy, nil)
-	if err == nil && len(raw) == 32 {
-		impl := common.BytesToAddress(raw)
+	// 2. Legacy Transparent Proxy Slot
+	legacySlot := common.HexToHash("0xa3f1a74d20ba3f5bb237cc54f6b8a73377b2212d7959d3317549ad8f949247df")
+	rawLegacy, _ := client.StorageAt(ctx, addr, legacySlot, nil)
+	if len(rawLegacy) > 0 {
+		impl := common.BytesToAddress(rawLegacy)
 		if impl != (common.Address{}) {
-			if code, err := client.CodeAt(ctx, impl, nil); err == nil && len(code) > 0 {
-				return impl
-			}
+			return impl
 		}
 	}
 
-	// 3. EIP-1167 Minimal Proxy Check
+	// 3. EIP-1167 Minimal Proxy
 	code, err := client.CodeAt(ctx, addr, nil)
 	if err == nil && len(code) >= 45 {
 		hexCode := common.Bytes2Hex(code)
-		// Check if bytecode starts with 363d3d373d3d3d363d73
 		if strings.HasPrefix(hexCode, "363d3d373d3d3d363d73") {
-			// Extract bytes 10 to 30 (20 bytes = 40 hex chars)
-			implHex := hexCode[20:60]
-			return common.HexToAddress(implHex)
+			// Bytes 10 to 30 (20 bytes) contain the implementation address
+			impl := common.BytesToAddress(code[10:30])
+			if impl != (common.Address{}) {
+				return impl
+			}
 		}
 	}
 
 	return common.Address{}
 }
-
 func UnwrapSource(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
