@@ -2,120 +2,20 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
+	"log"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-type etherscanSourceResult struct {
-	SourceCode     string `json:"SourceCode"`
-	ABI            string `json:"ABI"`
-	ContractName   string `json:"ContractName"`
-	Proxy          string `json:"Proxy"`
-	Implementation string `json:"Implementation"`
-}
-
-type etherscanResponse struct {
-	Status  string          `json:"status"`
-	Message string          `json:"message"`
-	Result  json.RawMessage `json:"result"`
-}
-
 // =============================================================
-// Programmatic Proxy Linking (Etherscan V2)
+// RPC & Decompilation Source Resolution
 // =============================================================
 
-type BaseScanResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message"`
-	Result  string `json:"result"`
-}
-
-func LinkProxyToImplementation(ctx context.Context, proxyAddress, implAddress string) error {
-	data := url.Values{}
-	data.Set("address", proxyAddress)
-	data.Set("expectedimplementation", implAddress)
-
-	endpoint := fmt.Sprintf("%s?chainid=%d&module=contract&action=verifyproxycontract&apikey=%s", 
-		EtherscanBaseURL, EtherscanChainID, EtherscanAPIKey)
-
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(data.Encode()))
-	if err != nil {
-		return fmt.Errorf("failed to construct request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("http transfer layer failure: %w", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	var baseResp BaseScanResponse
-	if err := json.Unmarshal(bodyBytes, &baseResp); err != nil {
-		return fmt.Errorf("invalid json footprint payload: %w", err)
-	}
-
-	if baseResp.Status != "1" {
-		return fmt.Errorf("etherscan tracking initialization rejected: %s", baseResp.Result)
-	}
-
-	guidToken := baseResp.Result
-	statusEndpoint := fmt.Sprintf("%s?chainid=%d&module=contract&action=checkproxyverification&guid=%s&apikey=%s", 
-		EtherscanBaseURL, EtherscanChainID, guidToken, EtherscanAPIKey)
-	
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-	timeout := time.After(60 * time.Second)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timeout:
-			return fmt.Errorf("timeout limit reached while verifying target guid: %s", guidToken)
-		case <-ticker.C:
-			statusResp, err := client.Get(statusEndpoint)
-			if err != nil {
-				continue 
-			}
-			statusBytes, _ := io.ReadAll(statusResp.Body)
-			statusResp.Body.Close()
-
-			var pollResp BaseScanResponse
-			if err := json.Unmarshal(statusBytes, &pollResp); err != nil {
-				continue
-			}
-
-			switch pollResp.Result {
-			case "Pending", "Awaiting confirmation":
-				// Keep polling
-			case "Pass", "Proxy contract verification successful", "SUCCESS":
-				return nil
-			default:
-				if pollResp.Status == "1" || strings.Contains(pollResp.Result, "Already Verified") {
-					return nil
-				}
-				return fmt.Errorf("verification dropped with error: %s", pollResp.Result)
-			}
-		}
-	}
-}
-
-// =============================================================
-// Source Resolution & Proxy Checks
-// =============================================================
-
+// ResolveImplementation finds the implementation address of a proxy via RPC.
 func ResolveImplementation(ctx context.Context, client *ethclient.Client, addr common.Address) common.Address {
 	// 1. EIP-1967 Slot
 	slot := common.HexToHash(EIP1967ImplementationSlot)
@@ -152,107 +52,16 @@ func ResolveImplementation(ctx context.Context, client *ethclient.Client, addr c
 	return common.Address{}
 }
 
-func UnwrapSource(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return raw
-	}
-	if strings.HasPrefix(raw, "{") && !strings.HasPrefix(raw, "{{") {
-		return extractSourcesFromJSON(raw)
-	}
-	if strings.HasPrefix(raw, "{{") && strings.HasSuffix(raw, "}}") {
-		inner := raw[1 : len(raw)-1]
-		return extractSourcesFromJSON(inner)
-	}
-	return raw
-}
-
-func extractSourcesFromJSON(jsonStr string) string {
-	var parsed struct {
-		Sources map[string]struct {
-			Content string `json:"content"`
-		} `json:"sources"`
-	}
-	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-		return ""
-	}
-	var sb strings.Builder
-	for _, src := range parsed.Sources {
-		sb.WriteString(src.Content)
-		sb.WriteString("\n")
-	}
-	return sb.String()
-}
-
-func fetchRawSource(ctx context.Context, addr common.Address) (string, string, error) {
-	q := url.Values{}
-	q.Set("chainid", fmt.Sprintf("%d", EtherscanChainID))
-	q.Set("module", "contract")
-	q.Set("action", "getsourcecode")
-	q.Set("address", addr.Hex())
-	q.Set("apikey", EtherscanAPIKey)
-
-	full := EtherscanBaseURL + "?" + q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, full, nil)
+// FetchBytecode fetches the raw bytecode via RPC. No APIs involved.
+func FetchBytecode(ctx context.Context, client *ethclient.Client, addr common.Address) ([]byte, error) {
+	code, err := client.CodeAt(ctx, addr, nil)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
-	c := &http.Client{Timeout: 30 * time.Second}
-	resp, err := c.Do(req)
-	if err != nil {
-		return "", "", err
+	if len(code) == 0 {
+		return nil, fmt.Errorf("no bytecode at %s", addr.Hex())
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-
-	var parsed etherscanResponse
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return "", "", fmt.Errorf("etherscan decode: %w", err)
-	}
-
-	if parsed.Status == "0" {
-		var errMsg string
-		_ = json.Unmarshal(parsed.Result, &errMsg)
-		return "", "", fmt.Errorf("%s", errMsg)
-	}
-
-	var results []etherscanSourceResult
-	if err := json.Unmarshal(parsed.Result, &results); err != nil {
-		return "", "", fmt.Errorf("etherscan result decode: %w", err)
-	}
-	if len(results) == 0 {
-		return "", "", fmt.Errorf("etherscan: no result for %s", addr.Hex())
-	}
-	
-	return results[0].SourceCode, results[0].ContractName, nil
-}
-
-func FetchVerifiedSource(ctx context.Context, client *ethclient.Client, addr common.Address) (string, string, error) {
-	src, name, err := fetchRawSource(ctx, addr)
-	
-	if err != nil && strings.Contains(err.Error(), "not verified") {
-		impl := ResolveImplementation(ctx, client, addr)
-		if impl != (common.Address{}) {
-			fmt.Printf("scanner[fix]: Attempting programmatic proxy linking for %s -> %s\n", addr.Hex(), impl.Hex())
-			linkErr := LinkProxyToImplementation(ctx, addr.Hex(), impl.Hex())
-			if linkErr == nil {
-				time.Sleep(5 * time.Second)
-				src, name, err = fetchRawSource(ctx, addr)
-			}
-		}
-	}
-
-	if err != nil {
-		return "", "", err
-	}
-	if src == "" || strings.Contains(src, "not verified") {
-		return "", "", fmt.Errorf("etherscan: source not verified for %s", addr.Hex())
-	}
-
-	// Rate limit sleep to respect Etherscan V2 (3 calls/sec)
-	time.Sleep(400 * time.Millisecond)
-
-	return UnwrapSource(src), name, nil
+	return code, nil
 }
 
 // =============================================================
@@ -276,7 +85,7 @@ func ExtractDependencies(ctx context.Context, client *ethclient.Client, source s
 		   strings.HasPrefix(lower, "0xaaa") || strings.HasPrefix(lower, "0x777") {
 			continue
 		}
-		if lower == "0x360894a13ba1a3210667c828492db98dca3e2076" {
+		if lower == "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc" {
 			continue
 		}
 
@@ -313,7 +122,6 @@ var regexRules = []regexRule{
 	{ID: "A6", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`get_dy\s*\(`)},
 	{ID: "A7", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`balanceOf\s*\(\s*address\s*\(\s*this\s*\)\s*\)`)},
 	
-	// Fixed C1 to ignore ** (exponentiation) and common library math
 	{ID: "C1", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`[/]\s*[\w()]+\s*\*\s*[^*/]`)},
 	{ID: "C2", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`\w+\s*/\s*\w+\s*\*\s*\w+`)},
 	{ID: "C3", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`div\s*\([^)]*\)\s*\.mul\s*\(`)},
@@ -360,7 +168,6 @@ func RunRegexScan(source string) []FlagReport {
 			}
 			flag.Suppressors = checkSuppressors(rule.ID, snippet)
 			
-			// Do not send known safe libraries to the LLM
 			isSafeLib := false
 			for _, s := range flag.Suppressors {
 				if s == "known_safe_library" {
