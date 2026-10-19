@@ -232,7 +232,7 @@ func scanTarget(
 	}
 
 	// Phase 1: Static Triage (Vandal + Regex)
-	vandalSummary, _ := RunVandal(ctx, target.Hex(), rpcURL)
+	vandalSummary, _ := RunVandal(ctx, target.Hex(), code) 
 	regexFlags := RunRegexScan(src)
 	
 	log.Printf("scanner[regex]: Triggered %d regex rules on %s", len(regexFlags), contractName)
