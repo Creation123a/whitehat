@@ -234,20 +234,38 @@ func scanTarget(
 		// Phase 2: Dynamic Anvil Validation
 	var exploitContext string
 	
-	// Example 1: Check if this looks like an oracle or manager
-	isOracle := strings.Contains(strings.ToLower(contractName), "oracle") || strings.Contains(strings.ToLower(contractName), "price")
-	if isOracle {
+		// Example 1: Check if this looks like an AMM pool or Oracle
+	isOracleOrPool := strings.Contains(strings.ToLower(contractName), "oracle") || 
+	                  strings.Contains(strings.ToLower(contractName), "price") ||
+	                  strings.Contains(strings.ToLower(contractName), "pool") ||
+	                  strings.Contains(strings.ToLower(contractName), "pair")
+	                  
+	if isOracleOrPool {
 		log.Printf("scanner[anvil]: Simulating flash loan distortion on %s", target.Hex())
-		// Example dummy slot for the simulation
-		dummySlot := common.HexToHash("0x0") 
-		exploiter.TestFlashLoanDistortion(ctx, target, dummySlot, big.NewInt(1000000000000000000))
-		exploitContext += "\nANVIL SIMULATION: Spot pool storage was artificially manipulated. No circuit breaker triggered.\n"
+		
+		msg, err := exploiter.TestFlashLoanDistortion(ctx, target)
+		if err == nil {
+			exploitContext += "\nANVIL SIMULATION: " + msg + " No circuit breaker triggered.\n"
+		}
 	}
 
-	// Example 2: Admin Bounds Check (if ABI reveals a setter and an owner)
-	// If it's vulnerable, it will append to the exploitContext.
-	// (Implement actual ABI packing logic here as needed per protocol)
-
+	// Example 2: ERC-4626 Inflation Attack (If contract looks like a vault)
+	isVault := strings.Contains(strings.ToLower(contractName), "vault") || 
+	           strings.Contains(strings.ToLower(contractName), "4626")
+	           
+	if isVault {
+		log.Printf("scanner[anvil]: Testing ERC-4626 inflation on %s", target.Hex())
+		// We use dummy addresses for the attacker and victim
+		attacker := common.HexToAddress("0x1111111111111111111111111111111111111111")
+		victim := common.HexToAddress("0x2222222222222222222222222222222222222222")
+		// Assuming target is the vault, and we pull the underlying asset from the ABI (dummy for now)
+		dummyAsset := common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913") // Default to USDC
+		
+		vulnerable, _ := exploiter.TestERC4626Inflation(ctx, target, dummyAsset, attacker, victim)
+		if vulnerable {
+			exploitContext += "\nANVIL SIMULATION: ERC-4626 First Depositor Inflation attack succeeded. Victim received 0 shares.\n"
+		}
+	}
 	// Phase 3: Segmented LLM Analytics
 	if combinedContext.Len() > 0 || exploitContext != "" {
 		fullPrompt := combinedContext.String() + exploitContext
