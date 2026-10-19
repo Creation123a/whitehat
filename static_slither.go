@@ -1,4 +1,4 @@
-//analysis.go
+//static_slither.go
 package main
 
 import (
