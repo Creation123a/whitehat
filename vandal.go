@@ -6,44 +6,44 @@ import (
 	"log"
 	"os"
 	"os/exec"
-
-	"github.com/ethereum/go-ethereum/common"
 )
 
-// RunVandal executes Vandal on the raw bytecode.
+// RunVandal executes Mythril (as a replacement for Vandal) on the raw bytecode.
+// The function name is kept as RunVandal to maintain compatibility with main.go.
 func RunVandal(ctx context.Context, contractAddr string, bytecode []byte) (string, error) {
-	log.Printf("scanner[static]: Running Vandal bytecode analysis on %s...", contractAddr)
+	log.Printf("scanner[static]: Running bytecode analysis (Mythril) on %s...", contractAddr)
 	
-	// 1. Write bytecode as a hex string to a temp file (Vandal expects hex, not raw binary)
-	tmpFile, err := os.CreateTemp("", "vandal-bytecode-*.hex")
+	// 1. Create a temp file for the raw runtime bytecode
+	// Mythril expects a binary file for --bin-runtime analysis
+	tmpFile, err := os.CreateTemp("", "mythril-bytecode-*.bin")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create temp file: %w", err)
 	}
 	defer os.Remove(tmpFile.Name())
 	
-	// Convert to hex string (without the 0x prefix)
-	hexStr := common.Bytes2Hex(bytecode)
-	if _, err := tmpFile.WriteString(hexStr); err != nil {
+	// Write the raw bytecode to the file
+	if _, err := tmpFile.Write(bytecode); err != nil {
 		tmpFile.Close()
-		return "", err
+		return "", fmt.Errorf("failed to write bytecode: %w", err)
 	}
 	tmpFile.Close()
 
-	// 2. Run Vandal on the bytecode file
-	cmd := exec.CommandContext(ctx, "vandal", "analyze", tmpFile.Name())
+	// 2. Run Mythril on the bytecode file
+	// --execution-timeout 10 limits analysis to 10 seconds to prevent pipeline hangs
+	cmd := exec.CommandContext(ctx, "myth", "analyze", "--bin-runtime", tmpFile.Name(), "--execution-timeout", "10")
 	out, err := cmd.CombinedOutput()
 	
 	if err != nil {
-		log.Printf("scanner[static]: Vandal execution failed: %v\nOutput: %s", err, string(out))
-		return "", fmt.Errorf("vandal execution failed: %w", err)
+		log.Printf("scanner[static]: Mythril execution failed or timed out: %v\nOutput: %s", err, string(out))
+		// We return an empty string and no error so the pipeline continues to the LLM phase
+		return "Mythril analysis failed or timed out.", nil
 	}
 
-	log.Printf("scanner[static]: Vandal completed. Parsing output...")
+	log.Printf("scanner[static]: Mythril completed. Parsing output...")
 	
-	// If Vandal found nothing, it might output a default string
 	outputStr := string(out)
 	if outputStr == "" || len(outputStr) < 10 {
-		return "Vandal found no obvious bytecode vulnerabilities.", nil
+		return "Mythril found no obvious bytecode vulnerabilities.", nil
 	}
 	
 	return outputStr, nil
