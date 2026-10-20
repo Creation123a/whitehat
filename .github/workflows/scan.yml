@@ -61,14 +61,16 @@ jobs:
         run: |
           pip install mythril
 
-      - name: Cache Cargo Dependencies (For Heimdall)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-          key: ${{ runner.os }}-cargo-heimdall
+      - name: Install Heimdall-rs (via Bifrost)
+        run: |
+          # 1. Install the Bifrost installer
+          curl -L http://get.heimdall.rs | bash
+          
+          # 2. Source the new path so the terminal can find bifrost
+          source $HOME/.profile
+          
+          # 3. Use Bifrost to install Heimdall
+          bifrost
 
       - name: Install Heimdall-rs
         run: |
