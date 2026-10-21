@@ -63,20 +63,29 @@ jobs:
 
       - name: Install Heimdall-rs (via Bifrost)
         run: |
-          # 1. Install the Bifrost installer
-          curl -L http://get.heimdall.rs | bash
-          
-          # 2. Source the new path so the terminal can find bifrost
-          source $HOME/.profile
-          
-          # 3. Use Bifrost to install Heimdall
+          # 1. Install the Bifrost version manager
+          curl -L https://raw.githubusercontent.com/Jon-Becker/heimdall-rs/main/bifrost/install | bash
+
+          # 2. Add the Bifrost binary directory to GitHub Actions PATH
+          echo "$HOME/.bifrost/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.bifrost/bin:$PATH"
+
+          # 3. Use Bifrost to compile and install Heimdall
           bifrost
 
-      - name: Install Heimdall-rs
-        run: |
-          if ! command -v heimdall &> /dev/null; then
-            cargo install heimdall-rs
+          # 4. Locate the compiled heimdall binary and add its directory to PATH
+          HEIMDALL_BIN_PATH=$(find "$HOME" -type f -name "heimdall" 2>/dev/null | head -n 1)
+          if [ -n "$HEIMDALL_BIN_PATH" ]; then
+            echo "Found Heimdall binary at: $HEIMDALL_BIN_PATH"
+            HEIMDALL_DIR=$(dirname "$HEIMDALL_BIN_PATH")
+            echo "$HEIMDALL_DIR" >> $GITHUB_PATH
+          else
+            echo "Error: Could not locate the heimdall binary."
+            exit 1
           fi
+
+          # 5. Verify installation
+          heimdall --version
 
       - name: Cache Ollama Models
         uses: actions/cache@v4
