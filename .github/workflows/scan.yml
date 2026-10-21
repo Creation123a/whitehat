@@ -40,7 +40,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120 # Increased from 60 to accommodate Mythril and Heimdall
 
     steps:
       - name: Checkout
@@ -57,6 +57,11 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Install System Dependencies for Mythril (Z3 Solver)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libz3-dev python3-dev
+
       - name: Install Mythril (Bytecode Analyzer)
         run: |
           pip install mythril
@@ -68,7 +73,8 @@ jobs:
           curl -L https://raw.githubusercontent.com/Jon-Becker/heimdall-rs/main/bifrost/install | bash
           echo "$HOME/.bifrost/bin" >> $GITHUB_PATH
           export PATH="$HOME/.bifrost/bin:$PATH"
-          bifrost
+          # Use --binary to download precompiled binary (much faster than compiling from source)
+          bifrost --binary
           HEIMDALL_BIN_PATH=$(find "$HOME" -type f -name "heimdall" 2>/dev/null | head -n 1)
           if [ -n "$HEIMDALL_BIN_PATH" ]; then
             echo "Found Heimdall binary at: $HEIMDALL_BIN_PATH"
