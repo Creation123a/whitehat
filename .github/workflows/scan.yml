@@ -63,17 +63,12 @@ jobs:
 
       - name: Install Heimdall-rs (via Bifrost)
         run: |
-          # 1. Install the Bifrost version manager
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
           curl -L https://raw.githubusercontent.com/Jon-Becker/heimdall-rs/main/bifrost/install | bash
-
-          # 2. Add the Bifrost binary directory to GitHub Actions PATH
           echo "$HOME/.bifrost/bin" >> $GITHUB_PATH
           export PATH="$HOME/.bifrost/bin:$PATH"
-
-          # 3. Use Bifrost to compile and install Heimdall
           bifrost
-
-          # 4. Locate the compiled heimdall binary and add its directory to PATH
           HEIMDALL_BIN_PATH=$(find "$HOME" -type f -name "heimdall" 2>/dev/null | head -n 1)
           if [ -n "$HEIMDALL_BIN_PATH" ]; then
             echo "Found Heimdall binary at: $HEIMDALL_BIN_PATH"
@@ -83,8 +78,6 @@ jobs:
             echo "Error: Could not locate the heimdall binary."
             exit 1
           fi
-
-          # 5. Verify installation
           heimdall --version
 
       - name: Cache Ollama Models
@@ -97,8 +90,7 @@ jobs:
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
           ollama serve &
-          # Wait for Ollama daemon to spin up
-          sleep 5
+          sleep 15
           ollama pull qwen2.5-coder:0.5b-instruct-q4_K_M
 
       - name: Install Foundry (Anvil)
