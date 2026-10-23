@@ -125,7 +125,6 @@ func run() int {
 	totalFlags := 0
 	scanned := 0
 
-	// Loop through all protocols
 	for _, proto := range protocols {
 		addrs := BaseProtocolRegistry[proto.Slug]
 		if len(addrs) == 0 {
@@ -206,14 +205,27 @@ func scanTarget(
 		log.Printf("scanner[source]: No bytecode at %s", target.Hex())
 		return false
 	}
-	
-	// Step 3: Bytecode Pre-Filter
-	if isStandardToken(code) {
-		log.Printf("scanner[filter]: %s is a standard ERC-20/721. Skipping.", target.Hex())
-		return false 
+
+	// Step 3: Discover Linked Contracts (Pools, Oracles, Comptrollers)
+	linkedContracts := DiscoverLinkedContracts(ctx, client, target, code)
+	if len(linkedContracts) > 0 {
+		for _, linked := range linkedContracts {
+			scanTarget(ctx, client, rpcClient, rpcURL, exploiter, proto, linked, visited, flags, totalFlags)
+		}
 	}
 
-	// Step 4: Decompile with Heimdall
+	// Step 4: Bytecode Pre-Filter
+	// If it's a standard token, AND we didn't find any linked contracts, skip it.
+	if isStandardToken(code) {
+		if len(linkedContracts) == 0 {
+			log.Printf("scanner[filter]: %s is a standard ERC-20/721 with no linked pools. Skipping.", target.Hex())
+			return false
+		}
+		log.Printf("scanner[filter]: %s is a standard token, but we found linked pools. Skipping token logic, analyzing pools.", target.Hex())
+		return true // We scanned the linked pools recursively, so the protocol was handled.
+	}
+
+	// Step 5: Decompile with Heimdall
 	log.Printf("scanner[heimdall]: Decompiling %s via RPC...", target.Hex())
 	decompiledSrc, err := DecompileWithHeimdall(ctx, target.Hex(), rpcURL)
 	if err != nil {
@@ -223,11 +235,13 @@ func scanTarget(
 	src := decompiledSrc
 	contractName := "DecompiledContract"
 
-	// Step 5: Dynamic Dependency Traversal
+	// Step 6: Extract Dependencies from Source
 	dependencies := ExtractDependencies(ctx, client, src, target)
 	for _, dep := range dependencies {
-		log.Printf("scanner[state]: Discovered dependency %s", dep.Hex())
-		scanTarget(ctx, client, rpcClient, rpcURL, exploiter, proto, dep, visited, flags, totalFlags)
+		if !visited[dep] {
+			log.Printf("scanner[state]: Discovered dependency in source %s", dep.Hex())
+			scanTarget(ctx, client, rpcClient, rpcURL, exploiter, proto, dep, visited, flags, totalFlags)
+		}
 	}
 
 	// Phase 1: Static Triage (Regex only)
@@ -243,7 +257,6 @@ func scanTarget(
 	// Phase 2: Dynamic Anvil Validation
 	var exploitContext string
 
-	// 1. Flash Loan AMM Distortion
 	log.Printf("scanner[anvil]: Testing Flash Loan distortion on %s...", target.Hex())
 	msg, err := exploiter.TestFlashLoanDistortion(ctx, target)
 	if err == nil {
@@ -253,7 +266,6 @@ func scanTarget(
 		log.Printf("scanner[anvil]: Simulation skipped/failed: %v", err)
 	}
 
-	// 2. ERC-4626 Inflation Attack
 	log.Printf("scanner[anvil]: Testing ERC-4626 inflation on %s...", target.Hex())
 	attacker := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	victim := common.HexToAddress("0x2222222222222222222222222222222222222222")
@@ -304,19 +316,16 @@ func isStandardToken(code []byte) bool {
 	hasTransfer := strings.Contains(hexCode, "a9059cbb")
 	hasApprove := strings.Contains(hexCode, "095ea7b3")
 	
-	// Check for AMM Math
-	hasAmmMath := strings.Contains(hexCode, "3850c7bd") || // slot0
-			      strings.Contains(hexCode, "0902f1ac") || // getReserves
-			      strings.Contains(hexCode, "bb7b8b80")    // get_virtual_price
+	hasAmmMath := strings.Contains(hexCode, "3850c7bd") || 
+			      strings.Contains(hexCode, "0902f1ac") || 
+			      strings.Contains(hexCode, "bb7b8b80")
 
-	// Check for Lending/Oracle Math
-	hasLendingMath := strings.Contains(hexCode, "b3596f07") || // getAssetPrice (Aave)
-			          strings.Contains(hexCode, "fc57d4df") || // getUnderlyingPrice (Compound/Sonne)
-			          strings.Contains(hexCode, "8a889156") || // latestRoundData (Chainlink)
-			          strings.Contains(hexCode, "50d25bcd") || // latestAnswer
-			          strings.Contains(hexCode, "a035b1fe")    // price() (Morpho)
+	hasLendingMath := strings.Contains(hexCode, "b3596f07") || 
+			          strings.Contains(hexCode, "fc57d4df") || 
+			          strings.Contains(hexCode, "8a889156") || 
+			          strings.Contains(hexCode, "50d25bcd") || 
+			          strings.Contains(hexCode, "a035b1fe")
 
-	// If it has transfer and approve but NO amm math and NO lending math, it's just a token.
 	return hasTransfer && hasApprove && !hasAmmMath && !hasLendingMath
 }
 
