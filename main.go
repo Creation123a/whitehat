@@ -230,16 +230,11 @@ func scanTarget(
 		scanTarget(ctx, client, rpcClient, rpcURL, exploiter, proto, dep, visited, flags, totalFlags)
 	}
 
-	// Phase 1: Static Triage (Vandal + Regex)
-	vandalSummary, _ := RunVandal(ctx, target.Hex(), code) 
+	// Phase 1: Static Triage (Regex only)
 	regexFlags := RunRegexScan(src)
-	
 	log.Printf("scanner[regex]: Triggered %d regex rules on %s", len(regexFlags), contractName)
 
 	var combinedContext strings.Builder
-	if vandalSummary != "" {
-		combinedContext.WriteString("VANDAL BYTECODE ANALYZER FINDINGS:\n" + vandalSummary + "\n")
-	}
 	for _, f := range regexFlags {
 		log.Printf("scanner[regex]: FLAG [%s] on line %d", f.RuleID, f.LineStart)
 		combinedContext.WriteString(fmt.Sprintf("REGEX FINDING (%s):\n%s\n", f.RuleID, f.Snippet))
@@ -248,7 +243,7 @@ func scanTarget(
 	// Phase 2: Dynamic Anvil Validation
 	var exploitContext string
 
-	// 1. Always try the Flash Loan AMM Distortion (fails safely if not an AMM)
+	// 1. Flash Loan AMM Distortion
 	log.Printf("scanner[anvil]: Testing Flash Loan distortion on %s...", target.Hex())
 	msg, err := exploiter.TestFlashLoanDistortion(ctx, target)
 	if err == nil {
@@ -258,13 +253,12 @@ func scanTarget(
 		log.Printf("scanner[anvil]: Simulation skipped/failed: %v", err)
 	}
 
-	// 2. Always try the ERC-4626 Inflation Attack (fails safely if not a vault)
+	// 2. ERC-4626 Inflation Attack
 	log.Printf("scanner[anvil]: Testing ERC-4626 inflation on %s...", target.Hex())
 	attacker := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	victim := common.HexToAddress("0x2222222222222222222222222222222222222222")
-	dummyAsset := common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
 	
-	vulnerable, err := exploiter.TestERC4626Inflation(ctx, target, dummyAsset, attacker, victim)
+	vulnerable, err := exploiter.TestERC4626Inflation(ctx, target, attacker, victim)
 	if err == nil && vulnerable {
 		log.Printf("scanner[anvil]: VULNERABLE! Victim received 0 shares.")
 		exploitContext += "\nANVIL SIMULATION: ERC-4626 First Depositor Inflation attack succeeded. Victim received 0 shares.\n"
