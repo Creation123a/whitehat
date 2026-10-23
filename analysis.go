@@ -103,28 +103,37 @@ type regexRule struct {
 
 
 var regexRules = []regexRule{
-	{ID: "A1", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`getReserves\s*\(`)},
-	{ID: "A2", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`slot0\s*\(\)`)},
-	{ID: "A3", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`sqrtPriceX96`)},
-	{ID: "A4", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`latestAnswer\s*\(`)},
-	{ID: "A5", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`get_virtual_price\s*\(`)},
-	{ID: "A6", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`get_dy\s*\(`)},
-	{ID: "A7", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`balanceOf\s*\(\s*address\s*\(\s*this\s*\)\s*\)`)},
+	// --- 1. Decompiled Spot Price Reads (Critical) ---
+	{ID: "A1", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`Unresolved_0902f1ac`)}, // getReserves()
+	{ID: "A2", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`Unresolved_3850c7bd`)}, // slot0()
+	{ID: "A4", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`Unresolved_feaf968c`)}, // latestRoundData()
+	{ID: "A5", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`Unresolved_50d25bcd`)}, // latestAnswer()
+	{ID: "A6", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`Unresolved_bb7b8b80`)}, // get_virtual_price()
+
+	// --- 2. Precision Loss / Division Before Multiplication (High) ---
+	// Matches: (var_a / var_b) * var_c  OR  (storage_0 / var_a) * 0x0de0b6b3a7640000
+	// This is the classic precision loss pattern. In decompiled code, division truncates, 
+	// so multiplying afterwards loses value[reference:1].
+	{ID: "C1", Category: "precision", Severity: "high", Pattern: regexp.MustCompile(`\(\s*[\w\[\]\.]+\s*/\s*[\w\[\]\.]+\s*\)\s*\*`)},
 	
-	{ID: "C1", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`[/]\s*[\w()]+\s*\*\s*[^*/]`)},
-	{ID: "C2", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`\w+\s*/\s*\w+\s*\*\s*\w+`)},
-	{ID: "C3", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`div\s*\([^)]*\)\s*\.mul\s*\(`)},
-	
-	{ID: "D1", Category: "stale-oracle", Severity: "medium", Pattern: regexp.MustCompile(`latestRoundData\s*\(`)},
-	{ID: "D2", Category: "stale-oracle", Severity: "medium", Pattern: regexp.MustCompile(`latestAnswer\s*\(`)},
-	
-	{ID: "E1", Category: "decimal-mismatch", Severity: "medium", Pattern: regexp.MustCompile(`/\s*1e8`)},
-	{ID: "E2", Category: "decimal-mismatch", Severity: "medium", Pattern: regexp.MustCompile(`uint256\(price\)\s*\*\s*1e10`)},
-	
-	{ID: "F1", Category: "reentrancy", Severity: "critical", Pattern: regexp.MustCompile(`get_virtual_price\s*\(`)},
-	{ID: "F2", Category: "reentrancy", Severity: "critical", Pattern: regexp.MustCompile(`getReserves\s*\(`)},
-	
-	{ID: "I1", Category: "lp-valuation", Severity: "high", Pattern: regexp.MustCompile(`getReserves\s*\(\)[\s\S]{0,200}totalSupply\s*\(\)`)},
+	// Matches: var_a / var_b * var_c (left-to-right evaluation)
+	{ID: "C2", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`[\w\[\]\.]+\s*/\s*[\w\[\]\.]+\s*\*\s*[\w\[\]\.]+`)},
+
+	// --- 3. Arithmetic Overflow / SafeMath Bypass (High) ---
+	// In decompiled code, SafeMath is usually resolved as Unresolved_..., but raw math 
+	// appears as standard operators. A raw multiplication of two variables is a huge red flag.
+	// Matches: var_a * var_b  OR  storage_0 * var_a
+	{ID: "O1", Category: "overflow", Severity: "high", Pattern: regexp.MustCompile(`(var_\w+|storage_\w+)\s*\*\s*(var_\w+|storage_\w+)`)},
+
+	// Matches: var_a + var_b (raw addition, potential overflow if not checked)[reference:2]
+	{ID: "O2", Category: "overflow", Severity: "medium", Pattern: regexp.MustCompile(`(var_\w+|storage_\w+)\s*\+\s*(var_\w+|storage_\w+)`)},
+
+	// --- 4. Rounding Errors (Medium) ---
+	// Matches multiplication by 1e18 followed by division. This usually *loses* precision 
+	// if the order is wrong, or implies a missing scale factor.
+	// 0x0de0b6b3a7640000 is 1e18.
+	{ID: "R1", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`0x0de0b6b3a7640000\s*/\s*[\w\[\]\.]+`)},
+	{ID: "R2", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`/\s*0x0de0b6b3a7640000\s*\*`)},
 }
 
 func RunRegexScan(source string) []FlagReport {
