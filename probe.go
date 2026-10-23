@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -13,7 +14,7 @@ import (
 
 const (
 	OllamaAPIBase = "http://localhost:11434/api/chat"
-	OllamaModel   = "qwen2.5-coder:0.5b-instruct-q4_K_M"
+	OllamaModel   = "qwen2.5-coder:3b" // Upgraded model
 )
 
 type ollamaRequest struct {
@@ -65,16 +66,21 @@ Only flag as VULNERABLE if the exploit path is:
 4. Balance-of-self accounting without virtual shares
 5. Missing math bounds in admin setters
 
-If the code is a standard math utility or safe decompiled logic, respond with:
-VERDICT: SAFE
-TYPE: none
-LOCATION: none
-REASON: standard audited math library or safe decompiled logic
+Respond in EXACTLY this format:
+VERDICT: <VULNERABLE|SAFE>
+TYPE: <vulnerability type>
+LOCATION: <line number or code fragment>
+REASON: <one sentence>
 
 Analyze: `
 
 // AskLocalLLM sends a snippet to the local Ollama instance.
 func AskLocalLLM(ctx context.Context, snippet, contractName, contractRole string) (string, error) {
+	// 3B model can handle a bit more context, but still needs truncation to prevent timeouts
+	if len(snippet) > 8000 {
+		snippet = snippet[:8000] + "\n... [TRUNCATED FOR LLM CONTEXT LIMIT] ..."
+	}
+
 	sysPrompt := fmt.Sprintf(systemPromptTemplate, contractRole, contractName)
 
 	reqBody := ollamaRequest{
@@ -85,7 +91,7 @@ func AskLocalLLM(ctx context.Context, snippet, contractName, contractRole string
 		},
 		Stream: false,
 		Options: ollamaOptions{
-			Temperature: 0,
+			Temperature: 0.1, // Slight temp to avoid repetitive loops on 3B
 		},
 	}
 
@@ -96,10 +102,11 @@ func AskLocalLLM(ctx context.Context, snippet, contractName, contractRole string
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	c := &http.Client{Timeout: 120 * time.Second} // Local generation can take a moment
+	// Increased timeout to 5 minutes for the 3B model
+	c := &http.Client{Timeout: 300 * time.Second} 
 	resp, err := c.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("ollama connection failed (is it running?): %w", err)
+		return "", fmt.Errorf("ollama connection failed: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
@@ -109,19 +116,22 @@ func AskLocalLLM(ctx context.Context, snippet, contractName, contractRole string
 		return "", fmt.Errorf("ollama decode: %w", err)
 	}
 
-	return strings.TrimSpace(parsed.Message.Content), nil
+	// Print raw output for debugging
+	rawText := strings.TrimSpace(parsed.Message.Content)
+	log.Printf("scanner[llm]: RAW LLM OUTPUT: %s", strings.ReplaceAll(rawText, "\n", " "))
+
+	return rawText, nil
 }
 
+// ParseVerdict extracts VULNERABLE / SAFE from the LLM response.
 func ParseVerdict(response string) string {
 	upper := strings.ToUpper(response)
-	if idx := strings.Index(upper, "VERDICT:"); idx >= 0 {
-		rest := strings.TrimSpace(upper[idx+len("VERDICT:"):])
-		if strings.HasPrefix(rest, "VULNERABLE") {
-			return "VULNERABLE"
-		}
-		if strings.HasPrefix(rest, "SAFE") {
-			return "SAFE"
-		}
+
+	if strings.Contains(upper, "VULNERABLE") {
+		return "VULNERABLE"
+	}
+	if strings.Contains(upper, "SAFE") {
+		return "SAFE"
 	}
 	return "UNKNOWN"
 }
