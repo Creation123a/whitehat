@@ -206,11 +206,8 @@ func scanTarget(
 		return false
 	}
 
-		// Step 3: Discover Linked Contracts (Pools, Oracles, Comptrollers)
-	// First, extract all selectors and resolve their names via 4byte.directory
+	// Step 3: Discover Linked Contracts (Pools, Oracles, Comptrollers)
 	selectorMap := GetSelectorMap(ctx, code)
-	
-	// Then, use the dynamic map to find linked addresses
 	linkedContracts := DiscoverLinkedContracts(ctx, client, target, selectorMap)
 	if len(linkedContracts) > 0 {
 		for _, linked := range linkedContracts {
@@ -219,14 +216,13 @@ func scanTarget(
 	}
 
 	// Step 4: Bytecode Pre-Filter
-	// If it's a standard token, AND we didn't find any linked contracts, skip it.
 	if isStandardToken(code) {
 		if len(linkedContracts) == 0 {
 			log.Printf("scanner[filter]: %s is a standard ERC-20/721 with no linked pools. Skipping.", target.Hex())
 			return false
 		}
 		log.Printf("scanner[filter]: %s is a standard token, but we found linked pools. Skipping token logic, analyzing pools.", target.Hex())
-		return true // We scanned the linked pools recursively, so the protocol was handled.
+		return true
 	}
 
 	// Step 5: Decompile with Heimdall
@@ -248,19 +244,14 @@ func scanTarget(
 		}
 	}
 
-	// Phase 1: Static Triage (Regex only)
+	// Step 7: Static Triage (Regex & Mixed-Source)
 	regexFlags := RunRegexScan(src)
 	log.Printf("scanner[regex]: Triggered %d regex rules on %s", len(regexFlags), contractName)
 
-	var combinedContext strings.Builder
-	for _, f := range regexFlags {
-		log.Printf("scanner[regex]: FLAG [%s] on line %d", f.RuleID, f.LineStart)
-		combinedContext.WriteString(fmt.Sprintf("REGEX FINDING (%s):\n%s\n", f.RuleID, f.Snippet))
-	}
-
-	// Phase 2: Dynamic Anvil Validation
+	// Step 8: Dynamic Anvil Validation
 	var exploitContext string
 
+	// 8.1 Flash Loan AMM Distortion
 	log.Printf("scanner[anvil]: Testing Flash Loan distortion on %s...", target.Hex())
 	msg, err := exploiter.TestFlashLoanDistortion(ctx, target)
 	if err == nil {
@@ -270,6 +261,7 @@ func scanTarget(
 		log.Printf("scanner[anvil]: Simulation skipped/failed: %v", err)
 	}
 
+	// 8.2 ERC-4626 Inflation
 	log.Printf("scanner[anvil]: Testing ERC-4626 inflation on %s...", target.Hex())
 	attacker := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	victim := common.HexToAddress("0x2222222222222222222222222222222222222222")
@@ -282,19 +274,64 @@ func scanTarget(
 		log.Printf("scanner[anvil]: SAFE. Inflation attack failed or not a valid 4626 vault.")
 	}
 
-	// Phase 3: Segmented LLM Analytics
-	if combinedContext.Len() > 0 || exploitContext != "" {
-		fullPrompt := combinedContext.String() + exploitContext
-		log.Printf("scanner[llm]: Sending %d bytes of context to Qwen...", len(fullPrompt))
+	// 8.3 Liquidation Simulation
+	// Find a linked oracle from the discovered linked contracts
+	var oracleAddr common.Address
+	for _, linked := range linkedContracts {
+		linkedCode, _ := client.CodeAt(ctx, linked, nil)
+		hexLinked := common.Bytes2Hex(linkedCode)
+		if strings.Contains(hexLinked, "50d25bcd") || strings.Contains(hexLinked, "feaf968c") {
+			oracleAddr = linked
+			break
+		}
+	}
+	
+	if oracleAddr != (common.Address{}) {
+		log.Printf("scanner[anvil]: Testing liquidation simulation on %s using oracle %s...", target.Hex(), oracleAddr.Hex())
+		liqVulnerable, err := exploiter.TestLiquidationSimulation(ctx, target, oracleAddr, victim)
+		if err == nil && liqVulnerable {
+			log.Printf("scanner[anvil]: VULNERABLE! Liquidation succeeded after price crash.")
+			exploitContext += "\nANVIL SIMULATION: Liquidation succeeded after a 90% oracle price crash.\n"
+		}
+	}
+
+	// Step 9: Segmented LLM Analytics (Chunking & Domain Prompts)
+	chunks := ChunkByFunction(src)
+	log.Printf("scanner[chunk]: Split contract into %d function chunks", len(chunks))
+
+	for i, chunk := range chunks {
+		domain := ClassifyChunk(chunk)
+		log.Printf("scanner[chunk]: Chunk %d classified as [%s]", i+1, domain)
 		
-		verdict, err := AskLocalLLM(ctx, fullPrompt, contractName, "Target Contract")
+		// Only send chunks that have potential math or oracle logic to the LLM
+		if domain == "general" && !strings.Contains(chunk, "Unresolved_") {
+			continue 
+		}
+
+		fullPrompt := chunk
+		// Append any regex flags that fall within this chunk for extra context
+		for _, f := range regexFlags {
+			if strings.Contains(chunk, f.Snippet) {
+				fullPrompt = fmt.Sprintf("REGEX FINDING (%s):\n%s\n\n%s", f.RuleID, f.Snippet, chunk)
+				break
+			}
+		}
+		
+		// Append Anvil context if relevant to this chunk
+		if exploitContext != "" && (domain == "lending" || domain == "oracle") {
+			fullPrompt += "\n\n" + exploitContext
+		}
+
+		log.Printf("scanner[llm]: Sending chunk %d (%d bytes) to Qwen...", i+1, len(fullPrompt))
+		
+		verdict, err := AskLocalLLM(ctx, fullPrompt, contractName, "Target Contract", domain)
 		if err == nil {
 			parsedVerdict := ParseVerdict(verdict)
 			log.Printf("scanner[llm]: Qwen Verdict -> %s", parsedVerdict)
 			
 			flag := FlagReport{
 				RuleID:          "DYNAMIC_TRACE",
-				Category:        "combined",
+				Category:        domain,
 				Severity:        "high",
 				Snippet:         fullPrompt,
 				LLMVerdict:      verdict,
