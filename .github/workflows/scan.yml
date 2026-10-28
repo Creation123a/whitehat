@@ -35,12 +35,12 @@ on:
       timeout:
         description: 'Pipeline timeout (e.g. 30m, 1h)'
         required: true
-        default: '45m'
+        default: '150m'
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
