@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -158,6 +159,57 @@ func ClassifyChunk(chunk string) string {
 }
 
 // =============================================================
+// Mixed Source & Per-Coin Taint Check
+// =============================================================
+
+// RunMixedSourceAnalysis checks each function chunk for the co-occurrence of
+// Chainlink and Spot AMM reads, and extracts the specific addresses involved.
+func RunMixedSourceAnalysis(source string) []FlagReport {
+	var flags []FlagReport
+	chunks := ChunkByFunction(source)
+
+	for _, chunk := range chunks {
+		// 1. Check for presence of selectors in this specific function
+		hasSpot := strings.Contains(chunk, "Unresolved_0902f1ac") || strings.Contains(chunk, "Unresolved_3850c7bd")
+		hasChainlink := strings.Contains(chunk, "Unresolved_feaf968c") || strings.Contains(chunk, "Unresolved_50d25bcd")
+		
+		if hasSpot && hasChainlink {
+			// 2. Extract all addresses referenced in this chunk
+			addresses := addressRegex.FindAllString(chunk, -1)
+			
+			// Deduplicate addresses
+			uniqueAddrs := make(map[string]bool)
+			var addrList []string
+			for _, addr := range addresses {
+				lower := strings.ToLower(addr)
+				// Skip common masks and the EIP-1967 slot
+				if strings.HasPrefix(lower, "0x000") || strings.HasPrefix(lower, "0xfff") || 
+				   strings.HasPrefix(lower, "0xaaa") || strings.HasPrefix(lower, "0x777") ||
+				   lower == "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc" {
+					continue
+				}
+				if !uniqueAddrs[lower] {
+					uniqueAddrs[lower] = true
+					addrList = append(addrList, addr)
+				}
+			}
+
+			// 3. Flag the function
+			snippet := fmt.Sprintf("CRITICAL: Function uses BOTH Spot AMM and Chainlink. Addresses referenced: %s", strings.Join(addrList, ", "))
+			flags = append(flags, FlagReport{
+				RuleID:    "MIXED_SOURCE_CHUNK",
+				Category:  "critical",
+				Severity:  "critical",
+				Snippet:   snippet + "\n\n" + chunk,
+				LineStart: 0,
+				LineEnd:   0,
+			})
+		}
+	}
+	return flags
+}
+
+// =============================================================
 // Regex Rules & Scanning
 // =============================================================
 
@@ -186,26 +238,11 @@ var regexRules = []regexRule{
 }
 
 func RunRegexScan(source string) []FlagReport {
-	var flags []FlagReport
+	// 1. Run the per-function mixed source check first
+	flags := RunMixedSourceAnalysis(source)
+
+	// 2. Run standard regex rules
 	lines := strings.Split(source, "\n")
-
-	// --- MIXED SOURCE DETECTION (Pre-scan) ---
-	hasSpot := strings.Contains(source, "Unresolved_0902f1ac") || strings.Contains(source, "Unresolved_3850c7bd")
-	hasChainlink := strings.Contains(source, "Unresolved_feaf968c") || strings.Contains(source, "Unresolved_50d25bcd")
-	
-	if hasSpot && hasChainlink {
-		flags = append(flags, FlagReport{
-			RuleID:    "MIXED_SOURCE",
-			Category:  "critical",
-			Severity:  "critical",
-			Snippet:   "CRITICAL: Contract uses BOTH an external oracle (Chainlink) AND a spot AMM price. This is the exact setup for a mixed-source manipulation attack (e.g., Moonwell MAMO exploit).",
-			LineStart: 0, 
-			LineEnd:   0,
-			Suppressors: []string{"mixed_source_detected"},
-		})
-	}
-
-	// --- STANDARD REGEX SCAN ---
 	for _, rule := range regexRules {
 		locs := rule.Pattern.FindAllStringIndex(source, -1)
 		for _, loc := range locs {
