@@ -206,8 +206,12 @@ func scanTarget(
 		return false
 	}
 
-	// Step 3: Discover Linked Contracts (Pools, Oracles, Comptrollers)
-	linkedContracts := DiscoverLinkedContracts(ctx, client, target, code)
+		// Step 3: Discover Linked Contracts (Pools, Oracles, Comptrollers)
+	// First, extract all selectors and resolve their names via 4byte.directory
+	selectorMap := GetSelectorMap(ctx, code)
+	
+	// Then, use the dynamic map to find linked addresses
+	linkedContracts := DiscoverLinkedContracts(ctx, client, target, selectorMap)
 	if len(linkedContracts) > 0 {
 		for _, linked := range linkedContracts {
 			scanTarget(ctx, client, rpcClient, rpcURL, exploiter, proto, linked, visited, flags, totalFlags)
