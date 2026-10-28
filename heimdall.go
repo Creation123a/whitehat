@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 )
 
 // DecompileWithHeimdall runs the Heimdall-rs binary to decompile a contract's
@@ -22,23 +23,34 @@ func DecompileWithHeimdall(ctx context.Context, address string, rpcURL string) (
 
 	log.Printf("scanner[heimdall]: Decompiling unverified contract %s... (This may take a few seconds)", address)
 
-	// 2. Build the Heimdall command
+	// 2. Enforce a strict 120-second timeout specifically for Heimdall
+	// This prevents a single massive contract from stalling the entire pipeline.
+	heimdallCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	// 3. Build the Heimdall command
 	// -r: RPC URL to fetch bytecode
 	// --include-sol: Output pseudo-Solidity code
 	// --skip-resolving: Skip online 4byte database lookups (much faster)
 	// -o: Output directory
-	cmd := exec.CommandContext(ctx, "heimdall", "decompile", address, "-r", rpcURL, "--include-sol", "--skip-resolving", "-o", tmpDir)
+	cmd := exec.CommandContext(heimdallCtx, "heimdall", "decompile", address, "-r", rpcURL, "--include-sol", "--skip-resolving", "-o", tmpDir)
 
-	// 3. Execute and capture both stdout and stderr for comprehensive logging
+	// 4. Execute and capture both stdout and stderr for comprehensive logging
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		// Check if the error was specifically caused by our 120s timeout
+		if heimdallCtx.Err() == context.DeadlineExceeded {
+			log.Printf("scanner[heimdall]: Execution timed out after 120s for %s", address)
+			return "", fmt.Errorf("decompile_timeout")
+		}
+		
 		log.Printf("scanner[heimdall]: Execution failed: %v\nRaw Output: %s", err, string(output))
 		return "", fmt.Errorf("heimdall decompile failed: %w", err)
 	}
 
 	log.Printf("scanner[heimdall]: Decompilation engine finished. Parsing output...")
 
-	// 4. Locate the generated decompiled.sol file
+	// 5. Locate the generated decompiled.sol file
 	solPath := filepath.Join(tmpDir, "decompiled.sol")
 	solBytes, err := os.ReadFile(solPath)
 	
