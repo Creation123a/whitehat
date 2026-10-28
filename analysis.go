@@ -58,7 +58,7 @@ func FetchBytecode(ctx context.Context, client *ethclient.Client, addr common.Ad
 }
 
 // =============================================================
-// Dependency Extraction & Regex
+// Dependency Extraction
 // =============================================================
 
 var addressRegex = regexp.MustCompile(`0x[a-fA-F0-9]{40}`)
@@ -94,13 +94,79 @@ func ExtractDependencies(ctx context.Context, client *ethclient.Client, source s
 	return out
 }
 
+// =============================================================
+// Chunking & Classification
+// =============================================================
+
+var functionBoundaryRegex = regexp.MustCompile(`function\s+Unresolved_[a-zA-Z0-9]+`)
+
+// ChunkByFunction splits the decompiled source into individual function chunks
+// based on the `function Unresolved_...` boundaries that Heimdall outputs.
+func ChunkByFunction(source string) []string {
+	indices := functionBoundaryRegex.FindAllStringIndex(source, -1)
+	if len(indices) == 0 {
+		return []string{source}
+	}
+
+	var chunks []string
+	for i := 0; i < len(indices); i++ {
+		start := indices[i][0]
+		end := len(source)
+		if i < len(indices)-1 {
+			end = indices[i+1][0]
+		}
+		chunks = append(chunks, source[start:end])
+	}
+	return chunks
+}
+
+// ClassifyChunk determines the primary domain of a function chunk
+// by counting keyword occurrences.
+func ClassifyChunk(chunk string) string {
+	lower := strings.ToLower(chunk)
+	
+	counts := map[string]int{
+		"pricing": 0,
+		"oracle":  0,
+		"lending": 0,
+		"staking": 0,
+	}
+
+	for _, kw := range []string{"mul", "div", "add", "sub", "0x0de0b6b3a7640000"} {
+		counts["pricing"] += strings.Count(lower, kw)
+	}
+	for _, kw := range []string{"oracle", "latestrounddata", "latestanswer", "slot0", "getreserves"} {
+		counts["oracle"] += strings.Count(lower, kw)
+	}
+	for _, kw := range []string{"borrow", "repay", "liquidate", "collateral", "debt", "supply"} {
+		counts["lending"] += strings.Count(lower, kw)
+	}
+	for _, kw := range []string{"stake", "unstake", "reward", "earned"} {
+		counts["staking"] += strings.Count(lower, kw)
+	}
+
+	maxDomain := "general"
+	maxCount := 0
+	for domain, count := range counts {
+		if count > maxCount {
+			maxCount = count
+			maxDomain = domain
+		}
+	}
+	
+	return maxDomain
+}
+
+// =============================================================
+// Regex Rules & Scanning
+// =============================================================
+
 type regexRule struct {
 	ID       string
 	Category string
 	Severity string
 	Pattern  *regexp.Regexp
 }
-
 
 var regexRules = []regexRule{
 	// --- 1. Decompiled Spot Price Reads (Critical) ---
@@ -111,46 +177,46 @@ var regexRules = []regexRule{
 	{ID: "A6", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`Unresolved_bb7b8b80`)}, // get_virtual_price()
 
 	// --- 2. Precision Loss / Division Before Multiplication (High) ---
-	// Matches: (var_a / var_b) * var_c  OR  (storage_0 / var_a) * 0x0de0b6b3a7640000
-	// This is the classic precision loss pattern. In decompiled code, division truncates, 
-	// so multiplying afterwards loses value[reference:1].
+	// Strictly matches: (var_a / var_b) * var_c
 	{ID: "C1", Category: "precision", Severity: "high", Pattern: regexp.MustCompile(`\(\s*[\w\[\]\.]+\s*/\s*[\w\[\]\.]+\s*\)\s*\*`)},
-	
-	// Matches: var_a / var_b * var_c (left-to-right evaluation)
-	{ID: "C2", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`[\w\[\]\.]+\s*/\s*[\w\[\]\.]+\s*\*\s*[\w\[\]\.]+`)},
 
 	// --- 3. Arithmetic Overflow / SafeMath Bypass (High) ---
-	// In decompiled code, SafeMath is usually resolved as Unresolved_..., but raw math 
-	// appears as standard operators. A raw multiplication of two variables is a huge red flag.
-	// Matches: var_a * var_b  OR  storage_0 * var_a
+	// Strictly matches: var_a * var_b (raw multiplication without SafeMath)
 	{ID: "O1", Category: "overflow", Severity: "high", Pattern: regexp.MustCompile(`(var_\w+|storage_\w+)\s*\*\s*(var_\w+|storage_\w+)`)},
-
-	// Matches: var_a + var_b (raw addition, potential overflow if not checked)[reference:2]
-	{ID: "O2", Category: "overflow", Severity: "medium", Pattern: regexp.MustCompile(`(var_\w+|storage_\w+)\s*\+\s*(var_\w+|storage_\w+)`)},
-
-	// --- 4. Rounding Errors (Medium) ---
-	// Matches multiplication by 1e18 followed by division. This usually *loses* precision 
-	// if the order is wrong, or implies a missing scale factor.
-	// 0x0de0b6b3a7640000 is 1e18.
-	{ID: "R1", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`0x0de0b6b3a7640000\s*/\s*[\w\[\]\.]+`)},
-	{ID: "R2", Category: "precision", Severity: "medium", Pattern: regexp.MustCompile(`/\s*0x0de0b6b3a7640000\s*\*`)},
 }
 
 func RunRegexScan(source string) []FlagReport {
 	var flags []FlagReport
 	lines := strings.Split(source, "\n")
 
+	// --- MIXED SOURCE DETECTION (Pre-scan) ---
+	hasSpot := strings.Contains(source, "Unresolved_0902f1ac") || strings.Contains(source, "Unresolved_3850c7bd")
+	hasChainlink := strings.Contains(source, "Unresolved_feaf968c") || strings.Contains(source, "Unresolved_50d25bcd")
+	
+	if hasSpot && hasChainlink {
+		flags = append(flags, FlagReport{
+			RuleID:    "MIXED_SOURCE",
+			Category:  "critical",
+			Severity:  "critical",
+			Snippet:   "CRITICAL: Contract uses BOTH an external oracle (Chainlink) AND a spot AMM price. This is the exact setup for a mixed-source manipulation attack (e.g., Moonwell MAMO exploit).",
+			LineStart: 0, 
+			LineEnd:   0,
+			Suppressors: []string{"mixed_source_detected"},
+		})
+	}
+
+	// --- STANDARD REGEX SCAN ---
 	for _, rule := range regexRules {
 		locs := rule.Pattern.FindAllStringIndex(source, -1)
 		for _, loc := range locs {
 			lineStart := strings.Count(source[:loc[0]], "\n")
 			lineEnd := strings.Count(source[:loc[1]], "\n")
 
-			ctxStart := lineStart - 10
+			ctxStart := lineStart - 5
 			if ctxStart < 0 {
 				ctxStart = 0
 			}
-			ctxEnd := lineEnd + 10
+			ctxEnd := lineEnd + 5
 			if ctxEnd >= len(lines) {
 				ctxEnd = len(lines) - 1
 			}
