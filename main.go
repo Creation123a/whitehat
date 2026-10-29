@@ -215,17 +215,19 @@ func scanTarget(
 	// Step 3: Classify
 	role, _ := ClassifyContract(ctx, code)
 
-		// Step 4: Expand dependencies
+   // Step 4: Expand dependencies
 	dummyUser := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	deps := DiscoverLinkedContracts(ctx, client, target, code, dummyUser)
 	
-	// SAFE FIX: Only scan the last 10,000 blocks for factory events
-	// Scanning from block 0 will timeout your RPC.
-	latestBlock, err := client.BlockNumber(ctx)
-	if err == nil {
-		fromBlock := new(big.Int).SetUint64(latestBlock - 1000)
-		toBlock := new(big.Int).SetUint64(latestBlock)
-		deps = append(deps, ScanFactoryEvents(ctx, client, target, fromBlock, toBlock)...)
+	// NEW: Use SQD for full historical factory discovery
+	for _, sig := range FactoryEventSignatures {
+		topic0Hash := crypto.Keccak256Hash([]byte(sig))
+		sqdDeps, err := ScanFactoryEventsSQD(ctx, target, topic0Hash)
+		if err != nil {
+			log.Printf("scanner[sqd]: Error fetching factory events for %s: %v", sig, err)
+		} else {
+			deps = append(deps, sqdDeps...)
+		}
 	}
 
 	// Step 5: Token short-circuit AFTER expansion
