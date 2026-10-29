@@ -70,7 +70,6 @@ jobs:
             exit 1
           fi
           heimdall --version
-
       - name: Install z3 and hevm
         run: |
           # 1. Install the z3 SMT solver (required by hevm)
@@ -85,8 +84,8 @@ jobs:
           chmod +x $HOME/.hevm/bin/hevm
           echo "$HOME/.hevm/bin" >> $GITHUB_PATH
           
-          # 4. Verify installation
-          $HOME/.hevm/bin/hevm --version
+          # 4. Verify installation (Corrected syntax)
+          $HOME/.hevm/bin/hevm version
 
       - name: Cache Ollama Models
         uses: actions/cache@v4
