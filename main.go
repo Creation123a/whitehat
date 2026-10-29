@@ -215,19 +215,21 @@ func scanTarget(
 	// Step 3: Classify
 	role, _ := ClassifyContract(ctx, code)
 
-   // Step 4: Expand dependencies
+   	// Step 4: Expand dependencies (BATCHED SQD)
 	dummyUser := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	deps := DiscoverLinkedContracts(ctx, client, target, code, dummyUser)
 	
-	// NEW: Use SQD for full historical factory discovery
+	var topic0Hashes []common.Hash
 	for _, sig := range FactoryEventSignatures {
-		topic0Hash := crypto.Keccak256Hash([]byte(sig))
-		sqdDeps, err := ScanFactoryEventsSQD(ctx, target, topic0Hash)
-		if err != nil {
-			log.Printf("scanner[sqd]: Error fetching factory events for %s: %v", sig, err)
-		} else {
-			deps = append(deps, sqdDeps...)
-		}
+		topic0Hashes = append(topic0Hashes, crypto.Keccak256Hash([]byte(sig)))
+	}
+	
+	// ONE call to SQD instead of 13
+	sqdDeps, err := ScanFactoryEventsSQD(ctx, target, topic0Hashes)
+	if err != nil {
+		log.Printf("scanner[sqd]: Error fetching factory events: %v", err)
+	} else {
+		deps = append(deps, sqdDeps...)
 	}
 
 	// Step 5: Token short-circuit AFTER expansion
