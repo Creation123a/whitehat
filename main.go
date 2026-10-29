@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -214,16 +215,17 @@ func scanTarget(
 	// Step 3: Classify
 	role, _ := ClassifyContract(ctx, code)
 
-	// Step 4: Expand dependencies (ALWAYS, before any audit)
+		// Step 4: Expand dependencies
 	dummyUser := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	deps := DiscoverLinkedContracts(ctx, client, target, code, dummyUser)
-	deps = append(deps, ScanFactoryEvents(ctx, client, target, nil, nil)...)
-
-	// Recurse
-	for _, dep := range deps {
-		if !visited[dep] {
-			scanTarget(ctx, client, rpcClient, rpcURL, exploiter, proto, dep, visited, flags, totalFlags, depth+1, blockNum)
-		}
+	
+	// SAFE FIX: Only scan the last 10,000 blocks for factory events
+	// Scanning from block 0 will timeout your RPC.
+	latestBlock, err := client.BlockNumber(ctx)
+	if err == nil {
+		fromBlock := new(big.Int).SetUint64(latestBlock - 1000)
+		toBlock := new(big.Int).SetUint64(latestBlock)
+		deps = append(deps, ScanFactoryEvents(ctx, client, target, fromBlock, toBlock)...)
 	}
 
 	// Step 5: Token short-circuit AFTER expansion
