@@ -127,6 +127,59 @@ func ChunkByFunction(source string) []string {
 // by counting keyword occurrences.
 func ClassifyChunk(chunk string) string {
 	lower := strings.ToLower(chunk)
+
+	// =====================================================
+	// PRIORITY OVERRIDES
+	// These signals are strong and unambiguous. If any of
+	// them appear, we return immediately without scoring.
+	// =====================================================
+	
+	// --- Lending signals ---
+	for _, kw := range []string{
+		"unresolved_c5ebeaec", // borrow(uint256)
+		"unresolved_5ec88c79", // getAccountLiquidity
+		"unresolved_bf92857c", // getUserAccountData
+		"unresolved_0e752702", // repayBorrow
+		"liquidate(", "repayBorrow(", "borrowBalanceStored",
+	} {
+		if strings.Contains(lower, kw) {
+			return "lending"
+		}
+	}
+
+	// --- Oracle / Spot AMM signals ---
+	for _, kw := range []string{
+		"unresolved_feaf968c", // latestRoundData
+		"unresolved_50d25bcd", // latestAnswer
+		"unresolved_3850c7bd", // slot0
+		"unresolved_0902f1ac", // getReserves
+		"unresolved_bb7b8b80", // get_virtual_price
+		"latestrounddata(", "getreserves(", "slot0(",
+	} {
+		if strings.Contains(lower, kw) {
+			return "oracle"
+		}
+	}
+
+	// --- Vault signals ---
+	for _, kw := range []string{
+		"unresolved_01e1d114", // totalAssets
+		"unresolved_18160ddd", // totalSupply
+		"unresolved_07a2d13a", // convertToAssets
+		"unresolved_6e553f65", // deposit(uint256,address)
+		"unresolved_ba087652", // redeem(uint256,address,address)
+		"converttoassets(", "converttoshares(", "previewredeem(",
+	} {
+		if strings.Contains(lower, kw) {
+			return "vault"
+		}
+	}
+
+	// =====================================================
+	// SCORING FALLBACK
+	// Only reached if no unambiguous signal was found.
+	// Uses word boundaries to avoid "address" matching "add".
+	// =====================================================
 	
 	counts := map[string]int{
 		"pricing": 0,
@@ -135,26 +188,23 @@ func ClassifyChunk(chunk string) string {
 		"vault":   0,
 	}
 
-	// Pricing (math + Uniswap V3 sqrtPriceX96)
-	for _, kw := range []string{"mul", "div", "add", "sub", "0x0de0b6b3a7640000", "1a686502"} {
-		counts["pricing"] += strings.Count(lower, kw)
-	}
-	
-	// Oracle (Chainlink + Spot AMM + Unresolved selectors)
-	for _, kw := range []string{
-		"oracle", "latestrounddata", "latestanswer", "slot0", "getreserves",
-		"unresolved_feaf968c", "unresolved_3850c7bd", "unresolved_50d25bcd", "unresolved_0902f1ac",
-	} {
+	// Pricing: math operations with word boundaries
+	// " add " won't match inside "address", "sub " etc.
+	pricingPattern := regexp.MustCompile(`\b(add|sub|mul|div|mulmod|addmod)\b|0x0de0b6b3a7640000`)
+	counts["pricing"] = len(pricingPattern.FindAllString(lower, -1))
+
+	// Oracle keywords
+	for _, kw := range []string{"oracle", "twap", "pricefeed"} {
 		counts["oracle"] += strings.Count(lower, kw)
 	}
-	
-	// Lending
-	for _, kw := range []string{"borrow", "repay", "liquidate", "collateral", "debt", "supply", "unresolved_c5ebeaec", "unresolved_5ec88c79"} {
+
+	// Lending keywords (safe because they're not substrings of common words)
+	for _, kw := range []string{"borrow", "collateral", "debt", "liquidation", "healthfactor"} {
 		counts["lending"] += strings.Count(lower, kw)
 	}
 
-	// Vault
-	for _, kw := range []string{"totalsupply", "totalassets", "converttoshares", "converttoassets", "unresolved_01e1d114", "unresolved_18160ddd"} {
+	// Vault keywords
+	for _, kw := range []string{"totalassets", "totalsupply", "shareprice", "slippage"} {
 		counts["vault"] += strings.Count(lower, kw)
 	}
 
@@ -166,10 +216,14 @@ func ClassifyChunk(chunk string) string {
 			maxDomain = domain
 		}
 	}
-	
+
+	// Threshold: only return a domain if we're actually confident
+	if maxCount < 2 {
+		return "general"
+	}
+
 	return maxDomain
 }
-
 // =============================================================
 // Bytecode-Level Rules (v11.0 Pre-Decompilation)
 // =============================================================
