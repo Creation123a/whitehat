@@ -322,17 +322,13 @@ func scanTarget(
 		}
 	}
 
-	// Step 10: Regex on decompiled (if available) — secondary signal
-	var regexFlags []FlagReport
-	if src != "" {
-		regexFlags = RunRegexScan(src)
-	}
 
-	// Step 11: LLM — only if proven OR tainted
+	// Step 10 & 11: LLM — only if proven OR tainted
 	if provenVuln || structuralTaint {
 		if src != "" {
 			chunks := ChunkByFunction(src)
-			for i, chunk := range chunks {
+			// FIX: Changed `for i, chunk` to `for _, chunk` (i was unused)
+			for _, chunk := range chunks {
 				domain := ClassifyChunk(chunk)
 				if domain != "lending" && domain != "oracle" && domain != "pricing" && domain != "vault" {
 					continue
