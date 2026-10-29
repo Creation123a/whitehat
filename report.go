@@ -64,7 +64,7 @@ func BuildReport(meta RunMetadata, findings []FindingReport, skipped []SkippedPr
 		findings[i].Rank = i + 1
 	}
 
-	meta.SchemaVersion = "8.0"
+	meta.SchemaVersion = "11.0"
 	meta.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	meta.VulnerableCount = len(findings)
 	meta.ProtocolsSkipped = len(skipped)
@@ -73,7 +73,7 @@ func BuildReport(meta RunMetadata, findings []FindingReport, skipped []SkippedPr
 }
 
 func RenderText(w io.Writer, r *Report) {
-	fmt.Fprintf(w, "=== BASE PROTOCOL SPOT-AMM EXPOSURE SCAN (v8.0) ===\n")
+	fmt.Fprintf(w, "=== BASE PROTOCOL SPOT-AMM EXPOSURE SCAN (v11.0) ===\n")
 	fmt.Fprintf(w, "Category: %s   Block: %d   %s\n",
 		r.Metadata.CategoryKeyword, r.Metadata.BlockNumber, r.Metadata.Timestamp)
 	fmt.Fprintf(w, "Protocols found: %d   scanned: %d   skipped: %d\n",
@@ -89,7 +89,15 @@ func RenderText(w io.Writer, r *Report) {
 		for _, fl := range f.Flags {
 			fmt.Fprintf(w, "     - %s [%s] @ %s (%s)\n",
 				fl.RuleID, fl.Severity, fl.ContractAddress, fl.ContractRole)
-			fmt.Fprintf(w, "       LLM: %s\n", fl.LLMVerdict)
+			
+			// Display the LLM verdict, including "UNPROVEN_LEAD" for bytecode flags
+			if fl.LLMVerdict != "" {
+				fmt.Fprintf(w, "       LLM: %s\n", fl.LLMVerdict)
+			}
+			
+			if len(fl.Suppressors) > 0 {
+				fmt.Fprintf(w, "       Suppressors: %v\n", fl.Suppressors)
+			}
 		}
 	}
 
