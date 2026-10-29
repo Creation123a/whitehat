@@ -8,12 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
@@ -189,7 +187,6 @@ func scanTarget(
 	flags *[]FlagReport,
 	totalFlags *int,
 	depth int,
-	blockNum uint64,
 ) bool {
 	// Depth guard
 	if depth > maxTraversalDepth || visited[addr] {
@@ -215,7 +212,7 @@ func scanTarget(
 	// Step 3: Classify
 	role, _ := ClassifyContract(ctx, code)
 
-   	// Step 4: Expand dependencies (BATCHED SQD)
+	// Step 4: Expand dependencies (BATCHED SQD)
 	dummyUser := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	deps := DiscoverLinkedContracts(ctx, client, target, code, dummyUser)
 	
@@ -244,53 +241,21 @@ func scanTarget(
 	structuralTaint := len(bcFlags) > 0
 
 	// Step 7: ANVIL PROOF GATE
-var exploitContext string
-var provenVuln bool
+	var exploitContext string
+	var provenVuln bool
 
-// Run the generalized economic attack harness.
-exploitResult, err := exploiter.RunEconomicAttackHarness(ctx, target, role, deps)
-if err != nil {
-    log.Printf("scanner[anvil]: Harness error: %v", err)
-} else if exploitResult != nil {
-    provenVuln = true
-    exploitContext = fmt.Sprintf("ANVIL ECONOMIC PROOF:\nType: %s\nTarget: %s\nProfit: %s wei\nDetails: %s\nTx: %s\n",
-        exploitResult.AttackType, exploitResult.Target, exploitResult.ProfitWei.String(), exploitResult.Details, exploitResult.TxHash)
-    log.Printf("scanner[anvil]: PROVEN EXPLOIT! Type: %s, Profit: %s", exploitResult.AttackType, exploitResult.ProfitWei.String())
-}
-
-		// Step 8: HEVM FALLBACK (if Anvil could not prove or assemble)
-	if !provenVuln {
-		// If it's tainted, we MUST run hevm, even if the role is unknown.
-		if structuralTaint || role == RoleVault || role == RoleLending || role == RoleAMM {
-			sig := ""
-			assertion := ""
-
-			switch role {
-			case RoleVault:
-				sig, assertion = "deposit(uint256,address)", "totalAssets() >= totalSupply()"
-			case RoleLending:
-				sig, assertion = "borrow(uint256)", "getAccountLiquidity(address(this)).2 == 0"
-			case RoleAMM:
-				sig, assertion = "swap(uint256,uint256,address,bytes)", "getReserves().0 > 0 && getReserves().1 > 0"
-			default:
-				// Fallback for unknown tainted contracts
-				sig, assertion = "borrow(uint256)", "totalSupply() >= totalAssets()" 
-			}
-
-			if sig != "" {
-				hexCode := hexutil.Encode(code)
-				log.Printf("scanner[hevm]: Running symbolic execution on %s (Role: %s, Tainted: %v)", target.Hex(), role, structuralTaint)
-				vuln, proof, err := exploiter.TestSymbolicInvariant(ctx, target, hexCode, sig, assertion, rpcURL, blockNum)
-				if err != nil {
-					log.Printf("scanner[hevm]: Symbolic execution error: %v", err)
-				} else if vuln {
-					provenVuln = true
-					exploitContext += "HEVM: " + proof + "\n"
-				}
-			}
-		}
+	// Run the generalized economic attack harness.
+	exploitResult, err := exploiter.RunEconomicAttackHarness(ctx, target, role, deps)
+	if err != nil {
+		log.Printf("scanner[anvil]: Harness error: %v", err)
+	} else if exploitResult != nil {
+		provenVuln = true
+		exploitContext = fmt.Sprintf("ANVIL ECONOMIC PROOF:\nType: %s\nTarget: %s\nProfit: %s wei\nDetails: %s\nTx: %s\n",
+			exploitResult.AttackType, exploitResult.Target, exploitResult.ProfitWei.String(), exploitResult.Details, exploitResult.TxHash)
+		log.Printf("scanner[anvil]: PROVEN EXPLOIT! Type: %s, Profit: %s", exploitResult.AttackType, exploitResult.ProfitWei.String())
 	}
-		// Step 9: Decompile ONLY if proven or tainted
+
+	// Step 9: Decompile ONLY if proven or tainted
 	var src string
 	if provenVuln || structuralTaint {
 		log.Printf("scanner[heimdall]: Attempting decompilation for %s (Proven: %v, Tainted: %v)", target.Hex(), provenVuln, structuralTaint)
@@ -355,6 +320,7 @@ if err != nil {
 
 	return true
 }
+
 
 func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
 	var lastErr error
