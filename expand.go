@@ -136,7 +136,7 @@ func ClassifyContract(ctx context.Context, code []byte) (ContractRole, map[strin
 	switch {
 	case vaultHits >= 2:
 		role = RoleVault
-	case lendingHits > 0 && oracleHits > 0:
+	case lendingHits > 0: // FIX: Removed `&& oracleHits > 0`
 		role = RoleLending
 	case ammHits > 0:
 		role = RoleAMM
