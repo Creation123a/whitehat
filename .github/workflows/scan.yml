@@ -71,6 +71,15 @@ jobs:
           fi
           heimdall --version
 
+      - name: Install hevm (Symbolic Execution)
+        run: |
+          mkdir -p $HOME/.hevm/bin
+          curl -L -o $HOME/.hevm/bin/hevm https://github.com/ethereum/hevm/releases/latest/download/hevm-linux-amd64
+          chmod +x $HOME/.hevm/bin/hevm
+          echo "$HOME/.hevm/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.hevm/bin:$PATH"
+          hevm version
+
       - name: Cache Ollama Models
         uses: actions/cache@v4
         with:
