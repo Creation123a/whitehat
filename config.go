@@ -11,10 +11,26 @@ const (
 	DefiLlamaProtocolsURL = "https://api.llama.fi/protocols"
 	DefiLlamaBaseChain    = "Base"
 
-
 	EIP1967ImplementationSlot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
 )
 
+// =============================================================
+// v11.0 Pipeline Constants
+// =============================================================
+
+const (
+	// maxTraversalDepth limits how deep the scanner will recursively
+	// probe linked contracts (e.g. Market -> Oracle -> Pool -> Factory).
+	maxTraversalDepth = 5
+
+	// maxDecompilesPerProtocol prevents spending hours decompiling
+	// every single proxy implementation if a protocol has hundreds.
+	maxDecompilesPerProtocol = 30
+)
+
+// =============================================================
+// Protocol Registry
+// =============================================================
 
 var BaseProtocolRegistry = map[string][]common.Address{
 	// Lending
@@ -300,6 +316,10 @@ var TargetCategories = map[string]bool{
 	"RWA":               true,
 }
 
+// =============================================================
+// Scanner Parameters
+// =============================================================
+
 const (
 	MinTVLUSD = 50_000
 	MaxTVLUSD = 10_000_000
@@ -310,6 +330,10 @@ const (
 	anvilReadyMax   = 60 * time.Second
 	anvilPollEvery  = 250 * time.Millisecond
 )
+
+// =============================================================
+// Stablecoin Helpers
+// =============================================================
 
 func isStableAsset(a AssetInfo) bool {
 	if a.Address != "" {
