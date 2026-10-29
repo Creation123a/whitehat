@@ -315,49 +315,58 @@ func scanTarget(
 		}
 	}
 
-	// Step 9: Decompile ONLY if proven or tainted
+		// Step 9: Decompile ONLY if proven or tainted
 	var src string
 	if provenVuln || structuralTaint {
+		log.Printf("scanner[heimdall]: Attempting decompilation for %s (Proven: %v, Tainted: %v)", target.Hex(), provenVuln, structuralTaint)
 		decompiled, err := DecompileWithHeimdall(ctx, proto.Slug, target.Hex(), code, rpcURL, provenVuln, structuralTaint)
-		if err == nil {
+		if err != nil {
+			log.Printf("scanner[heimdall]: FAILED to decompile %s: %v", target.Hex(), err)
+		} else {
 			src = decompiled
+			log.Printf("scanner[heimdall]: Successfully decompiled %s (%d bytes)", target.Hex(), len(src))
 		}
 	}
-
 
 	// Step 10 & 11: LLM — only if proven OR tainted
 	if provenVuln || structuralTaint {
 		if src != "" {
 			chunks := ChunkByFunction(src)
-			// FIX: Changed `for i, chunk` to `for _, chunk` (i was unused)
+			log.Printf("scanner[llm]: Split %s into %d chunks", target.Hex(), len(chunks))
 			for _, chunk := range chunks {
 				domain := ClassifyChunk(chunk)
 				if domain != "lending" && domain != "oracle" && domain != "pricing" && domain != "vault" {
 					continue
 				}
 
+				log.Printf("scanner[llm]: Sending %s chunk to Qwen...", domain)
 				prompt := chunk
 				if exploitContext != "" {
 					prompt = fmt.Sprintf("PROOF:\n%s\n\nCODE:\n%s", exploitContext, chunk)
 				}
 
 				verdict, err := AskLocalLLM(ctx, prompt, proto.Name, string(role), domain, exploitContext)
-				if err == nil {
-					parsed := ParseVerdict(verdict)
-					(*totalFlags)++
-					if parsed == "VULNERABLE" || (structuralTaint && exploitContext == "") {
-						*flags = append(*flags, FlagReport{
-							RuleID:          "DYNAMIC_TRACE",
-							Category:        domain,
-							Severity:        "high",
-							Snippet:         prompt,
-							LLMVerdict:      verdict,
-							ContractAddress: target.Hex(),
-							ContractRole:    string(role),
-						})
-					}
+				if err != nil {
+					log.Printf("scanner[llm]: ERROR from Ollama: %v", err)
+					continue
+				}
+				
+				parsed := ParseVerdict(verdict)
+				(*totalFlags)++
+				if parsed == "VULNERABLE" || (structuralTaint && exploitContext == "") {
+					*flags = append(*flags, FlagReport{
+						RuleID:          "DYNAMIC_TRACE",
+						Category:        domain,
+						Severity:        "high",
+						Snippet:         prompt,
+						LLMVerdict:      verdict,
+						ContractAddress: target.Hex(),
+						ContractRole:    string(role),
+					})
 				}
 			}
+		} else {
+			log.Printf("scanner[llm]: Skipping LLM for %s because decompilation returned empty source.", target.Hex())
 		}
 	}
 
