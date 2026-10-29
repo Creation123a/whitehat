@@ -140,11 +140,10 @@ func run() int {
 
 		for _, addr := range addrs {
 			// v11.0: Pass depth=0 to initiate recursion
-			if scanTarget(runCtx, client, rpcClient, effectiveRPC, exploiter, proto, addr, visited, &protoFlags, &totalFlags, 0, blockNum) {
+			if scanTarget(runCtx, client, rpcClient, effectiveRPC, exploiter, proto, addr, visited, &protoFlags, &totalFlags, 0) {
 				scannedSuccessfully = true
 			}
 		}
-
 		if !scannedSuccessfully {
 			skipped = append(skipped, SkippedProtocol{Name: proto.Name, Slug: proto.Slug, Reason: "decompilation or RPC failed"})
 			continue
