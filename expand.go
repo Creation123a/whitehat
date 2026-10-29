@@ -242,13 +242,20 @@ func ScanFactoryEvents(
 
 // ScanFactoryEventsSQD uses the SQD Portal to fetch full historical factory events
 // without touching your RPC provider.
-func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Hash common.Hash) ([]common.Address, error) {
+// Change the signature to accept multiple hashes
+func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Hashes []common.Hash) ([]common.Address, error) {
 	url := "https://portal.sqd.dev/datasets/base-mainnet/stream"
+
+	// Convert []common.Hash to []string for JSON
+	var topic0Strings []string
+	for _, h := range topic0Hashes {
+		topic0Strings = append(topic0Strings, h.Hex())
+	}
 
 	var allFound []common.Address
 	seen := make(map[common.Address]bool)
 	fromBlock := uint64(0)
-	toBlock := uint64(99999999) // Catch all historical and recent blocks
+	toBlock := uint64(99999999)
 
 	for {
 		select {
@@ -264,17 +271,14 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 			"logs": []map[string]interface{}{
 				{
 					"address": []string{factory.Hex()},
-					"topic0":  []string{topic0Hash.Hex()},
+					"topic0":  topic0Strings, // BATCHED HERE
 				},
 			},
 			"fields": map[string]interface{}{
-				"log": map[string]bool{
-					"address": true,
-					"topics":  true,
-					"data":    true,
-				},
+				"log": map[string]bool{"address": true, "topics": true, "data": true},
 			},
 		}
+		// FIXED: Removed the extra closing brace that was here
 
 		bodyBytes, _ := json.Marshal(reqBody)
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(bodyBytes))
@@ -297,7 +301,8 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 		}
 
 		scanner := bufio.NewScanner(resp.Body)
-		lastBlockInStream := fromBlock
+		// FIXED: Initialize to -1 so we can detect if the stream returned any progress
+		lastBlockInStream := int64(-1) 
 
 		for scanner.Scan() {
 			var chunk struct {
@@ -314,7 +319,8 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 				continue
 			}
 
-			lastBlockInStream = chunk.Header.Number
+			// Update the last block we've seen in this stream
+			lastBlockInStream = int64(chunk.Header.Number)
 
 			for _, logEntry := range chunk.Logs {
 				// 1. Check indexed topics
@@ -347,11 +353,14 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 		}
 		resp.Body.Close()
 
-		// Pagination check
-		if lastBlockInStream >= toBlock {
+		// FIXED: Infinite loop protection
+		// If the stream returned no blocks at all, or we've reached the target, stop.
+		if lastBlockInStream == -1 || uint64(lastBlockInStream) >= toBlock {
 			break
 		}
-		fromBlock = lastBlockInStream + 1
+
+		// Advance the cursor to the next block
+		fromBlock = uint64(lastBlockInStream) + 1
 	}
 
 	if len(allFound) > 0 {
