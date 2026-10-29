@@ -123,6 +123,8 @@ func ChunkByFunction(source string) []string {
 
 // ClassifyChunk determines the primary domain of a function chunk
 // by counting keyword occurrences.
+// ClassifyChunk determines the primary domain of a function chunk
+// by counting keyword occurrences.
 func ClassifyChunk(chunk string) string {
 	lower := strings.ToLower(chunk)
 	
@@ -130,20 +132,30 @@ func ClassifyChunk(chunk string) string {
 		"pricing": 0,
 		"oracle":  0,
 		"lending": 0,
-		"staking": 0,
+		"vault":   0,
 	}
 
-	for _, kw := range []string{"mul", "div", "add", "sub", "0x0de0b6b3a7640000"} {
+	// Pricing (math + Uniswap V3 sqrtPriceX96)
+	for _, kw := range []string{"mul", "div", "add", "sub", "0x0de0b6b3a7640000", "1a686502"} {
 		counts["pricing"] += strings.Count(lower, kw)
 	}
-	for _, kw := range []string{"oracle", "latestrounddata", "latestanswer", "slot0", "getreserves"} {
+	
+	// Oracle (Chainlink + Spot AMM + Unresolved selectors)
+	for _, kw := range []string{
+		"oracle", "latestrounddata", "latestanswer", "slot0", "getreserves",
+		"unresolved_feaf968c", "unresolved_3850c7bd", "unresolved_50d25bcd", "unresolved_0902f1ac",
+	} {
 		counts["oracle"] += strings.Count(lower, kw)
 	}
-	for _, kw := range []string{"borrow", "repay", "liquidate", "collateral", "debt", "supply"} {
+	
+	// Lending
+	for _, kw := range []string{"borrow", "repay", "liquidate", "collateral", "debt", "supply", "unresolved_c5ebeaec", "unresolved_5ec88c79"} {
 		counts["lending"] += strings.Count(lower, kw)
 	}
-	for _, kw := range []string{"stake", "unstake", "reward", "earned"} {
-		counts["staking"] += strings.Count(lower, kw)
+
+	// Vault
+	for _, kw := range []string{"totalsupply", "totalassets", "converttoshares", "converttoassets", "unresolved_01e1d114", "unresolved_18160ddd"} {
+		counts["vault"] += strings.Count(lower, kw)
 	}
 
 	maxDomain := "general"
