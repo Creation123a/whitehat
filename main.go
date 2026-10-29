@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
 )
@@ -33,7 +35,7 @@ func run() int {
 		anvilPort = fs.Int("anvil-port", 8545, "anvil listen port")
 		outPath   = fs.String("out", "report.json", "output file")
 		format    = fs.String("format", "json", "output format: text | json")
-		timeout   = fs.Duration("timeout", 120*time.Minute, "pipeline timeout") // Increased to 120m
+		timeout   = fs.Duration("timeout", 120*time.Minute, "pipeline timeout")
 		category  = fs.String("category", "", "DefiLlama category keyword")
 	)
 
@@ -139,7 +141,7 @@ func run() int {
 		scannedSuccessfully := false
 
 		for _, addr := range addrs {
-			if scanTarget(runCtx, client, rpcClient, effectiveRPC, exploiter, proto, addr, visited, &protoFlags, &totalFlags) {
+			if scanTarget(runCtx, client, rpcClient, effectiveRPC, exploiter, proto, addr, visited, &protoFlags, &totalFlags, 0, blockNum) {
 				scannedSuccessfully = true
 			}
 		}
@@ -173,7 +175,10 @@ func run() int {
 	return WriteReport(*outPath, *format, rep)
 }
 
-// scanTarget executes the full triaging pipeline on a single contract.
+// =============================================================
+// v11.0 Core Target Scanner
+// =============================================================
+
 func scanTarget(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -185,185 +190,224 @@ func scanTarget(
 	visited map[common.Address]bool,
 	flags *[]FlagReport,
 	totalFlags *int,
+	depth int,
+	blockNum uint64,
 ) bool {
-	if visited[addr] {
+	if depth > maxTraversalDepth || visited[addr] {
 		return false
 	}
 	visited[addr] = true
 
-	// Step 1: Proxy Resolution
-	impl := ResolveImplementation(ctx, client, addr)
+	// 1. Proxy Resolution
 	target := addr
-	if impl != (common.Address{}) {
+	if impl := ResolveImplementation(ctx, client, addr); impl != (common.Address{}) && !visited[impl] {
 		target = impl
-		log.Printf("scanner[proxy]: Resolved %s -> Impl %s", addr.Hex(), target.Hex())
+		visited[impl] = true
 	}
 
-	// Step 2: Fetch Bytecode via RPC
+	// 2. Fetch Bytecode
 	code, err := FetchBytecode(ctx, client, target)
 	if err != nil || len(code) == 0 {
-		log.Printf("scanner[source]: No bytecode at %s", target.Hex())
 		return false
 	}
 
-	// Step 3: Discover Linked Contracts
-	selectorMap := GetSelectorMap(ctx, code)
-	linkedContracts := DiscoverLinkedContracts(ctx, client, target, selectorMap)
+	// 3. Classify Contract
+	role, _ := ClassifyContract(ctx, code)
+
+	// 4. Expand Dependencies (ALWAYS)
+	dummyUser := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	deps := DiscoverLinkedContracts(ctx, client, target, code, dummyUser)
 	
-	// Step 4: Bytecode Pre-Filter
-	if isStandardToken(code) && len(linkedContracts) == 0 {
-		log.Printf("scanner[filter]: %s is a standard ERC-20/721 with no linked pools. Skipping.", target.Hex())
-		return false
-	}
+	// Add Factory Events discovery
+	factoryDeps := ScanFactoryEvents(ctx, client, target, big.NewInt(0), nil) // 0 to latest
+	deps = append(deps, factoryDeps...)
 
-	// Step 5: Decompile with Heimdall
-	log.Printf("scanner[heimdall]: Decompiling %s via RPC...", target.Hex())
-	decompiledSrc, err := DecompileWithHeimdall(ctx, target.Hex(), rpcURL)
-	if err != nil {
-		log.Printf("scanner[heimdall]: Decompilation failed for %s: %v", target.Hex(), err)
-		return false
-	}
-	src := decompiledSrc
-	contractName := "DecompiledContract"
-
-	// Step 6: Extract Dependencies from Source
-	dependencies := ExtractDependencies(ctx, client, src, target)
-	for _, dep := range dependencies {
+	for _, dep := range deps {
 		if !visited[dep] {
-			log.Printf("scanner[state]: Discovered dependency in source %s", dep.Hex())
-			scanTarget(ctx, client, rpcClient, rpcURL, exploiter, proto, dep, visited, flags, totalFlags)
+			scanTarget(ctx, client, rpcClient, rpcURL, exploiter, proto, dep, visited, flags, totalFlags, depth+1, blockNum)
 		}
 	}
 
-	// Step 7: Static Triage
-	regexFlags := RunRegexScan(src)
-	log.Printf("scanner[regex]: Triggered %d regex rules on %s", len(regexFlags), contractName)
-
-	// Directly add critical structural flaws (like Mixed Source)
-	for _, f := range regexFlags {
-		if f.RuleID == "MIXED_SOURCE_CHUNK" {
-			log.Printf("scanner[regex]: PROVEN STRUCTURAL FLAW: MIXED_SOURCE on %s", target.Hex())
-			(*totalFlags)++
-			*flags = append(*flags, f)
-		}
+	// 5. Token Short-Circuit (AFTER expansion)
+	if role == RoleToken {
+		return true
 	}
 
-	// Step 8: Identify Anvil Targets (AMM, Oracle, Lending Pool)
-	var ammPool, protocolOracle, protocolPool common.Address
-	
-	checkTarget := func(c []byte, t common.Address) {
-		hexC := common.Bytes2Hex(c)
-		if strings.Contains(hexC, "0902f1ac") || strings.Contains(hexC, "3850c7bd") {
-			if ammPool == (common.Address{}) { ammPool = t }
-		}
-		if strings.Contains(hexC, "50d25bcd") || strings.Contains(hexC, "feaf968c") {
-			if protocolOracle == (common.Address{}) { protocolOracle = t }
-		}
-		if strings.Contains(hexC, "5ec88c79") || strings.Contains(hexC, "bf92857c") {
-			if protocolPool == (common.Address{}) { protocolPool = t }
-		}
-	}
+	// 6. Bytecode Rules (Pre-Decompilation)
+	selectors := ExtractSelectorsFromBytecode(code)
+	bcFlags := RunBytecodeRules(selectors)
+	structuralTaint := len(bcFlags) > 0
 
-	// Check the target, linked state variables, and decompiled dependencies
-	checkTarget(code, target)
-	for _, linked := range linkedContracts {
-		linkedCode, _ := client.CodeAt(ctx, linked, nil)
-		checkTarget(linkedCode, linked)
-	}
-	for _, dep := range dependencies {
-		depCode, _ := client.CodeAt(ctx, dep, nil)
-		checkTarget(depCode, dep)
-	}
-
-	// Step 9: Anvil Simulation & Proof Generation
+	// 7. Anvil Proof Gate
 	var exploitContext string
-	if ammPool != (common.Address{}) && protocolOracle != (common.Address{}) && protocolPool != (common.Address{}) {
-		log.Printf("scanner[anvil]: Found AMM (%s), Oracle (%s), and Pool (%s). Running Oracle Manipulation Proof...", ammPool.Hex(), protocolOracle.Hex(), protocolPool.Hex())
-		
-		dummyUser := common.HexToAddress("0x1111111111111111111111111111111111111111")
-		isVuln, proof, err := exploiter.TestOracleManipulation(ctx, ammPool, protocolOracle, protocolPool, dummyUser)
-		
-		if err == nil && isVuln {
-			exploitContext = fmt.Sprintf("ANVIL PROOF: %s\n", proof)
-			log.Printf("scanner[anvil]: PROVEN EXPLOIT! %s", proof)
-		} else if err != nil {
-			log.Printf("scanner[anvil]: Oracle manipulation proof failed: %v", err)
-		} else {
-			log.Printf("scanner[anvil]: Oracle manipulation did not break protocol. %s", proof)
+	var provenVuln bool
+	attacker := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	victim := common.HexToAddress("0x3333333333333333333333333333333333333333")
+
+	// 7a. Oracle Manipulation
+	ammPool, oracle, pool := identifyTriplet(deps, ctx, client)
+	if ammPool != (common.Address{}) && oracle != (common.Address{}) && pool != (common.Address{}) {
+		healthAddr, _ := ResolveHealthCheckTarget(ctx, client, pool)
+		if healthAddr != (common.Address{}) {
+			vuln, proof, err := exploiter.TestOracleManipulation(ctx, ammPool, oracle, healthAddr, dummyUser)
+			if err == nil && vuln {
+				provenVuln = true
+				exploitContext += "ANVIL: " + proof + "\n"
+				log.Printf("scanner[anvil]: PROVEN EXPLOIT! %s", proof)
+			}
 		}
-	} else {
-		log.Printf("scanner[anvil]: Could not identify full AMM/Oracle/Pool triplet. Skipping Oracle Manipulation.")
 	}
 
-	// Step 10: LLM Analytics (Only if we have an Anvil Proof)
-	chunks := ChunkByFunction(src)
-	log.Printf("scanner[chunk]: Split contract into %d function chunks", len(chunks))
-
-	for i, chunk := range chunks {
-		domain := ClassifyChunk(chunk)
-		
-		// Only send to LLM if we have an Anvil proof and the chunk is related to math/oracle/lending.
-		if exploitContext == "" || (domain != "lending" && domain != "oracle" && domain != "pricing") {
-			continue 
+	// 7b. ERC-4626 Inflation
+	if role == RoleVault {
+		asset := GetVaultAsset(ctx, client, target)
+		if asset == (common.Address{}) {
+			asset = common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913") // default USDC
 		}
+		vuln, _ := exploiter.TestERC4626Inflation(ctx, target, attacker, victim)
+		if vuln {
+			provenVuln = true
+			exploitContext += "ANVIL: ERC-4626 inflation proven\n"
+			log.Printf("scanner[anvil]: PROVEN EXPLOIT! ERC-4626 inflation on %s", target.Hex())
+		}
+	}
 
-		fullPrompt := chunk
-		
-		// Append any regex flags that fall within this chunk for extra context
-		for _, f := range regexFlags {
-			if strings.Contains(chunk, f.Snippet) {
-				fullPrompt = fmt.Sprintf("REGEX FINDING (%s):\n%s\n\n%s", f.RuleID, f.Snippet, chunk)
-				break
+	// 8. HEVM Fallback
+	if !provenVuln {
+		sig, assertion := invariantFor(role)
+		if sig != "" {
+			vuln, proof, err := exploiter.TestSymbolicInvariant(ctx, target, hexutil.Encode(code), sig, assertion, rpcURL, blockNum)
+			if err == nil && vuln {
+				provenVuln = true
+				exploitContext += "HEVM: " + proof + "\n"
+				log.Printf("scanner[hevm]: PROVEN EXPLOIT! %s", proof)
 			}
 		}
+	}
 
-		log.Printf("scanner[llm]: Sending proven-vulnerable chunk %d (%d bytes) to Qwen...", i+1, len(fullPrompt))
-		
-		// Pass exploitContext to the LLM to force root-cause analysis
-		verdict, err := AskLocalLLM(ctx, fullPrompt, contractName, "Target Contract", domain, exploitContext)
-		if err == nil {
-			parsedVerdict := ParseVerdict(verdict)
-			log.Printf("scanner[llm]: Qwen Verdict -> %s", parsedVerdict)
+	// 9. Decompile (ONLY if proven or tainted)
+	var src string
+	if provenVuln || structuralTaint {
+		var err error
+		src, err = DecompileWithHeimdall(ctx, proto.Slug, target.Hex(), code, rpcURL, provenVuln, structuralTaint)
+		if err != nil {
+			log.Printf("scanner[heimdall]: Failed to decompile %s: %v", target.Hex(), err)
+		}
+	}
+
+	// 10. Regex Scan (Secondary signal)
+	var regexFlags []FlagReport
+	if src != "" {
+		regexFlags = RunRegexScan(src)
+		log.Printf("scanner[regex]: Triggered %d regex rules on %s", len(regexFlags), target.Hex())
+	}
+
+	// 11. LLM Analytics (Only if proven OR tainted)
+	if provenVuln || structuralTaint {
+		chunks := ChunkByFunction(src)
+		for i, chunk := range chunks {
+			domain := ClassifyChunk(chunk)
 			
-			flag := FlagReport{
-				RuleID:          "DYNAMIC_TRACE",
-				Category:        domain,
-				Severity:        "high",
-				Snippet:         fullPrompt,
-				LLMVerdict:      verdict,
-				ContractAddress: target.Hex(),
-				ContractRole:    "main",
+			// If we are here because of structural taint but have no proof, force the LLM to analyze the relevant domains
+			if exploitContext == "" && (domain != "lending" && domain != "oracle" && domain != "pricing" && domain != "vault") {
+				continue
 			}
-			(*totalFlags)++
-			if parsedVerdict == "VULNERABLE" {
-				*flags = append(*flags, flag)
+			if exploitContext != "" && (domain != "lending" && domain != "oracle" && domain != "pricing" && domain != "vault") {
+				continue
 			}
-		} else {
-			log.Printf("scanner[llm]: error: %v", err)
+
+			fullPrompt := chunk
+			for _, f := range regexFlags {
+				if strings.Contains(chunk, f.Snippet) {
+					fullPrompt = fmt.Sprintf("REGEX FINDING (%s):\n%s\n\n%s", f.RuleID, f.Snippet, chunk)
+					break
+				}
+			}
+
+			contextToPass := exploitContext
+			if contextToPass == "" {
+				contextToPass = "STRUCTURAL_TAINT: Bytecode rules flagged this contract."
+			}
+
+			verdict, err := AskLocalLLM(ctx, fullPrompt, "Target Contract", string(role), domain, contextToPass)
+			if err == nil {
+				parsedVerdict := ParseVerdict(verdict)
+				
+				flag := FlagReport{
+					RuleID:          "DYNAMIC_TRACE",
+					Category:        domain,
+					Severity:        "high",
+					Snippet:         fullPrompt,
+					LLMVerdict:      verdict,
+					ContractAddress: target.Hex(),
+					ContractRole:    string(role),
+				}
+				(*totalFlags)++
+				if parsedVerdict == "VULNERABLE" || (structuralTaint && exploitContext == "") {
+					*flags = append(*flags, flag)
+				}
+			}
 		}
+	}
+
+	// 12. Attach Bytecode Flags
+	for _, f := range bcFlags {
+		(*totalFlags)++
+		f.ContractAddress = target.Hex()
+		f.ContractRole = string(role)
+		*flags = append(*flags, f)
 	}
 
 	return true
 }
 
-// isStandardToken checks if the bytecode is just a standard ERC-20/721.
-func isStandardToken(code []byte) bool {
-	hexCode := common.Bytes2Hex(code)
-	
-	hasTransfer := strings.Contains(hexCode, "a9059cbb")
-	hasApprove := strings.Contains(hexCode, "095ea7b3")
-	
-	hasAmmMath := strings.Contains(hexCode, "3850c7bd") || 
-			      strings.Contains(hexCode, "0902f1ac") || 
-			      strings.Contains(hexCode, "bb7b8b80")
+// =============================================================
+// Helpers
+// =============================================================
 
-	hasLendingMath := strings.Contains(hexCode, "b3596f07") || 
-			          strings.Contains(hexCode, "fc57d4df") || 
-			          strings.Contains(hexCode, "8a889156") || 
-			          strings.Contains(hexCode, "50d25bcd") || 
-			          strings.Contains(hexCode, "a035b1fe")
+// identifyTriplet scans the dependencies to find the AMM, Oracle, and Lending Pool.
+func identifyTriplet(deps []common.Address, ctx context.Context, client *ethclient.Client) (common.Address, common.Address, common.Address) {
+	var ammPool, oracle, pool common.Address
+	for _, dep := range deps {
+		code, err := client.CodeAt(ctx, dep, nil)
+		if err != nil || len(code) == 0 {
+			continue
+		}
+		selCounts := ExtractSelectorsFromBytecode(code)
+		
+		if ammPool == (common.Address{}) {
+			if selCounts[0x0902f1ac] || selCounts[0x3850c7bd] { // getReserves, slot0
+				ammPool = dep
+			}
+		}
+		if oracle == (common.Address{}) {
+			if selCounts[0xfeaf968c] || selCounts[0x50d25bcd] { // latestRoundData, latestAnswer
+				oracle = dep
+			}
+		}
+		if pool == (common.Address{}) {
+			if selCounts[0x5ec88c79] || selCounts[0xbf92857c] { // getAccountLiquidity, getUserAccountData
+				pool = dep
+			}
+		}
+	}
+	return ammPool, oracle, pool
+}
 
-	return hasTransfer && hasApprove && !hasAmmMath && !hasLendingMath
+// invariantFor maps a contract role to a hevm signature and economic assertion.
+func invariantFor(role ContractRole) (string, string) {
+	switch role {
+	case RoleVault:
+		return "deposit(uint256,address)", "totalAssets() >= totalSupply()"
+	case RoleLending:
+		return "borrow(uint256)", "healthFactor() >= 1e18"
+	case RoleAMM:
+		return "swap(uint256,uint256,address,bytes)", "getReserves().0 > 0 && getReserves().1 > 0"
+	case RoleMathOracle:
+		return "update()", "latestAnswer() > 0"
+	default:
+		return "", ""
+	}
 }
 
 func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
