@@ -293,28 +293,38 @@ func scanTarget(
 		}
 	}
 
-	// Step 8: HEVM FALLBACK (if Anvil could not prove or assemble)
+		// Step 8: HEVM FALLBACK (if Anvil could not prove or assemble)
 	if !provenVuln {
-		var sig, assertion string
-		switch role {
-		case RoleVault:
-			sig, assertion = "deposit(uint256,address)", "totalAssets() >= totalSupply()"
-		case RoleLending:
-			sig, assertion = "borrow(uint256)", "getAccountLiquidity(address(this)).2 == 0" // checking shortfall
-		case RoleAMM:
-			sig, assertion = "swap(uint256,uint256,address,bytes)", "getReserves().0 > 0 && getReserves().1 > 0"
-		}
+		// If it's tainted, we MUST run hevm, even if the role is unknown.
+		if structuralTaint || role == RoleVault || role == RoleLending || role == RoleAMM {
+			sig := ""
+			assertion := ""
 
-		if sig != "" {
-			hexCode := hexutil.Encode(code)
-			vuln, proof, err := exploiter.TestSymbolicInvariant(ctx, target, hexCode, sig, assertion, rpcURL, blockNum)
-			if err == nil && vuln {
-				provenVuln = true
-				exploitContext += "HEVM: " + proof + "\n"
+			switch role {
+			case RoleVault:
+				sig, assertion = "deposit(uint256,address)", "totalAssets() >= totalSupply()"
+			case RoleLending:
+				sig, assertion = "borrow(uint256)", "getAccountLiquidity(address(this)).2 == 0"
+			case RoleAMM:
+				sig, assertion = "swap(uint256,uint256,address,bytes)", "getReserves().0 > 0 && getReserves().1 > 0"
+			default:
+				// Fallback for unknown tainted contracts
+				sig, assertion = "borrow(uint256)", "totalSupply() >= totalAssets()" 
+			}
+
+			if sig != "" {
+				hexCode := hexutil.Encode(code)
+				log.Printf("scanner[hevm]: Running symbolic execution on %s (Role: %s, Tainted: %v)", target.Hex(), role, structuralTaint)
+				vuln, proof, err := exploiter.TestSymbolicInvariant(ctx, target, hexCode, sig, assertion, rpcURL, blockNum)
+				if err != nil {
+					log.Printf("scanner[hevm]: Symbolic execution error: %v", err)
+				} else if vuln {
+					provenVuln = true
+					exploitContext += "HEVM: " + proof + "\n"
+				}
 			}
 		}
 	}
-
 		// Step 9: Decompile ONLY if proven or tainted
 	var src string
 	if provenVuln || structuralTaint {
