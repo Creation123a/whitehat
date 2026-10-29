@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
+	"net/http"
+	"time"
 
 	evmole "github.com/cdump/evmole/go"
 	"github.com/ethereum/go-ethereum"
@@ -82,10 +88,7 @@ var TokenSelectors = []string{
 // ClassifyContract
 // =============================================================
 
-// ClassifyContract uses evmole to extract function selectors and classifies
-// the contract based on the presence of known selector combinations.
 func ClassifyContract(ctx context.Context, code []byte) (ContractRole, map[string]int) {
-	// 1. Extract selectors using evmole
 	info, err := evmole.ContractInfo(ctx, code, evmole.Options{
 		Selectors:       true,
 		Arguments:       true,
@@ -98,7 +101,6 @@ func ClassifyContract(ctx context.Context, code []byte) (ContractRole, map[strin
 			selCounts[fmt.Sprintf("%08x", fn.Selector)]++
 		}
 	} else {
-		// Fallback: raw bytecode scan if evmole fails
 		for i := 0; i+5 <= len(code); i++ {
 			if code[i] == 0x63 { // PUSH4
 				selCounts[hex.EncodeToString(code[i+1:i+5])]++
@@ -106,7 +108,6 @@ func ClassifyContract(ctx context.Context, code []byte) (ContractRole, map[strin
 		}
 	}
 
-	// 2. Count matches against taxonomy
 	matches := func(taxonomy []string) int {
 		count := 0
 		for _, sel := range taxonomy {
@@ -123,15 +124,13 @@ func ClassifyContract(ctx context.Context, code []byte) (ContractRole, map[strin
 	ammHits := matches(AMMSelectors)
 	tokenHits := matches(TokenSelectors)
 
-	// Check for any math selectors (generic math operations that might indicate an oracle or pricing logic)
 	mathHits := 0
 	for sel := range selCounts {
-		if sel == "0de0b6b3" || sel == "771602f7" || sel == "1a686502" { // selectors for common math functions or sqrtPrice
+		if sel == "0de0b6b3" || sel == "771602f7" || sel == "1a686502" {
 			mathHits++
 		}
 	}
 
-		// 3. Priority classification
 	var role ContractRole
 	switch {
 	case vaultHits >= 2:
@@ -171,7 +170,7 @@ var FactoryEventSignatures = []string{
 }
 
 // ScanFactoryEvents searches for logs emitted by the given factory contract
-// that match known factory event signatures. It returns verified contract addresses.
+// that match known factory event signatures using eth_getLogs.
 func ScanFactoryEvents(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -180,7 +179,6 @@ func ScanFactoryEvents(
 	toBlock *big.Int,
 ) []common.Address {
 
-	// FIX: Build a single slice of hashes for Topic 0
 	var topic0 []common.Hash
 	for _, sig := range FactoryEventSignatures {
 		topic0 = append(topic0, crypto.Keccak256Hash([]byte(sig)))
@@ -190,7 +188,6 @@ func ScanFactoryEvents(
 		FromBlock: fromBlock,
 		ToBlock:   toBlock,
 		Addresses: []common.Address{factory},
-		// FIX: Wrap the single slice of hashes in a slice of slices
 		Topics:    [][]common.Hash{topic0},
 	}
 
@@ -238,10 +235,134 @@ func ScanFactoryEvents(
 
 	return found
 }
+
+// =============================================================
+// SQD Portal Discovery (RPC-Free)
+// =============================================================
+
+// ScanFactoryEventsSQD uses the SQD Portal to fetch full historical factory events
+// without touching your RPC provider.
+func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Hash common.Hash) ([]common.Address, error) {
+	url := "https://portal.sqd.dev/datasets/base-mainnet/stream"
+
+	var allFound []common.Address
+	seen := make(map[common.Address]bool)
+	fromBlock := uint64(0)
+	toBlock := uint64(99999999) // Catch all historical and recent blocks
+
+	for {
+		select {
+		case <-ctx.Done():
+			return allFound, ctx.Err()
+		default:
+		}
+
+		reqBody := map[string]interface{}{
+			"type":      "evm",
+			"fromBlock": fromBlock,
+			"toBlock":   toBlock,
+			"logs": []map[string]interface{}{
+				{
+					"address": []string{factory.Hex()},
+					"topic0":  []string{topic0Hash.Hex()},
+				},
+			},
+			"fields": map[string]interface{}{
+				"log": map[string]bool{
+					"address": true,
+					"topics":  true,
+					"data":    true,
+				},
+			},
+		}
+
+		bodyBytes, _ := json.Marshal(reqBody)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(bodyBytes))
+		if err != nil {
+			return allFound, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return allFound, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return allFound, fmt.Errorf("SQD API error %d: %s", resp.StatusCode, string(body))
+		}
+
+		scanner := bufio.NewScanner(resp.Body)
+		lastBlockInStream := fromBlock
+
+		for scanner.Scan() {
+			var chunk struct {
+				Header struct {
+					Number uint64 `json:"number"`
+				} `json:"header"`
+				Logs []struct {
+					Topics []string `json:"topics"`
+					Data   string   `json:"data"`
+				} `json:"logs"`
+			}
+			
+			if err := json.Unmarshal(scanner.Bytes(), &chunk); err != nil {
+				continue
+			}
+
+			lastBlockInStream = chunk.Header.Number
+
+			for _, logEntry := range chunk.Logs {
+				// 1. Check indexed topics
+				for _, topic := range logEntry.Topics[1:] {
+					if len(topic) == 66 { // 0x + 64 hex chars
+						addr := common.HexToAddress(topic)
+						if addr != (common.Address{}) && !seen[addr] {
+							seen[addr] = true
+							allFound = append(allFound, addr)
+						}
+					}
+				}
+				
+				// 2. Check non-indexed data payload
+				if len(logEntry.Data) > 2 {
+					dataBytes := common.FromHex(logEntry.Data)
+					for i := 0; i+32 <= len(dataBytes); i += 32 {
+						word := dataBytes[i : i+32]
+						// Check if it looks like a padded address (first 12 bytes zero)
+						if bytes.Equal(word[:12], make([]byte, 12)) {
+							addr := common.BytesToAddress(word[12:])
+							if addr != (common.Address{}) && !seen[addr] {
+								seen[addr] = true
+								allFound = append(allFound, addr)
+							}
+						}
+					}
+				}
+			}
+		}
+		resp.Body.Close()
+
+		// Pagination check
+		if lastBlockInStream >= toBlock {
+			break
+		}
+		fromBlock = lastBlockInStream + 1
+	}
+
+	if len(allFound) > 0 {
+		log.Printf("scanner[sqd]: Found %d historical child contracts for factory %s", len(allFound), factory.Hex())
+	}
+	return allFound, nil
+}
+
 // IsFactoryCandidateBytecode checks if the bytecode contains a PUSH32 of
-// any known factory event topic hash. This avoids source-level heuristics.
+// any known factory event topic hash.
 func IsFactoryCandidateBytecode(code []byte) bool {
-	// Precompute topic hashes
 	topicMap := make(map[common.Hash]bool)
 	for _, sig := range FactoryEventSignatures {
 		topicMap[crypto.Keccak256Hash([]byte(sig))] = true
