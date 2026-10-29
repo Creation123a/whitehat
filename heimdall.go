@@ -80,10 +80,12 @@ func DecompileWithHeimdall(
 	heimdallCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
-	// 6. Build the Heimdall command using --code to avoid redundant RPC calls.
-	// Since we already fetched the bytecode in scanTarget, we can pass it directly.
-	hexCode := common.Bytes2Hex(bytecode)
-	cmd := exec.CommandContext(heimdallCtx, "heimdall", "decompile", "--code", hexCode, "--include-sol", "--skip-resolving", "-o", tmpDir)
+		// Build the Heimdall command
+	// -r: RPC URL to fetch bytecode (Heimdall will fetch it itself)
+	// --include-sol: Output pseudo-Solidity code
+	// --skip-resolving: Skip online 4byte database lookups (much faster)
+	// -o: Output directory
+	cmd := exec.CommandContext(heimdallCtx, "heimdall", "decompile", address, "-r", rpcURL, "--include-sol", "--skip-resolving", "-o", tmpDir)
 
 	// 7. Execute and capture both stdout and stderr for comprehensive logging
 	output, err := cmd.CombinedOutput()
