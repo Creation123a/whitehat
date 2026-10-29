@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	"strings"
 
 	evmole "github.com/cdump/evmole/go"
 	"github.com/ethereum/go-ethereum"
@@ -182,22 +181,22 @@ func ScanFactoryEvents(
 	toBlock *big.Int,
 ) []common.Address {
 
-	var topics [][]common.Hash
+	// FIX: Build a single slice of hashes for Topic 0
+	var topic0 []common.Hash
 	for _, sig := range FactoryEventSignatures {
-		hash := crypto.Keccak256Hash([]byte(sig))
-		topics = append(topics, hash)
+		topic0 = append(topic0, crypto.Keccak256Hash([]byte(sig)))
 	}
 
 	query := ethereum.FilterQuery{
 		FromBlock: fromBlock,
 		ToBlock:   toBlock,
 		Addresses: []common.Address{factory},
-		Topics:    [][]common.Hash{topics},
+		// FIX: Wrap the single slice of hashes in a slice of slices
+		Topics:    [][]common.Hash{topic0},
 	}
 
 	logs, err := client.FilterLogs(ctx, query)
 	if err != nil {
-		// It's common for a contract to not be a factory; we don't log errors here to avoid noise.
 		return nil
 	}
 
@@ -205,7 +204,6 @@ func ScanFactoryEvents(
 	var found []common.Address
 
 	extractAddressFromWord := func(word common.Hash) common.Address {
-		// An address in a 32-byte word is padded with 12 zero bytes on the left
 		if common.BytesToHash(word[:12]) == (common.Hash{}) {
 			return common.BytesToAddress(word[12:])
 		}
@@ -213,7 +211,6 @@ func ScanFactoryEvents(
 	}
 
 	for _, vLog := range logs {
-		// 1. Check indexed topics
 		for _, topic := range vLog.Topics[1:] {
 			addr := extractAddressFromWord(topic)
 			if addr != (common.Address{}) && !seen[addr] {
@@ -224,7 +221,6 @@ func ScanFactoryEvents(
 			}
 		}
 
-		// 2. Check data payload (non-indexed parameters)
 		for i := 0; i+32 <= len(vLog.Data); i += 32 {
 			word := common.BytesToHash(vLog.Data[i : i+32])
 			addr := extractAddressFromWord(word)
@@ -243,7 +239,6 @@ func ScanFactoryEvents(
 
 	return found
 }
-
 // IsFactoryCandidateBytecode checks if the bytecode contains a PUSH32 of
 // any known factory event topic hash. This avoids source-level heuristics.
 func IsFactoryCandidateBytecode(code []byte) bool {
