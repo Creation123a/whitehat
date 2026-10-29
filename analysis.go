@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -159,50 +160,84 @@ func ClassifyChunk(chunk string) string {
 }
 
 // =============================================================
-// Mixed Source & Per-Coin Taint Check
+// Bytecode-Level Rules (v11.0 Pre-Decompilation)
 // =============================================================
 
-// RunMixedSourceAnalysis checks each function chunk for the co-occurrence of
-// Chainlink and Spot AMM reads, and extracts the specific addresses involved.
-func RunMixedSourceAnalysis(source string) []FlagReport {
+type bytecodeRule struct {
+	ID          string
+	Category    string
+	Severity    string
+	MustHave    []string // all required selectors (hex without 0x)
+	MustNotHave []string // any of these disqualifies
+}
+
+var bytecodeRules = []bytecodeRule{
+	{ID: "BC_ORACLE_SPOT", Category: "mixed-source", Severity: "critical",
+		MustHave: []string{"feaf968c", "0902f1ac"}, // Chainlink latestRoundData + Uniswap V2 getReserves
+	},
+	{ID: "BC_ORACLE_SPOT_V3", Category: "mixed-source", Severity: "critical",
+		MustHave: []string{"feaf968c", "3850c7bd"}, // Chainlink latestRoundData + Uniswap V3 slot0
+	},
+	{ID: "BC_VAULT_NO_VIRTUAL", Category: "vault", Severity: "high",
+		MustHave: []string{"01e1d114", "18160ddd"}, // totalAssets + totalSupply
+		MustNotHave: []string{"07a2d13a"},          // convertToAssets (proxy for virtual offset)
+	},
+	{ID: "BC_LENDING_UNCHECKED", Category: "lending", Severity: "high",
+		MustHave: []string{"c5ebeaec"},             // borrow(uint256)
+		MustNotHave: []string{"5ec88c79"},          // getAccountLiquidity (missing health check)
+	},
+}
+
+// ExtractSelectorsFromBytecode scans raw EVM bytecode for PUSH4 (0x63) and returns a set.
+func ExtractSelectorsFromBytecode(code []byte) map[uint32]bool {
+	out := make(map[uint32]bool)
+	for i := 0; i+5 <= len(code); i++ {
+		if code[i] == 0x63 { // PUSH4 opcode
+			val := uint32(code[i+1])<<24 | uint32(code[i+2])<<16 | uint32(code[i+3])<<8 | uint32(code[i+4])
+			out[val] = true
+		}
+	}
+	return out
+}
+
+// RunBytecodeRules checks the extracted selector map against the structural rules.
+// This runs before any decompilation.
+func RunBytecodeRules(selectors map[uint32]bool) []FlagReport {
 	var flags []FlagReport
-	chunks := ChunkByFunction(source)
-
-	for _, chunk := range chunks {
-		// 1. Check for presence of selectors in this specific function
-		hasSpot := strings.Contains(chunk, "Unresolved_0902f1ac") || strings.Contains(chunk, "Unresolved_3850c7bd")
-		hasChainlink := strings.Contains(chunk, "Unresolved_feaf968c") || strings.Contains(chunk, "Unresolved_50d25bcd")
+	for _, rule := range bytecodeRules {
+		match := true
 		
-		if hasSpot && hasChainlink {
-			// 2. Extract all addresses referenced in this chunk
-			addresses := addressRegex.FindAllString(chunk, -1)
-			
-			// Deduplicate addresses
-			uniqueAddrs := make(map[string]bool)
-			var addrList []string
-			for _, addr := range addresses {
-				lower := strings.ToLower(addr)
-				// Skip common masks and the EIP-1967 slot
-				if strings.HasPrefix(lower, "0x000") || strings.HasPrefix(lower, "0xfff") || 
-				   strings.HasPrefix(lower, "0xaaa") || strings.HasPrefix(lower, "0x777") ||
-				   lower == "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc" {
-					continue
-				}
-				if !uniqueAddrs[lower] {
-					uniqueAddrs[lower] = true
-					addrList = append(addrList, addr)
-				}
+		// Check MustHave
+		for _, hexStr := range rule.MustHave {
+			if len(hexStr) != 8 { 
+				match = false
+				break 
 			}
+			val, err := strconv.ParseUint(hexStr, 16, 32)
+			if err != nil || !selectors[uint32(val)] {
+				match = false
+				break
+			}
+		}
+		if !match { continue }
 
-			// 3. Flag the function
-			snippet := fmt.Sprintf("CRITICAL: Function uses BOTH Spot AMM and Chainlink. Addresses referenced: %s", strings.Join(addrList, ", "))
+		// Check MustNotHave
+		for _, hexStr := range rule.MustNotHave {
+			if len(hexStr) != 8 { continue }
+			val, err := strconv.ParseUint(hexStr, 16, 32)
+			if err == nil && selectors[uint32(val)] {
+				match = false
+				break
+			}
+		}
+
+		if match {
 			flags = append(flags, FlagReport{
-				RuleID:    "MIXED_SOURCE_CHUNK",
-				Category:  "critical",
-				Severity:  "critical",
-				Snippet:   snippet + "\n\n" + chunk,
-				LineStart: 0,
-				LineEnd:   0,
+				RuleID:     rule.ID,
+				Category:   rule.Category,
+				Severity:   rule.Severity,
+				Snippet:    "Bytecode contains suspicious selector combination.",
+				LLMVerdict: "UNPROVEN_LEAD",
 			})
 		}
 	}
@@ -210,7 +245,7 @@ func RunMixedSourceAnalysis(source string) []FlagReport {
 }
 
 // =============================================================
-// Regex Rules & Scanning
+// Professional Regex Rules (v11.0 Post-Decompilation)
 // =============================================================
 
 type regexRule struct {
@@ -221,28 +256,39 @@ type regexRule struct {
 }
 
 var regexRules = []regexRule{
-	// --- 1. Decompiled Spot Price Reads (Critical) ---
-	{ID: "A1", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`Unresolved_0902f1ac`)}, // getReserves()
-	{ID: "A2", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`Unresolved_3850c7bd`)}, // slot0()
-	{ID: "A4", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`Unresolved_feaf968c`)}, // latestRoundData()
-	{ID: "A5", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`Unresolved_50d25bcd`)}, // latestAnswer()
-	{ID: "A6", Category: "spot-amm", Severity: "critical", Pattern: regexp.MustCompile(`Unresolved_bb7b8b80`)}, // get_virtual_price()
+	// 1. Oracle without staleness check
+	{ID: "ORACLE_STALE", Category: "oracle", Severity: "critical",
+		Pattern: regexp.MustCompile(`latestRoundData\s*\(\s*\)(?![\s\S]{0,200}(updatedAt|heartbeat|maxDelay))`)},
 
-	// --- 2. Precision Loss / Division Before Multiplication (High) ---
-	// Strictly matches: (var_a / var_b) * var_c
-	{ID: "C1", Category: "precision", Severity: "high", Pattern: regexp.MustCompile(`\(\s*[\w\[\]\.]+\s*/\s*[\w\[\]\.]+\s*\)\s*\*`)},
+	// 2. Spot AMM read without TWAP
+	{ID: "SPOT_NO_TWAP", Category: "spot-amm", Severity: "critical",
+		Pattern: regexp.MustCompile(`(getReserves\s*\(\s*\)|slot0\s*\(\s*\)|sqrtPriceX96)(?![\s\S]{0,300}(observe|consult|TWAP|twap|timeWeighted))`)},
 
-	// --- 3. Arithmetic Overflow / SafeMath Bypass (High) ---
-	// Strictly matches: var_a * var_b (raw multiplication without SafeMath)
-	{ID: "O1", Category: "overflow", Severity: "high", Pattern: regexp.MustCompile(`(var_\w+|storage_\w+)\s*\*\s*(var_\w+|storage_\w+)`)},
+	// 3. Division before multiplication
+	{ID: "DIV_BEFORE_MUL", Category: "precision", Severity: "high",
+		Pattern: regexp.MustCompile(`\([^)]*\s*/\s*[^)]*\)\s*\*`)},
+
+	// 4. ERC-4626 inflation without virtual shares
+	{ID: "ERC4626_INFLATE", Category: "vault", Severity: "high",
+		Pattern: regexp.MustCompile(`totalSupply\s*\(\s*\)\s*==\s*0(?![^}]{0,200}(virtual|dead|_decimalsOffset|1e[0-9]+))`)},
+
+	// 5. Answered-in-round missing
+	{ID: "CHAINLINK_ROUND", Category: "oracle", Severity: "medium",
+		Pattern: regexp.MustCompile(`latestRoundData\s*\(\s*\)(?![\s\S]{0,300}answeredInRound\s*>=?\s*roundId)`)},
+
+	// 6. Self-balance accounting (donation attack surface)
+	{ID: "SELF_BALANCE", Category: "vault", Severity: "high",
+		Pattern: regexp.MustCompile(`balanceOf\s*\(\s*address\s*\(\s*this\s*\)\s*\)`)},
+
+	// 7. Liquidation without health bound
+	{ID: "LIQ_NO_HEALTH", Category: "lending", Severity: "critical",
+		Pattern: regexp.MustCompile(`function\s+liquidate\s*\([^)]*\)[^{]*\{(?:(?!healthFactor|getAccountLiquidity|shortfall)[\s\S]){0,500}`)},
 }
 
 func RunRegexScan(source string) []FlagReport {
-	// 1. Run the per-function mixed source check first
-	flags := RunMixedSourceAnalysis(source)
-
-	// 2. Run standard regex rules
+	var flags []FlagReport
 	lines := strings.Split(source, "\n")
+	
 	for _, rule := range regexRules {
 		locs := rule.Pattern.FindAllStringIndex(source, -1)
 		for _, loc := range locs {
