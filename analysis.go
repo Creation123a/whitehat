@@ -257,11 +257,11 @@ type regexRule struct {
 var regexRules = []regexRule{
 	// 1. Oracle without staleness check
 	{ID: "ORACLE_STALE", Category: "oracle", Severity: "critical",
-		Pattern: regexp.MustCompile(`latestRoundData\s*\(\s*\)(?![\s\S]{0,200}(updatedAt|heartbeat|maxDelay))`)},
+		Pattern: regexp.MustCompile(`latestRoundData\s*\(\s*\)`)},
 
 	// 2. Spot AMM read without TWAP
 	{ID: "SPOT_NO_TWAP", Category: "spot-amm", Severity: "critical",
-		Pattern: regexp.MustCompile(`(getReserves\s*\(\s*\)|slot0\s*\(\s*\)|sqrtPriceX96)(?![\s\S]{0,300}(observe|consult|TWAP|twap|timeWeighted))`)},
+		Pattern: regexp.MustCompile(`getReserves\s*\(\s*\)|slot0\s*\(\s*\)|sqrtPriceX96`)},
 
 	// 3. Division before multiplication
 	{ID: "DIV_BEFORE_MUL", Category: "precision", Severity: "high",
@@ -269,11 +269,11 @@ var regexRules = []regexRule{
 
 	// 4. ERC-4626 inflation without virtual shares
 	{ID: "ERC4626_INFLATE", Category: "vault", Severity: "high",
-		Pattern: regexp.MustCompile(`totalSupply\s*\(\s*\)\s*==\s*0(?![^}]{0,200}(virtual|dead|_decimalsOffset|1e[0-9]+))`)},
+		Pattern: regexp.MustCompile(`totalSupply\s*\(\s*\)\s*==\s*0`)},
 
 	// 5. Answered-in-round missing
 	{ID: "CHAINLINK_ROUND", Category: "oracle", Severity: "medium",
-		Pattern: regexp.MustCompile(`latestRoundData\s*\(\s*\)(?![\s\S]{0,300}answeredInRound\s*>=?\s*roundId)`)},
+		Pattern: regexp.MustCompile(`latestRoundData\s*\(\s*\)`)},
 
 	// 6. Self-balance accounting (donation attack surface)
 	{ID: "SELF_BALANCE", Category: "vault", Severity: "high",
@@ -281,7 +281,7 @@ var regexRules = []regexRule{
 
 	// 7. Liquidation without health bound
 	{ID: "LIQ_NO_HEALTH", Category: "lending", Severity: "critical",
-		Pattern: regexp.MustCompile(`function\s+liquidate\s*\([^)]*\)[^{]*\{(?:(?!healthFactor|getAccountLiquidity|shortfall)[\s\S]){0,500}`)},
+		Pattern: regexp.MustCompile(`function\s+liquidate\s*\([^)]*\)`)},
 }
 
 func RunRegexScan(source string) []FlagReport {
@@ -314,14 +314,9 @@ func RunRegexScan(source string) []FlagReport {
 			}
 			flag.Suppressors = checkSuppressors(rule.ID, snippet)
 			
-			isSafeLib := false
-			for _, s := range flag.Suppressors {
-				if s == "known_safe_library" {
-					isSafeLib = true
-					break
-				}
-			}
-			if isSafeLib {
+			// If a suppressor matches the logic that was previously in the lookahead,
+			// do not append the flag.
+			if len(flag.Suppressors) > 0 {
 				continue
 			}
 
@@ -335,29 +330,44 @@ func checkSuppressors(ruleID, snippet string) []string {
 	var out []string
 	lower := strings.ToLower(snippet)
 
-	knownLibs := []string{
-		"credit to remco bloemen", "original credit to remco bloemen",
-		"solady", "openzeppelin", "aave", 
-		"the whitepaper contains reference", "expwad", "logwad", "muldiv", "sqr",
-	}
-	for _, lib := range knownLibs {
-		if strings.Contains(lower, lib) {
-			out = append(out, "known_safe_library")
-			return out
+	// 1. Check for safe libraries (disqualifies math/precision rules)
+	if ruleID == "DIV_BEFORE_MUL" || ruleID == "ERC4626_INFLATE" {
+		knownLibs := []string{
+			"credit to remco bloemen", "original credit to remco bloemen",
+			"solady", "openzeppelin", "aave", 
+			"the whitepaper contains reference", "expwad", "logwad", "muldiv", "sqr",
+		}
+		for _, lib := range knownLibs {
+			if strings.Contains(lower, lib) {
+				return []string{"known_safe_library"}
+			}
 		}
 	}
 
-	if regexp.MustCompile(`observe\s*\(|consult\s*\(|twap|timeweighted`).MatchString(lower) {
-		out = append(out, "has_twap_guard")
+	// 2. Rule-specific negative checks (replaces missing lookaheads)
+	switch ruleID {
+	case "ORACLE_STALE", "CHAINLINK_ROUND":
+		if regexp.MustCompile(`updatedat|heartbeat|maxdelay|answeredinround`).MatchString(lower) {
+			out = append(out, "has_freshness_check")
+		}
+	case "SPOT_NO_TWAP":
+		if regexp.MustCompile(`observe\s*\(|consult\s*\(|twap|timeweighted`).MatchString(lower) {
+			out = append(out, "has_twap_guard")
+		}
+	case "ERC4626_INFLATE":
+		if regexp.MustCompile(`virtual|dead|_decimalsoffset|1e[0-9]+`).MatchString(lower) {
+			out = append(out, "has_virtual_shares")
+		}
+	case "LIQ_NO_HEALTH":
+		if regexp.MustCompile(`healthfactor|getaccountliquidity|shortfall`).MatchString(lower) {
+			out = append(out, "has_health_check")
+		}
 	}
+
+	// 3. General guards
 	if regexp.MustCompile(`nonreentrant`).MatchString(lower) {
 		out = append(out, "has_reentrancy_guard")
 	}
-	if regexp.MustCompile(`updatedat|heartbeat|maxdelay|answeredinround`).MatchString(lower) {
-		out = append(out, "has_freshness_check")
-	}
-	if regexp.MustCompile(`decimals\s*\(|10\s*\*\*\s*decimals`).MatchString(lower) {
-		out = append(out, "has_decimals_check")
-	}
+	
 	return out
 }
