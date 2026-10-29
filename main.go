@@ -241,59 +241,20 @@ func scanTarget(
 	bcFlags := RunBytecodeRules(selectors)
 	structuralTaint := len(bcFlags) > 0
 
-	// Step 7: ANVIL PROOF GATE (before Heimdall)
-	var exploitContext string
-	var provenVuln bool
+	// Step 7: ANVIL PROOF GATE
+var exploitContext string
+var provenVuln bool
 
-	// 7a. Identify triplet for Oracle Manipulation
-	var ammPool, protocolOracle, protocolPool common.Address
-	checkTarget := func(c []byte, t common.Address) {
-		hexC := common.Bytes2Hex(c)
-		if strings.Contains(hexC, "0902f1ac") || strings.Contains(hexC, "3850c7bd") {
-			if ammPool == (common.Address{}) {
-				ammPool = t
-			}
-		}
-		if strings.Contains(hexC, "50d25bcd") || strings.Contains(hexC, "feaf968c") {
-			if protocolOracle == (common.Address{}) {
-				protocolOracle = t
-			}
-		}
-		if strings.Contains(hexC, "5ec88c79") || strings.Contains(hexC, "bf92857c") {
-			if protocolPool == (common.Address{}) {
-				protocolPool = t
-			}
-		}
-	}
-
-	checkTarget(code, target)
-	for _, dep := range deps {
-		depCode, _ := client.CodeAt(ctx, dep, nil)
-		checkTarget(depCode, dep)
-	}
-
-	if ammPool != (common.Address{}) && protocolOracle != (common.Address{}) && protocolPool != (common.Address{}) {
-		healthAddr, _ := ResolveHealthCheckTarget(ctx, client, protocolPool)
-		if healthAddr != (common.Address{}) {
-			vuln, proof, _ := exploiter.TestOracleManipulation(ctx, ammPool, protocolOracle, healthAddr, dummyUser)
-			if vuln {
-				provenVuln = true
-				exploitContext += "ANVIL: " + proof + "\n"
-			}
-		}
-	}
-
-	// 7b. ERC-4626 Inflation for vaults
-	if role == RoleVault {
-		asset := GetVaultAsset(ctx, client, target)
-		if asset != (common.Address{}) {
-			vuln, _ := exploiter.TestERC4626Inflation(ctx, target, dummyUser, common.HexToAddress("0x2222222222222222222222222222222222222222"))
-			if vuln {
-				provenVuln = true
-				exploitContext += "ANVIL: ERC-4626 inflation proven\n"
-			}
-		}
-	}
+// Run the generalized economic attack harness.
+exploitResult, err := exploiter.RunEconomicAttackHarness(ctx, target, role, deps)
+if err != nil {
+    log.Printf("scanner[anvil]: Harness error: %v", err)
+} else if exploitResult != nil {
+    provenVuln = true
+    exploitContext = fmt.Sprintf("ANVIL ECONOMIC PROOF:\nType: %s\nTarget: %s\nProfit: %s wei\nDetails: %s\nTx: %s\n",
+        exploitResult.AttackType, exploitResult.Target, exploitResult.ProfitWei.String(), exploitResult.Details, exploitResult.TxHash)
+    log.Printf("scanner[anvil]: PROVEN EXPLOIT! Type: %s, Profit: %s", exploitResult.AttackType, exploitResult.ProfitWei.String())
+}
 
 		// Step 8: HEVM FALLBACK (if Anvil could not prove or assemble)
 	if !provenVuln {
