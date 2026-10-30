@@ -52,11 +52,13 @@ var OracleSelectors = []string{
 }
 
 var AMMSelectors = []string{
-	"0902f1ac", // getReserves()
-	"3850c7bd", // slot0()
+	"0902f1ac", // getReserves() — Uniswap V2
+	"3850c7bd", // slot0() — Uniswap V3 / Solidly
 	"0dfe1681", // token0()
 	"d21220a7", // token1()
 	"1a686502", // sqrtPriceX96
+	"bb7b8b80", // get_virtual_price() — Curve
+	"f94d4668", // getPoolTokens(bytes32) — Balancer
 }
 
 var LendingSelectors = []string{
@@ -261,13 +263,14 @@ func ScanFactoryEvents(
 var sqdCache = make(map[common.Address][]common.Address)
 
 // ScanFactoryEventsSQD wraps sqdFetch with retry/backoff for rate limits.
-// Honors the Retry-After header on 429/503/529, caps total retries at 5.
 func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Hashes []common.Hash, currentBlock uint64) ([]common.Address, error) {
 	if cached, ok := sqdCache[factory]; ok {
-		log.Printf("scanner[sqd]: cache hit for factory %s (%d children)", factory.Hex(), len(cached))
 		return cached, nil
 	}
-
+	if len(sqdCache) > 5000 {
+		log.Printf("scanner[sqd]: cache size cap reached; clearing")
+		sqdCache = make(map[common.Address][]common.Address)
+	}
 	var topic0Strings []string
 	for _, h := range topic0Hashes {
 		topic0Strings = append(topic0Strings, h.Hex())
