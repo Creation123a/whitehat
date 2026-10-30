@@ -430,10 +430,10 @@ func checkSuppressors(ruleID, snippet string) []string {
 		}
 	}
 
-	// 3. General guards
-	if regexp.MustCompile(`nonreentrant`).MatchString(lower) {
-		out = append(out, "has_reentrancy_guard")
-	}
+// 3. General guards
+if ruleID == "REENTRANCY" && regexp.MustCompile(`nonreentrant`).MatchString(lower) {
+	out = append(out, "has_reentrancy_guard")
+}
 	
 	return out
 }
