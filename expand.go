@@ -114,11 +114,15 @@ func ClassifyContract(ctx context.Context, code []byte) (ContractRole, map[strin
 		Arguments:       true,
 		StateMutability: true,
 	})
-	if err == nil && info != nil && len(info.Functions) > 0 {
-		for _, fn := range info.Functions {
-			selCounts[fmt.Sprintf("%08x", fn.Selector)]++
+	// In ClassifyContract, replace the evmole enrichment block:
+if err == nil && info != nil && len(info.Functions) > 0 {
+	for _, fn := range info.Functions {
+		sel := strings.TrimPrefix(strings.ToLower(fn.Selector), "0x")
+		if len(sel) == 8 {
+			selCounts[sel]++
 		}
-	}
+	}	
+}
 
 	matches := func(taxonomy []string) int {
 		count := 0
