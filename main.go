@@ -17,9 +17,7 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
-func main() {
-	os.Exit(run())
-}
+func main() { os.Exit(run()) }
 
 func run() int {
 	fs := flag.NewFlagSet("scanner", flag.ContinueOnError)
@@ -37,10 +35,7 @@ func run() int {
 		category  = fs.String("category", "", "DefiLlama category keyword")
 	)
 
-	if err := fs.Parse(os.Args[1:]); err != nil {
-		return 1
-	}
-
+	if err := fs.Parse(os.Args[1:]); err != nil { return 1 }
 	if *category == "" || !TargetCategories[*category] {
 		fmt.Fprintln(os.Stderr, "scanner: valid --category is required")
 		return 1
@@ -51,12 +46,8 @@ func run() int {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		cancelRoot()
-	}()
+	go func() { <-sigCh; cancelRoot() }()
 
-	// ---- Anvil Lifecycle ----
 	var anvil *exec.Cmd
 	effectiveRPC := *rpcURL
 	if effectiveRPC == "" {
@@ -65,9 +56,7 @@ func run() int {
 			"--fork-block-number", fmt.Sprintf("%d", *forkBlock),
 			"--port", fmt.Sprintf("%d", *anvilPort),
 			"--chain-id", fmt.Sprintf("%d", requiredChainID),
-			"--fork-retry-backoff", "2000",
-			"--retries", "10",
-			"--timeout", "60000",
+			"--fork-retry-backoff", "2000", "--retries", "10", "--timeout", "60000",
 		)
 		anvil.Stdout = os.Stderr
 		anvil.Stderr = os.Stderr
@@ -88,10 +77,7 @@ func run() int {
 	defer cancelSetup()
 
 	rpcClient, err := dialReady(setupCtx, effectiveRPC)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "scanner: rpc connect: %v\n", err)
-		return 1
-	}
+	if err != nil { fmt.Fprintf(os.Stderr, "scanner: rpc connect: %v\n", err); return 1 }
 	defer rpcClient.Close()
 
 	client := ethclient.NewClient(rpcClient)
@@ -101,26 +87,20 @@ func run() int {
 	defer cancelRun()
 
 	blockNum, err := client.BlockNumber(runCtx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "scanner: block number: %v\n", err)
-		return 2
-	}
+	if err != nil { fmt.Fprintf(os.Stderr, "scanner: block number: %v\n", err); return 2 }
 	log.Printf("scanner: forked at block %d", blockNum)
 
-	// Phase 1: Discovery
 	protocols, err := DiscoverProtocols(runCtx, *category)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "scanner[phase1]: %v\n", err)
-		return 2
-	}
+	if err != nil { fmt.Fprintf(os.Stderr, "scanner[phase1]: %v\n", err); return 2 }
 	log.Printf("scanner[phase1]: Found %d protocols in [%s]", len(protocols), *category)
 
 	if len(protocols) == 0 {
-		rep := BuildReport(RunMetadata{ChainID: requiredChainID, BlockNumber: blockNum, CategoryKeyword: *category}, nil, nil)
+		rep := BuildReport(RunMetadata{ChainID: requiredChainID, BlockNumber: blockNum, CategoryKeyword: *category}, nil, nil, nil)
 		return WriteReport(*outPath, *format, rep)
 	}
 
 	var findings []FindingReport
+	var leads []LeadReport
 	var skipped []SkippedProtocol
 	totalFlags := 0
 	scanned := 0
@@ -128,7 +108,6 @@ func run() int {
 	for _, proto := range protocols {
 		addrs := BaseProtocolRegistry[proto.Slug]
 		if len(addrs) == 0 {
-			log.Printf("scanner[phase1]: SKIPPED %q - no hardcoded addresses in registry", proto.Name)
 			skipped = append(skipped, SkippedProtocol{Name: proto.Name, Slug: proto.Slug, Reason: "no hardcoded addresses"})
 			continue
 		}
@@ -136,11 +115,12 @@ func run() int {
 		log.Printf("scanner[phase2]: Scanning protocol %q", proto.Name)
 		visited := make(map[common.Address]bool)
 		var protoFlags []FlagReport
+		var protoLeads []LeadReport
 		scannedSuccessfully := false
 
 		for _, addr := range addrs {
-			// Pass depth=0 to initiate recursion
-			if scanTarget(runCtx, client, rpcClient, effectiveRPC, exploiter, proto, addr, visited, &protoFlags, &totalFlags, 0, blockNum) {
+			if scanTarget(runCtx, client, rpcClient, effectiveRPC, exploiter, proto, addr,
+				visited, &protoFlags, &protoLeads, &totalFlags, 0, blockNum) {
 				scannedSuccessfully = true
 			}
 		}
@@ -153,28 +133,25 @@ func run() int {
 		scanned++
 		if len(protoFlags) > 0 {
 			findings = append(findings, FindingReport{
-				Protocol: proto.Name,
-				Slug:     proto.Slug,
-				Category: proto.Category,
-				TVLUSD:   proto.TVLUSD,
-				Flags:    protoFlags,
+				Protocol: proto.Name, Slug: proto.Slug, Category: proto.Category,
+				TVLUSD: proto.TVLUSD, Flags: protoFlags,
 			})
+		}
+		// C12 FIX: bytecode-only flags go to leads, not findings
+		if len(protoLeads) > 0 {
+			leads = append(leads, protoLeads...)
 		}
 	}
 
 	meta := RunMetadata{
-		ChainID:          requiredChainID,
-		BlockNumber:      blockNum,
-		CategoryKeyword:  *category,
-		ProtocolsFound:   len(protocols),
-		ProtocolsScanned: scanned,
-		TotalFlags:       totalFlags,
+		ChainID: requiredChainID, BlockNumber: blockNum,
+		CategoryKeyword: *category, ProtocolsFound: len(protocols),
+		ProtocolsScanned: scanned, TotalFlags: totalFlags,
 	}
-	rep := BuildReport(meta, findings, skipped)
+	rep := BuildReport(meta, findings, leads, skipped)
 	return WriteReport(*outPath, *format, rep)
 }
 
-// scanTarget executes the v11.0 Proof-Gatekeeper Pipeline.
 func scanTarget(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -185,17 +162,16 @@ func scanTarget(
 	addr common.Address,
 	visited map[common.Address]bool,
 	flags *[]FlagReport,
+	leads *[]LeadReport,
 	totalFlags *int,
 	depth int,
-	blockNum uint64,        
+	blockNum uint64,
 ) bool {
-	// Depth guard
 	if depth > maxTraversalDepth || visited[addr] {
 		return false
 	}
 	visited[addr] = true
 
-	// Step 1: Proxy Resolution
 	impl := ResolveImplementation(ctx, client, addr)
 	target := addr
 	if impl != (common.Address{}) {
@@ -203,26 +179,22 @@ func scanTarget(
 		log.Printf("scanner[proxy]: Resolved %s -> Impl %s", addr.Hex(), target.Hex())
 	}
 
-	// Step 2: Fetch Bytecode via RPC
 	code, err := FetchBytecode(ctx, client, target)
 	if err != nil || len(code) == 0 {
 		log.Printf("scanner[source]: No bytecode at %s", target.Hex())
 		return false
 	}
 
-	// Step 3: Classify
 	role, _ := ClassifyContract(ctx, code)
 
-	// Step 4: Expand dependencies (BATCHED SQD)
 	dummyUser := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	deps := DiscoverLinkedContracts(ctx, client, target, code, dummyUser)
-	
+
 	var topic0Hashes []common.Hash
 	for _, sig := range FactoryEventSignatures {
 		topic0Hashes = append(topic0Hashes, crypto.Keccak256Hash([]byte(sig)))
 	}
-	
-	// ONE call to SQD (Now with retry/cache inside expand.go)
+
 	sqdDeps, err := ScanFactoryEventsSQD(ctx, target, topic0Hashes)
 	if err != nil {
 		log.Printf("scanner[sqd]: Error fetching factory events: %v", err)
@@ -230,18 +202,24 @@ func scanTarget(
 		deps = append(deps, sqdDeps...)
 	}
 
-	// Step 5: Token short-circuit AFTER expansion
+	// C5 FIX: recurse into discovered dependencies
+	for _, dep := range deps {
+		if dep == (common.Address{}) || visited[dep] {
+			continue
+		}
+		scanTarget(ctx, client, rpcClient, rpcURL, exploiter, proto, dep,
+			visited, flags, leads, totalFlags, depth+1, blockNum)
+	}
+
 	if role == RoleToken {
-		log.Printf("scanner[filter]: %s classified as RoleToken. Skipping further audit.", target.Hex())
+		log.Printf("scanner[filter]: %s classified as RoleToken. Skipping.", target.Hex())
 		return true
 	}
 
-	// Step 6: BYTECODE RULES (before any proof)
 	selectors := ExtractSelectorsFromBytecode(code)
 	bcFlags := RunBytecodeRules(selectors)
 	structuralTaint := len(bcFlags) > 0
 
-	// Step 7: ANVIL PROOF GATE
 	var exploitContext string
 	var provenVuln bool
 
@@ -251,53 +229,50 @@ func scanTarget(
 	} else if exploitResult != nil {
 		provenVuln = true
 		exploitContext = fmt.Sprintf("ANVIL ECONOMIC PROOF:\nType: %s\nTarget: %s\nProfit: %s wei\nDetails: %s\nTx: %s\n",
-			exploitResult.AttackType, exploitResult.Target, exploitResult.ProfitWei.String(), exploitResult.Details, exploitResult.TxHash)
-		log.Printf("scanner[anvil]: PROVEN EXPLOIT! Type: %s, Profit: %s", exploitResult.AttackType, exploitResult.ProfitWei.String())
+			exploitResult.AttackType, exploitResult.Target, exploitResult.ProfitWei.String(),
+			exploitResult.Details, exploitResult.TxHash)
+		log.Printf("scanner[anvil]: PROVEN EXPLOIT! Type: %s, Profit: %s",
+			exploitResult.AttackType, exploitResult.ProfitWei.String())
 	}
 
-	// Step 7.5: FUZZING (Medusa) — runs if economic harness failed
+	// C1 FIX: check InvariantBroken BEFORE err
 	if !provenVuln && (role == RoleLending || role == RoleVault || role == RoleAMM) {
 		log.Printf("scanner[fuzz]: Running Medusa invariants for %s (role: %s)", target.Hex(), role)
-		fuzzResult, err := RunMedusaFuzz(ctx, target, role, rpcURL, blockNum)
-		if err != nil {
-			log.Printf("scanner[fuzz]: Medusa error: %v", err)
-		} else if fuzzResult != nil && fuzzResult.InvariantBroken {
+		fuzzResult, fuzzErr := RunMedusaFuzz(ctx, target, role, rpcURL, blockNum)
+		if fuzzResult != nil && fuzzResult.InvariantBroken {
 			provenVuln = true
-			exploitContext = fmt.Sprintf("MEDUSA FUZZ PROOF:\nInvariant: %s\nCounterexample: %s\n", 
+			exploitContext = fmt.Sprintf("MEDUSA FUZZ PROOF:\nInvariant: %s\nCounterexample: %s\n",
 				fuzzResult.Invariant, fuzzResult.Counterexample)
 			log.Printf("scanner[fuzz]: PROVEN via invariant break: %s", fuzzResult.Invariant)
+		} else if fuzzErr != nil {
+			log.Printf("scanner[fuzz]: Medusa error: %v", fuzzErr)
 		}
 	}
 
-	
-	// Step 9: Decompile if proven, tainted, OR role is high-value
-	shouldDecompile := provenVuln || structuralTaint || 
-		role == RoleLending || role == RoleVault || role == RoleAMM
-	
+	// C10 FIX: shouldDecompile only when proven/tainted (matching DecompileWithHeimdall gate)
+	shouldDecompile := provenVuln || structuralTaint
+
 	var src string
 	if shouldDecompile {
-		log.Printf("scanner[heimdall]: Attempting decompilation for %s (Proven: %v, Tainted: %v, Role: %s)", target.Hex(), provenVuln, structuralTaint, role)
+		log.Printf("scanner[heimdall]: Decompiling %s (Proven: %v, Tainted: %v)", target.Hex(), provenVuln, structuralTaint)
 		decompiled, err := DecompileWithHeimdall(ctx, proto.Slug, target.Hex(), code, rpcURL, provenVuln, structuralTaint)
 		if err != nil {
-			log.Printf("scanner[heimdall]: FAILED to decompile %s: %v", target.Hex(), err)
+			log.Printf("scanner[heimdall]: Skipped/failed: %v", err)
 		} else {
 			src = decompiled
-			log.Printf("scanner[heimdall]: Successfully decompiled %s (%d bytes)", target.Hex(), len(src))
+			log.Printf("scanner[heimdall]: Decompiled %s (%d bytes)", target.Hex(), len(src))
 		}
 	}
 
-	// Step 10 & 11: LLM — only if proven OR tainted
 	if provenVuln || structuralTaint {
 		if src != "" {
 			chunks := ChunkByFunction(src)
-			log.Printf("scanner[llm]: Split %s into %d chunks", target.Hex(), len(chunks))
 			for _, chunk := range chunks {
 				domain := ClassifyChunk(chunk)
 				if domain != "lending" && domain != "oracle" && domain != "pricing" && domain != "vault" {
 					continue
 				}
 
-				log.Printf("scanner[llm]: Sending %s chunk to Qwen...", domain)
 				prompt := chunk
 				if exploitContext != "" {
 					prompt = fmt.Sprintf("PROOF:\n%s\n\nCODE:\n%s", exploitContext, chunk)
@@ -305,35 +280,33 @@ func scanTarget(
 
 				verdict, err := AskLocalLLM(ctx, prompt, proto.Name, string(role), domain, exploitContext)
 				if err != nil {
-					log.Printf("scanner[llm]: ERROR from Ollama: %v", err)
+					log.Printf("scanner[llm]: ERROR: %v", err)
 					continue
 				}
-				
+
 				parsed := ParseVerdict(verdict)
 				(*totalFlags)++
 				if parsed == "VULNERABLE" || (structuralTaint && exploitContext == "") {
 					*flags = append(*flags, FlagReport{
-						RuleID:          "DYNAMIC_TRACE",
-						Category:        domain,
-						Severity:        "high",
-						Snippet:         prompt,
-						LLMVerdict:      verdict,
-						ContractAddress: target.Hex(),
-						ContractRole:    string(role),
+						RuleID: "DYNAMIC_TRACE", Category: domain, Severity: "high",
+						Snippet: prompt, LLMVerdict: verdict,
+						ContractAddress: target.Hex(), ContractRole: string(role),
 					})
 				}
 			}
-		} else {
-			log.Printf("scanner[llm]: Skipping LLM for %s because decompilation returned empty source.", target.Hex())
 		}
 	}
 
-	// Step 12: Attach bytecode-rule flags directly (no LLM needed)
+	// C12 FIX: bytecode-only flags go to leads, not findings
 	for _, f := range bcFlags {
 		(*totalFlags)++
 		f.ContractAddress = target.Hex()
 		f.ContractRole = string(role)
-		*flags = append(*flags, f)
+		*leads = append(*leads, LeadReport{
+			RuleID: f.RuleID, Category: f.Category, Severity: f.Severity,
+			ContractAddress: target.Hex(), ContractRole: string(role),
+			Evidence: "bytecode selector combination",
+		})
 	}
 
 	return true
@@ -350,9 +323,7 @@ func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
 			callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			callErr := c.CallContext(callCtx, &id, "eth_chainId")
 			cancel()
-			if callErr == nil {
-				return c, nil
-			}
+			if callErr == nil { return c, nil }
 			lastErr = callErr
 			c.Close()
 		} else {
@@ -360,9 +331,7 @@ func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
 		}
 		select {
 		case <-ctx.Done():
-			if lastErr != nil {
-				return nil, fmt.Errorf("%w (last: %v)", ctx.Err(), lastErr)
-			}
+			if lastErr != nil { return nil, fmt.Errorf("%w (last: %v)", ctx.Err(), lastErr) }
 			return nil, ctx.Err()
 		case <-ticker.C:
 		}
