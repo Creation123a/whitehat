@@ -52,6 +52,13 @@ jobs:
           go-version: '1.24'
           cache: true
 
+      - name: Install Medusa
+        run: |
+          curl -L https://github.com/crytic/medusa/releases/download/v0.1.5/medusa-linux-amd64.tar.gz -o medusa.tar.gz
+          tar xzf medusa.tar.gz
+          sudo mv medusa /usr/local/bin/
+          medusa --version
+          
       - name: Install Heimdall-rs (via Bifrost)
         run: |
           sudo apt-get update
