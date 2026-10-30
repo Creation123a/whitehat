@@ -44,19 +44,24 @@ func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole
 	// 3. Medusa config
 	configFile := filepath.Join(tmpDir, "medusa.json")
 	config := map[string]interface{}{
-		"fuzzing": map[string]interface{}{
-			"timeout":         300, // 5 minutes
-			"targetContracts": []string{"Invariants"}, // Fuzz the Invariants contract
-			"testLimit":       100000,
-		},
-		"compilation": map[string]interface{}{
-			"sources": []string{tmpDir},
-		},
-		"chain": map[string]interface{}{
-			"rpcURL":      rpcURL,
-			"blockNumber": blockNum,
-		},
-	}
+    "fuzzing": map[string]interface{}{
+        "timeout":         300,
+        "targetContracts": []string{"Invariants"},
+        "testLimit":       100000,
+        "propertyTesting": map[string]interface{}{   // ← ADD THIS
+            "enabled":      true,
+            "testPrefixes": []string{"check_", "invariant_"},
+        },
+    },
+    "compilation": map[string]interface{}{
+        "sources":  []string{tmpDir},
+        "platform": "crytic-compile",  // ← also add this
+    },
+    "chain": map[string]interface{}{
+        "rpcURL":      rpcURL,
+        "blockNumber": blockNum,
+    },
+}
 	configBytes, _ := json.MarshalIndent(config, "", "  ")
 	os.WriteFile(configFile, configBytes, 0644)
 
