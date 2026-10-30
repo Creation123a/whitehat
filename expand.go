@@ -262,7 +262,7 @@ var sqdCache = make(map[common.Address][]common.Address)
 
 // ScanFactoryEventsSQD wraps sqdFetch with retry/backoff for rate limits.
 // Honors the Retry-After header on 429/503/529, caps total retries at 5.
-func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Hashes []common.Hash) ([]common.Address, error) {
+func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Hashes []common.Hash, currentBlock uint64) ([]common.Address, error) {
 	if cached, ok := sqdCache[factory]; ok {
 		log.Printf("scanner[sqd]: cache hit for factory %s (%d children)", factory.Hex(), len(cached))
 		return cached, nil
@@ -287,7 +287,7 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 		default:
 		}
 
-		addrs, retryAfter, err := sqdFetch(ctx, factory, topic0Strings)
+		addrs, retryAfter, err := sqdFetch(ctx, factory, topic0Strings, currentBlock)
 		if err == nil {
 			sqdCache[factory] = addrs
 			return addrs, nil
@@ -310,13 +310,19 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 // sqdFetch performs the actual HTTP + NDJSON pagination. It returns
 // (addresses, retryAfter, error). On 429/503/529 it returns the
 // parsed Retry-After delay so the caller can honor it.
-func sqdFetch(ctx context.Context, factory common.Address, topic0Strings []string) ([]common.Address, time.Duration, error) {
+func sqdFetch(ctx context.Context, factory common.Address, topic0Strings []string, currentBlock uint64) ([]common.Address, time.Duration, error) {
 	url := "https://portal.sqd.dev/datasets/base-mainnet/stream"
 
 	var allFound []common.Address
 	seen := make(map[common.Address]bool)
+
+	// Start from a 5,000,000-block lookback (~4 months on Base) to avoid
+	// streaming the entire chain for every factory.
 	fromBlock := uint64(0)
-	toBlock := uint64(99999999)
+	if currentBlock > 5_000_000 {
+		fromBlock = currentBlock - 5_000_000
+	}
+	toBlock := currentBlock
 
 	for {
 		select {
