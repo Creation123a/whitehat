@@ -31,9 +31,6 @@ type FindingReport struct {
 	Flags    []FlagReport `json:"flags"`
 }
 
-// LeadReport captures bytecode-only structural findings that have NOT been
-// proven via Anvil or Medusa. They are surfaced separately from Findings so
-// the proof-gated scanner does not report unproven leads as vulnerabilities.
 type LeadReport struct {
 	RuleID          string `json:"rule_id"`
 	Category        string `json:"category"`
@@ -66,16 +63,11 @@ type SkippedProtocol struct {
 type Report struct {
 	Metadata RunMetadata       `json:"metadata"`
 	Findings []FindingReport   `json:"findings"`
-	Leads    []LeadReport      `json:"leads"`
+	Leads    []LeadReport      `json:"leads,omitempty"`
 	Skipped  []SkippedProtocol `json:"skipped"`
 }
 
-func BuildReport(
-	meta RunMetadata,
-	findings []FindingReport,
-	leads []LeadReport,
-	skipped []SkippedProtocol,
-) *Report {
+func BuildReport(meta RunMetadata, findings []FindingReport, leads []LeadReport, skipped []SkippedProtocol) *Report {
 	sort.SliceStable(findings, func(i, j int) bool {
 		return findings[i].TVLUSD > findings[j].TVLUSD
 	})
@@ -83,8 +75,7 @@ func BuildReport(
 		findings[i].Rank = i + 1
 	}
 
-	// Sort leads by severity then by category for stable output
-	severityRank := func(s string) int {
+	sevRank := func(s string) int {
 		switch s {
 		case "critical":
 			return 0
@@ -92,14 +83,12 @@ func BuildReport(
 			return 1
 		case "medium":
 			return 2
-		case "low":
-			return 3
 		default:
-			return 4
+			return 3
 		}
 	}
 	sort.SliceStable(leads, func(i, j int) bool {
-		return severityRank(leads[i].Severity) < severityRank(leads[j].Severity)
+		return sevRank(leads[i].Severity) < sevRank(leads[j].Severity)
 	})
 
 	meta.SchemaVersion = "11.0"
@@ -125,7 +114,6 @@ func RenderText(w io.Writer, r *Report) {
 	fmt.Fprintf(w, "Total flags: %d   proven vulnerable: %d   leads: %d\n\n",
 		r.Metadata.TotalFlags, r.Metadata.VulnerableCount, r.Metadata.LeadsCount)
 
-	// ---- FINDINGS: only proven vulnerabilities ----
 	fmt.Fprintf(w, "--- FINDINGS (proven via Anvil / Medusa) (%d) ---\n", len(r.Findings))
 	if len(r.Findings) == 0 {
 		fmt.Fprintln(w, "(no proven vulnerabilities)")
@@ -135,22 +123,19 @@ func RenderText(w io.Writer, r *Report) {
 		for _, fl := range f.Flags {
 			fmt.Fprintf(w, "     - %s [%s] @ %s (%s)\n",
 				fl.RuleID, fl.Severity, fl.ContractAddress, fl.ContractRole)
-
 			if fl.LLMVerdict != "" {
 				fmt.Fprintf(w, "       LLM: %s\n", fl.LLMVerdict)
 			}
-
 			if len(fl.Suppressors) > 0 {
 				fmt.Fprintf(w, "       Suppressors: %v\n", fl.Suppressors)
 			}
 		}
 	}
 
-	// ---- LEADS: bytecode-only, unproven ----
 	if len(r.Leads) > 0 {
 		fmt.Fprintf(w, "\n--- LEADS (bytecode-only, unproven) (%d) ---\n", len(r.Leads))
 		for _, l := range r.Leads {
-			fmt.Fprintf(w, "  %-28s [%s] @ %s (%s)\n",
+			fmt.Fprintf(w, "  %-24s  [%s]  %s  (%s)\n",
 				l.RuleID, l.Severity, l.ContractAddress, l.ContractRole)
 			if l.Evidence != "" {
 				fmt.Fprintf(w, "     evidence: %s\n", l.Evidence)
@@ -158,7 +143,6 @@ func RenderText(w io.Writer, r *Report) {
 		}
 	}
 
-	// ---- SKIPPED ----
 	if len(r.Skipped) > 0 {
 		fmt.Fprintf(w, "\n--- SKIPPED (%d) ---\n", len(r.Skipped))
 		for _, s := range r.Skipped {
