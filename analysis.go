@@ -12,11 +12,6 @@ import (
 
 // =============================================================
 // Package-level compiled regexes
-//
-// All regexes used in hot paths (ClassifyChunk, checkSuppressors)
-// are compiled once at init time instead of per-call. This is a
-// pure performance fix — the patterns are byte-for-byte identical
-// to the previously inline-compiled ones.
 // =============================================================
 
 var (
@@ -24,12 +19,10 @@ var (
 	twapGuardPattern     = regexp.MustCompile(`observe\s*\(|consult\s*\(|twap|timeweighted`)
 	nonReentrantPattern  = regexp.MustCompile(`nonreentrant`)
 	freshnessPattern     = regexp.MustCompile(`updatedat|heartbeat|maxdelay|answeredinround`)
-	decimalsPattern      = regexp.MustCompile(`decimals\s*\(|10\s*\*\*\s*decimals`)
 	virtualSharesPattern = regexp.MustCompile(`virtual|dead|_decimalsoffset|1e[0-9]+`)
 	healthCheckPattern   = regexp.MustCompile(`healthfactor|getaccountliquidity|shortfall`)
 
 	functionBoundaryRegex = regexp.MustCompile(`function\s+Unresolved_[a-zA-Z0-9]+`)
-	addressRegex          = regexp.MustCompile(`0x[a-fA-F0-9]{40}`)
 )
 
 // =============================================================
@@ -81,41 +74,6 @@ func FetchBytecode(ctx context.Context, client *ethclient.Client, addr common.Ad
 }
 
 // =============================================================
-// Dependency Extraction
-// =============================================================
-
-func ExtractDependencies(ctx context.Context, client *ethclient.Client, source string, self common.Address) []common.Address {
-	matches := addressRegex.FindAllString(source, -1)
-	seen := make(map[common.Address]bool)
-	var out []common.Address
-	for _, m := range matches {
-		a := common.HexToAddress(m)
-		if a == (common.Address{}) || a == self {
-			continue
-		}
-		lower := strings.ToLower(m)
-		if strings.HasPrefix(lower, "0x000") || strings.HasPrefix(lower, "0xfff") ||
-			strings.HasPrefix(lower, "0xaaa") || strings.HasPrefix(lower, "0x777") {
-			continue
-		}
-		if lower == "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc" {
-			continue
-		}
-
-		code, err := client.CodeAt(ctx, a, nil)
-		if err != nil || len(code) == 0 {
-			continue
-		}
-
-		if !seen[a] {
-			seen[a] = true
-			out = append(out, a)
-		}
-	}
-	return out
-}
-
-// =============================================================
 // Chunking & Classification
 // =============================================================
 
@@ -140,11 +98,6 @@ func ChunkByFunction(source string) []string {
 }
 
 // ClassifyChunk determines the primary domain of a function chunk.
-//
-// Priority overrides run first because the keywords below are unambiguous.
-// Only when none of them match do we fall back to numeric scoring, which uses
-// word-boundary regexes for short math tokens (so "address" doesn't score as
-// "add").
 func ClassifyChunk(chunk string) string {
 	lower := strings.ToLower(chunk)
 
@@ -190,27 +143,16 @@ func ClassifyChunk(chunk string) string {
 	}
 
 	// --- Scoring fallback ---
-	counts := map[string]int{
-		"pricing": 0,
-		"oracle":  0,
-		"lending": 0,
-		"vault":   0,
-	}
+	counts := map[string]int{"pricing": 0, "oracle": 0, "lending": 0, "vault": 0}
 
-	// Pricing: math tokens with word boundaries (hoisted regex)
 	counts["pricing"] = len(pricingMathPattern.FindAllString(lower, -1))
 
-	// Oracle keywords
 	for _, kw := range []string{"oracle", "twap", "pricefeed"} {
 		counts["oracle"] += strings.Count(lower, kw)
 	}
-
-	// Lending keywords (not substrings of common words)
 	for _, kw := range []string{"borrow", "collateral", "debt", "liquidation", "healthfactor"} {
 		counts["lending"] += strings.Count(lower, kw)
 	}
-
-	// Vault keywords
 	for _, kw := range []string{"totalassets", "totalsupply", "shareprice", "slippage"} {
 		counts["vault"] += strings.Count(lower, kw)
 	}
@@ -223,12 +165,9 @@ func ClassifyChunk(chunk string) string {
 			maxDomain = domain
 		}
 	}
-
-	// Only classify when the signal is strong enough
 	if maxCount < 2 {
 		return "general"
 	}
-
 	return maxDomain
 }
 
@@ -240,32 +179,31 @@ type bytecodeRule struct {
 	ID          string
 	Category    string
 	Severity    string
-	MustHave    []string // all required selectors (hex without 0x)
-	MustNotHave []string // any of these disqualifies
+	MustHave    []string
+	MustNotHave []string
 }
 
 var bytecodeRules = []bytecodeRule{
 	{ID: "BC_ORACLE_SPOT", Category: "mixed-source", Severity: "critical",
-		MustHave: []string{"feaf968c", "0902f1ac"}, // Chainlink latestRoundData + Uniswap V2 getReserves
+		MustHave: []string{"feaf968c", "0902f1ac"},
 	},
 	{ID: "BC_ORACLE_SPOT_V3", Category: "mixed-source", Severity: "critical",
-		MustHave: []string{"feaf968c", "3850c7bd"}, // Chainlink latestRoundData + Uniswap V3 slot0
+		MustHave: []string{"feaf968c", "3850c7bd"},
 	},
 	{ID: "BC_VAULT_NO_VIRTUAL", Category: "vault", Severity: "high",
-		MustHave: []string{"01e1d114", "18160ddd"}, // totalAssets + totalSupply
-		MustNotHave: []string{"07a2d13a"},          // convertToAssets (proxy for virtual offset)
+		MustHave:    []string{"01e1d114", "18160ddd"},
+		MustNotHave: []string{"07a2d13a"},
 	},
 	{ID: "BC_LENDING_UNCHECKED", Category: "lending", Severity: "high",
-	MustHave:    []string{"c5ebeaec"},              // borrow(uint256)
-	MustNotHave: []string{"5ec88c79", "bf92857c"}, // Compound getAccountLiquidity OR Aave getUserAccountData
-},
+		MustHave:    []string{"c5ebeaec"},
+		MustNotHave: []string{"5ec88c79", "bf92857c"},
+	},
 }
 
-// ExtractSelectorsFromBytecode scans raw EVM bytecode for PUSH4 (0x63) and returns a set.
 func ExtractSelectorsFromBytecode(code []byte) map[uint32]bool {
 	out := make(map[uint32]bool)
 	for i := 0; i+5 <= len(code); i++ {
-		if code[i] == 0x63 { // PUSH4 opcode
+		if code[i] == 0x63 {
 			val := uint32(code[i+1])<<24 | uint32(code[i+2])<<16 | uint32(code[i+3])<<8 | uint32(code[i+4])
 			out[val] = true
 		}
@@ -273,14 +211,10 @@ func ExtractSelectorsFromBytecode(code []byte) map[uint32]bool {
 	return out
 }
 
-// RunBytecodeRules checks the extracted selector map against the structural rules.
-// This runs before any decompilation.
 func RunBytecodeRules(selectors map[uint32]bool) []FlagReport {
 	var flags []FlagReport
 	for _, rule := range bytecodeRules {
 		match := true
-
-		// Check MustHave
 		for _, hexStr := range rule.MustHave {
 			if len(hexStr) != 8 {
 				match = false
@@ -295,8 +229,6 @@ func RunBytecodeRules(selectors map[uint32]bool) []FlagReport {
 		if !match {
 			continue
 		}
-
-		// Check MustNotHave
 		for _, hexStr := range rule.MustNotHave {
 			if len(hexStr) != 8 {
 				continue
@@ -307,7 +239,6 @@ func RunBytecodeRules(selectors map[uint32]bool) []FlagReport {
 				break
 			}
 		}
-
 		if match {
 			flags = append(flags, FlagReport{
 				RuleID:     rule.ID,
@@ -322,7 +253,7 @@ func RunBytecodeRules(selectors map[uint32]bool) []FlagReport {
 }
 
 // =============================================================
-// Professional Regex Rules (v11.0 Post-Decompilation)
+// Regex Rules (v11.0 Post-Decompilation)
 // =============================================================
 
 type regexRule struct {
@@ -333,35 +264,20 @@ type regexRule struct {
 }
 
 var regexRules = []regexRule{
-	// 1. Oracle without staleness check
 	{ID: "ORACLE_STALE", Category: "oracle", Severity: "critical",
 		Pattern: regexp.MustCompile(`latestRoundData\s*\(\s*\)`)},
-
-	// 2. Spot AMM read without TWAP
 	{ID: "SPOT_NO_TWAP", Category: "spot-amm", Severity: "critical",
 		Pattern: regexp.MustCompile(`getReserves\s*\(\s*\)|slot0\s*\(\s*\)|sqrtPriceX96|get_virtual_price\s*\(\s*\)`)},
-
-	// 3. Division before multiplication
 	{ID: "DIV_BEFORE_MUL", Category: "precision", Severity: "high",
 		Pattern: regexp.MustCompile(`\([^)]*\s*/\s*[^)]*\)\s*\*`)},
-
-	// 4. ERC-4626 inflation without virtual shares
 	{ID: "ERC4626_INFLATE", Category: "vault", Severity: "high",
 		Pattern: regexp.MustCompile(`totalSupply\s*\(\s*\)\s*==\s*0`)},
-
-	// 5. Answered-in-round missing
 	{ID: "CHAINLINK_ROUND", Category: "oracle", Severity: "medium",
 		Pattern: regexp.MustCompile(`latestRoundData\s*\(\s*\)`)},
-
-	// 6. Self-balance accounting (donation attack surface)
 	{ID: "SELF_BALANCE", Category: "vault", Severity: "high",
 		Pattern: regexp.MustCompile(`balanceOf\s*\(\s*address\s*\(\s*this\s*\)\s*\)`)},
-
-	// 7. Liquidation without health bound
 	{ID: "LIQ_NO_HEALTH", Category: "lending", Severity: "critical",
 		Pattern: regexp.MustCompile(`function\s+liquidate\s*\([^)]*\)`)},
-
-	// 8. REENTRANCY — previously defined suppressor but no rule
 	{ID: "REENTRANCY", Category: "reentrancy", Severity: "high",
 		Pattern: regexp.MustCompile(`\.call\s*\{[^}]*value|\.call\.value|Unresolved_[a-f0-9]+\s*\([^)]*\)\s*;[^}]*\.call`)},
 }
@@ -396,8 +312,6 @@ func RunRegexScan(source string) []FlagReport {
 			}
 			flag.Suppressors = checkSuppressors(rule.ID, snippet)
 
-			// If any suppressor matched, drop the flag. Suppressors are rule-specific
-			// (see checkSuppressors), so this does not hide findings for other rules.
 			if len(flag.Suppressors) > 0 {
 				continue
 			}
@@ -412,7 +326,6 @@ func checkSuppressors(ruleID, snippet string) []string {
 	var out []string
 	lower := strings.ToLower(snippet)
 
-	// 1. Known safe library (only disqualifies math/precision rules)
 	if ruleID == "DIV_BEFORE_MUL" || ruleID == "ERC4626_INFLATE" {
 		knownLibs := []string{
 			"credit to remco bloemen", "original credit to remco bloemen",
@@ -426,7 +339,6 @@ func checkSuppressors(ruleID, snippet string) []string {
 		}
 	}
 
-	// 2. Rule-specific suppressors (hoisted regexes)
 	switch ruleID {
 	case "ORACLE_STALE", "CHAINLINK_ROUND":
 		if freshnessPattern.MatchString(lower) {
@@ -446,8 +358,6 @@ func checkSuppressors(ruleID, snippet string) []string {
 		}
 	}
 
-	// 3. General guards — scoped to the relevant rule.
-	// The reentrancy guard must not suppress oracle/math/vault findings.
 	if ruleID == "REENTRANCY" && nonReentrantPattern.MatchString(lower) {
 		out = append(out, "has_reentrancy_guard")
 	}
