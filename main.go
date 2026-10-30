@@ -141,7 +141,7 @@ func run() int {
 
 		for _, addr := range addrs {
 			// Pass depth=0 to initiate recursion
-			if scanTarget(runCtx, client, rpcClient, effectiveRPC, exploiter, proto, addr, visited, &protoFlags, &totalFlags, 0) {
+			if scanTarget(runCtx, client, rpcClient, effectiveRPC, exploiter, proto, addr, visited, &protoFlags, &totalFlags, 0, blockNum) {
 				scannedSuccessfully = true
 			}
 		}
@@ -188,6 +188,7 @@ func scanTarget(
 	flags *[]FlagReport,
 	totalFlags *int,
 	depth int,
+	blockNum uint64,        
 ) bool {
 	// Depth guard
 	if depth > maxTraversalDepth || visited[addr] {
