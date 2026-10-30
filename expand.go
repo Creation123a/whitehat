@@ -9,17 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	evmole "github.com/cdump/evmole/go"
-	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethclient"
 )
 
 // =============================================================
@@ -43,12 +39,7 @@ const (
 // =============================================================
 
 var OracleSelectors = []string{
-	"feaf968c", // latestRoundData()
-	"50d25bcd", // latestAnswer()
-	"98d5fdca", // getPrice()
-	"b3596f07", // getAssetPrice(address)
-	"fc57d4df", // getUnderlyingPrice(address)
-	"a035b1fe", // price()
+	"feaf968c", "50d25bcd", "98d5fdca", "b3596f07", "fc57d4df", "a035b1fe",
 }
 
 var AMMSelectors = []string{
@@ -62,69 +53,43 @@ var AMMSelectors = []string{
 }
 
 var LendingSelectors = []string{
-	"5ec88c79", // getAccountLiquidity(address)
-	"3b1d21a2", // getCash()
-	"17bfdfbc", // borrowBalanceStored(address)
-	"c5ebeaec", // borrow(uint256)
-	"0e752702", // repayBorrow(uint256)
-	"bf92857c", // getUserAccountData(address) [Aave V3]
+	"5ec88c79", "3b1d21a2", "17bfdfbc", "c5ebeaec", "0e752702", "bf92857c",
 }
 
 var VaultSelectors = []string{
-	"07a2d13a", // convertToAssets(uint256)
-	"c6e6f592", // convertToShares(uint256)
-	"01e1d114", // totalAssets()
-	"4cdad506", // previewRedeem(uint256)
-	"6e553f65", // deposit(uint256,address)
-	"ba087652", // redeem(uint256,address,address)
+	"07a2d13a", "c6e6f592", "01e1d114", "4cdad506", "6e553f65", "ba087652",
 }
 
 var TokenSelectors = []string{
-	"a9059cbb", // transfer
-	"095ea7b3", // approve
-	"18160ddd", // totalSupply
-	"70a08231", // balanceOf
-	"23b872dd", // transferFrom
-	"dd62ed3e", // allowance
+	"a9059cbb", "095ea7b3", "18160ddd", "70a08231", "23b872dd", "dd62ed3e",
 }
 
 // =============================================================
 // ClassifyContract
 // =============================================================
-//
-// Fix B: Always run the raw bytecode scan first. evmole is
-// additive enrichment, not the primary source. The old logic
-// returned an empty selector map when evmole succeeded but
-// returned zero functions (common for proxy-heavy contracts),
-// causing RoleLending markets to fall through to RoleUnknown.
 
 func ClassifyContract(ctx context.Context, code []byte) (ContractRole, map[string]int) {
 	selCounts := make(map[string]int)
 
-	// 1. Always scan raw bytecode for PUSH4 selectors.
 	for i := 0; i+5 <= len(code); i++ {
-		if code[i] == 0x63 { // PUSH4
+		if code[i] == 0x63 {
 			selCounts[hex.EncodeToString(code[i+1:i+5])]++
 		}
 	}
 
-	// 2. Enrich with evmole metadata when available. This adds
-	// functions that evmole discovers via a different code path
-	// (rare, but possible with certain jump-table patterns).
 	info, err := evmole.ContractInfo(ctx, code, evmole.Options{
 		Selectors:       true,
 		Arguments:       true,
 		StateMutability: true,
 	})
-	// In ClassifyContract, replace the evmole enrichment block:
-if err == nil && info != nil && len(info.Functions) > 0 {
-	for _, fn := range info.Functions {
-		sel := strings.TrimPrefix(strings.ToLower(fn.Selector), "0x")
-		if len(sel) == 8 {
-			selCounts[sel]++
+	if err == nil && info != nil && len(info.Functions) > 0 {
+		for _, fn := range info.Functions {
+			sel := strings.TrimPrefix(strings.ToLower(fn.Selector), "0x")
+			if len(sel) == 8 {
+				selCounts[sel]++
+			}
 		}
-	}	
-}
+	}
 
 	matches := func(taxonomy []string) int {
 		count := 0
@@ -172,13 +137,13 @@ if err == nil && info != nil && len(info.Functions) > 0 {
 // =============================================================
 
 var FactoryEventSignatures = []string{
-	"PairCreated(address,address,address,uint256)",      // Uniswap V2
-	"PairCreated(address,address,bool,address)",         // Aerodrome 4-arg
-	"PairCreated(address,address,bool,address,uint256)", // Aerodrome 5-arg
-	"PoolCreated(address,address,uint24,int24,address)", // Uniswap V3
-	"MarketListed(address)",                             // Compound
+	"PairCreated(address,address,address,uint256)",
+	"PairCreated(address,address,bool,address)",
+	"PairCreated(address,address,bool,address,uint256)",
+	"PoolCreated(address,address,uint24,int24,address)",
+	"MarketListed(address)",
 	"MarketCreated(address,address)",
-	"CreateMarket(bytes32,address)",                     // Morpho
+	"CreateMarket(bytes32,address)",
 	"VaultCreated(address,address)",
 	"VaultCreated(address)",
 	"NewVault(address)",
@@ -187,82 +152,12 @@ var FactoryEventSignatures = []string{
 	"ProxyCreated(address)",
 }
 
-// ScanFactoryEvents searches for logs emitted by the given factory contract
-// that match known factory event signatures using eth_getLogs.
-func ScanFactoryEvents(
-	ctx context.Context,
-	client *ethclient.Client,
-	factory common.Address,
-	fromBlock *big.Int,
-	toBlock *big.Int,
-) []common.Address {
-
-	var topic0 []common.Hash
-	for _, sig := range FactoryEventSignatures {
-		topic0 = append(topic0, crypto.Keccak256Hash([]byte(sig)))
-	}
-
-	query := ethereum.FilterQuery{
-		FromBlock: fromBlock,
-		ToBlock:   toBlock,
-		Addresses: []common.Address{factory},
-		Topics:    [][]common.Hash{topic0},
-	}
-
-	logs, err := client.FilterLogs(ctx, query)
-	if err != nil {
-		return nil
-	}
-
-	seen := make(map[common.Address]bool)
-	var found []common.Address
-
-	extractAddressFromWord := func(word common.Hash) common.Address {
-		if common.BytesToHash(word[:12]) == (common.Hash{}) {
-			return common.BytesToAddress(word[12:])
-		}
-		return common.Address{}
-	}
-
-	for _, vLog := range logs {
-		for _, topic := range vLog.Topics[1:] {
-			addr := extractAddressFromWord(topic)
-			if addr != (common.Address{}) && !seen[addr] {
-				if code, err := client.CodeAt(ctx, addr, nil); err == nil && len(code) > 0 {
-					found = append(found, addr)
-					seen[addr] = true
-				}
-			}
-		}
-
-		for i := 0; i+32 <= len(vLog.Data); i += 32 {
-			word := common.BytesToHash(vLog.Data[i : i+32])
-			addr := extractAddressFromWord(word)
-			if addr != (common.Address{}) && !seen[addr] {
-				if code, err := client.CodeAt(ctx, addr, nil); err == nil && len(code) > 0 {
-					found = append(found, addr)
-					seen[addr] = true
-				}
-			}
-		}
-	}
-
-	if len(found) > 0 {
-		log.Printf("scanner[factory]: Found %d contracts emitted by factory %s", len(found), factory.Hex())
-	}
-
-	return found
-}
-
 // =============================================================
 // SQD Portal Discovery (RPC-Free, Batched, Cached, Retried)
 // =============================================================
 
-// sqdCache prevents re-querying the same factory within a single run.
-// Keyed by factory address.
 var sqdCache = make(map[common.Address][]common.Address)
 
-// ScanFactoryEventsSQD wraps sqdFetch with retry/backoff for rate limits.
 func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Hashes []common.Hash, currentBlock uint64) ([]common.Address, error) {
 	if cached, ok := sqdCache[factory]; ok {
 		return cached, nil
@@ -271,6 +166,7 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 		log.Printf("scanner[sqd]: cache size cap reached; clearing")
 		sqdCache = make(map[common.Address][]common.Address)
 	}
+
 	var topic0Strings []string
 	for _, h := range topic0Hashes {
 		topic0Strings = append(topic0Strings, h.Hex())
@@ -303,24 +199,18 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 		} else if !strings.Contains(err.Error(), "529") &&
 			!strings.Contains(err.Error(), "503") &&
 			!strings.Contains(err.Error(), "429") {
-			// Non-retryable error (e.g. malformed request), stop early
 			break
 		}
 	}
 	return nil, lastErr
 }
 
-// sqdFetch performs the actual HTTP + NDJSON pagination. It returns
-// (addresses, retryAfter, error). On 429/503/529 it returns the
-// parsed Retry-After delay so the caller can honor it.
 func sqdFetch(ctx context.Context, factory common.Address, topic0Strings []string, currentBlock uint64) ([]common.Address, time.Duration, error) {
 	url := "https://portal.sqd.dev/datasets/base-mainnet/stream"
 
 	var allFound []common.Address
 	seen := make(map[common.Address]bool)
 
-	// Start from a 5,000,000-block lookback (~4 months on Base) to avoid
-	// streaming the entire chain for every factory.
 	fromBlock := uint64(0)
 	if currentBlock > 5_000_000 {
 		fromBlock = currentBlock - 5_000_000
@@ -363,13 +253,11 @@ func sqdFetch(ctx context.Context, factory common.Address, topic0Strings []strin
 			return allFound, 0, err
 		}
 
-		// 204 = no matching blocks in the requested range. Not an error.
 		if resp.StatusCode == http.StatusNoContent {
 			resp.Body.Close()
 			return allFound, 0, nil
 		}
 
-		// Rate limit / server overload — surface Retry-After.
 		if resp.StatusCode == 429 || resp.StatusCode == 503 || resp.StatusCode == 529 {
 			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 			body, _ := io.ReadAll(resp.Body)
@@ -383,7 +271,6 @@ func sqdFetch(ctx context.Context, factory common.Address, topic0Strings []strin
 			return allFound, 0, fmt.Errorf("SQD API error %d: %s", resp.StatusCode, string(body))
 		}
 
-		// NDJSON stream. Increase buffer to 10MB to survive very wide logs.
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 1024*1024), 1024*1024*10)
 		lastBlockInStream := int64(-1)
@@ -406,7 +293,6 @@ func sqdFetch(ctx context.Context, factory common.Address, topic0Strings []strin
 			lastBlockInStream = int64(chunk.Header.Number)
 
 			for _, logEntry := range chunk.Logs {
-				// 1. Indexed topics
 				for _, topic := range logEntry.Topics[1:] {
 					if len(topic) == 66 {
 						addr := common.HexToAddress(topic)
@@ -417,7 +303,6 @@ func sqdFetch(ctx context.Context, factory common.Address, topic0Strings []strin
 					}
 				}
 
-				// 2. Non-indexed data payload
 				if len(logEntry.Data) > 2 {
 					dataBytes := common.FromHex(logEntry.Data)
 					for i := 0; i+32 <= len(dataBytes); i += 32 {
@@ -435,7 +320,6 @@ func sqdFetch(ctx context.Context, factory common.Address, topic0Strings []strin
 		}
 		resp.Body.Close()
 
-		// Infinite loop protection: if no blocks were returned, stop.
 		if lastBlockInStream == -1 || uint64(lastBlockInStream) >= toBlock {
 			break
 		}
@@ -449,9 +333,6 @@ func sqdFetch(ctx context.Context, factory common.Address, topic0Strings []strin
 	return allFound, 0, nil
 }
 
-// parseRetryAfter parses the Retry-After header into a Duration.
-// SQD sends this in seconds (per the Portal docs). Capped at 60s
-// so a single request cannot stall the pipeline.
 func parseRetryAfter(header string) time.Duration {
 	if header == "" {
 		return 0
@@ -463,24 +344,4 @@ func parseRetryAfter(header string) time.Duration {
 		return time.Duration(secs) * time.Second
 	}
 	return 0
-}
-
-// IsFactoryCandidateBytecode checks if the bytecode contains a PUSH32 of
-// any known factory event topic hash.
-func IsFactoryCandidateBytecode(code []byte) bool {
-	topicMap := make(map[common.Hash]bool)
-	for _, sig := range FactoryEventSignatures {
-		topicMap[crypto.Keccak256Hash([]byte(sig))] = true
-	}
-
-	for i := 0; i+33 <= len(code); i++ {
-		if code[i] == 0x7f { // PUSH32
-			var hash common.Hash
-			copy(hash[:], code[i+1:i+33])
-			if topicMap[hash] {
-				return true
-			}
-		}
-	}
-	return false
 }
