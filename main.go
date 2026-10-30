@@ -153,6 +153,23 @@ func run() int {
 	return WriteReport(*outPath, *format, rep)
 }
 
+// scanTarget executes the v11.0 Proof-Gatekeeper Pipeline for a single
+// target (and recursively for its discovered dependencies).
+//
+// Pipeline order:
+//   1. Depth/visited guard
+//   2. Proxy resolution (EIP-1967 / legacy / EIP-1167)
+//   3. Bytecode fetch + role classification
+//   4. Dependency discovery (evmole view calls + SQD factory events)
+//   5. Bounded recursion into dependencies
+//   6. Token short-circuit
+//   7. Bytecode-level structural rules (pre-decompile)
+//   8. Anvil economic proof gate
+//   9. Medusa invariant proof gate
+//  10. Heimdall decompile (gated by proof OR taint)
+//  11. LLM root-cause analysis (gated by proof OR taint)
+//  12. Regex tier over decompiled source (leads only)
+//  13. Bytecode leads emitted
 func scanTarget(
 	ctx context.Context,
 	client *ethclient.Client,
@@ -168,11 +185,13 @@ func scanTarget(
 	depth int,
 	blockNum uint64,
 ) bool {
+	// ---- 1. Depth / visited guard -----------------------------------
 	if depth > maxTraversalDepth || visited[addr] {
 		return false
 	}
 	visited[addr] = true
 
+	// ---- 2. Proxy resolution ----------------------------------------
 	impl := ResolveImplementation(ctx, client, addr)
 	target := addr
 	if impl != (common.Address{}) {
@@ -180,14 +199,15 @@ func scanTarget(
 		log.Printf("scanner[proxy]: Resolved %s -> Impl %s", addr.Hex(), target.Hex())
 	}
 
+	// ---- 3. Bytecode fetch + role classification --------------------
 	code, err := FetchBytecode(ctx, client, target)
 	if err != nil || len(code) == 0 {
 		log.Printf("scanner[source]: No bytecode at %s", target.Hex())
 		return false
 	}
-
 	role, _ := ClassifyContract(ctx, code)
 
+	// ---- 4. Dependency discovery ------------------------------------
 	dummyUser := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	deps := DiscoverLinkedContracts(ctx, client, target, code, dummyUser)
 
@@ -202,6 +222,7 @@ func scanTarget(
 		deps = append(deps, sqdDeps...)
 	}
 
+	// ---- 5. Bounded recursion ---------------------------------------
 	children := 0
 	for _, dep := range deps {
 		if dep == (common.Address{}) || visited[dep] {
@@ -216,11 +237,13 @@ func scanTarget(
 		children++
 	}
 
+	// ---- 6. Token short-circuit -------------------------------------
 	if role == RoleToken {
 		log.Printf("scanner[filter]: %s classified as RoleToken. Skipping.", target.Hex())
 		return true
 	}
 
+	// ---- 7. Bytecode-level structural rules -------------------------
 	selectors := ExtractSelectorsFromBytecode(code)
 	bcFlags := RunBytecodeRules(selectors)
 	structuralTaint := len(bcFlags) > 0
@@ -228,20 +251,25 @@ func scanTarget(
 	var exploitContext string
 	var provenVuln bool
 
+	// ---- 8. Anvil economic proof gate -------------------------------
 	exploitResult, err := exploiter.RunEconomicAttackHarness(ctx, target, role, deps)
 	if err != nil {
 		log.Printf("scanner[anvil]: Harness error: %v", err)
 	} else if exploitResult != nil {
 		if exploitResult.LeadOnly {
 			*leads = append(*leads, LeadReport{
-				RuleID: "ANVIL_ORACLE_SPOT_DEPENDENT", Category: "mixed-source",
-				Severity: "high", ContractAddress: target.Hex(), ContractRole: string(role),
-				Evidence: exploitResult.Details,
+				RuleID:          "ANVIL_ORACLE_SPOT_DEPENDENT",
+				Category:        "mixed-source",
+				Severity:        "high",
+				ContractAddress: target.Hex(),
+				ContractRole:    string(role),
+				Evidence:        exploitResult.Details,
 			})
 			log.Printf("scanner[anvil]: Structural lead recorded: %s", exploitResult.Details)
 		} else {
 			provenVuln = true
-			exploitContext = fmt.Sprintf("ANVIL ECONOMIC PROOF:\nType: %s\nTarget: %s\nProfit: %s wei\nDetails: %s\nTx: %s\n",
+			exploitContext = fmt.Sprintf(
+				"ANVIL ECONOMIC PROOF:\nType: %s\nTarget: %s\nProfit: %s wei\nDetails: %s\nTx: %s\n",
 				exploitResult.AttackType, exploitResult.Target, exploitResult.ProfitWei.String(),
 				exploitResult.Details, exploitResult.TxHash)
 			log.Printf("scanner[anvil]: PROVEN EXPLOIT! Type: %s, Profit: %s",
@@ -249,24 +277,29 @@ func scanTarget(
 		}
 	}
 
+	// ---- 9. Medusa invariant proof gate -----------------------------
 	if !provenVuln && (role == RoleLending || role == RoleVault || role == RoleAMM) {
 		log.Printf("scanner[fuzz]: Running Medusa invariants for %s (role: %s)", target.Hex(), role)
 		fuzzResult, fuzzErr := RunMedusaFuzz(ctx, target, role, rpcURL, blockNum)
-		if fuzzResult != nil && fuzzResult.InvariantBroken && fuzzErr == nil {
+		switch {
+		case fuzzResult != nil && fuzzResult.InvariantBroken && fuzzErr == nil:
 			provenVuln = true
 			exploitContext = fmt.Sprintf("MEDUSA FUZZ PROOF:\nInvariant: %s\nCounterexample: %s\n",
 				fuzzResult.Invariant, fuzzResult.Counterexample)
 			log.Printf("scanner[fuzz]: PROVEN via invariant break: %s", fuzzResult.Invariant)
-		} else if fuzzErr != nil {
+		case fuzzResult != nil && fuzzResult.Skipped:
+			log.Printf("scanner[fuzz]: Medusa skipped: %s", fuzzResult.SkipReason)
+		case fuzzErr != nil:
 			log.Printf("scanner[fuzz]: Medusa error: %v", fuzzErr)
 		}
 	}
 
+	// ---- 10. Heimdall decompile (gated by proof OR taint) -----------
 	shouldDecompile := provenVuln || structuralTaint
-
 	var src string
 	if shouldDecompile {
-		log.Printf("scanner[heimdall]: Decompiling %s (Proven: %v, Tainted: %v)", target.Hex(), provenVuln, structuralTaint)
+		log.Printf("scanner[heimdall]: Decompiling %s (Proven: %v, Tainted: %v)",
+			target.Hex(), provenVuln, structuralTaint)
 		decompiled, err := DecompileWithHeimdall(ctx, proto.Slug, target.Hex(), code, rpcURL, provenVuln, structuralTaint)
 		if errors.Is(err, ErrDecompileSkipped) {
 			log.Printf("scanner[heimdall]: Decompilation skipped (no proof, no taint)")
@@ -278,6 +311,7 @@ func scanTarget(
 		}
 	}
 
+	// ---- 11. LLM root-cause analysis --------------------------------
 	if provenVuln || structuralTaint {
 		if src != "" {
 			chunks := ChunkByFunction(src)
@@ -302,27 +336,59 @@ func scanTarget(
 				(*totalFlags)++
 				if parsed == "VULNERABLE" || (structuralTaint && exploitContext == "") {
 					*flags = append(*flags, FlagReport{
-						RuleID: "DYNAMIC_TRACE", Category: domain, Severity: "high",
-						Snippet: prompt, LLMVerdict: verdict,
-						ContractAddress: target.Hex(), ContractRole: string(role),
+						RuleID:          "DYNAMIC_TRACE",
+						Category:        domain,
+						Severity:        "high",
+						Snippet:         prompt,
+						LLMVerdict:      verdict,
+						ContractAddress: target.Hex(),
+						ContractRole:    string(role),
 					})
 				}
 			}
 		}
 	}
 
+	// ---- 12. Regex tier over decompiled source (leads only) ---------
+	// RunRegexScan produces heuristic hits (DIV_BEFORE_MUL, SPOT_NO_TWAP,
+	// SELF_BALANCE, ORACLE_STALE, CHAINLINK_ROUND, LIQ_NO_HEALTH,
+	// REENTRANCY). These are routed to Leads, not Findings — they have
+	// not been proven economically. The LLM analysis above may have
+	// already promoted some patterns to Findings via DYNAMIC_TRACE.
+	if src != "" {
+		regexFlags := RunRegexScan(src)
+		for i := range regexFlags {
+			regexFlags[i].ContractAddress = target.Hex()
+			regexFlags[i].ContractRole = string(role)
+			*leads = append(*leads, LeadReport{
+				RuleID:          regexFlags[i].RuleID,
+				Category:        regexFlags[i].Category,
+				Severity:        regexFlags[i].Severity,
+				ContractAddress: target.Hex(),
+				ContractRole:    string(role),
+				Evidence:        regexFlags[i].Snippet,
+			})
+			(*totalFlags)++
+		}
+	}
+
+	// ---- 13. Bytecode leads -----------------------------------------
+	// Structural selector combinations (BC_ORACLE_SPOT, BC_LENDING_UNCHECKED,
+	// etc.) are unproven. They go to Leads, never Findings.
 	for _, f := range bcFlags {
 		(*totalFlags)++
 		*leads = append(*leads, LeadReport{
-			RuleID: f.RuleID, Category: f.Category, Severity: f.Severity,
-			ContractAddress: target.Hex(), ContractRole: string(role),
-			Evidence: "bytecode selector combination",
+			RuleID:          f.RuleID,
+			Category:        f.Category,
+			Severity:        f.Severity,
+			ContractAddress: target.Hex(),
+			ContractRole:    string(role),
+			Evidence:        "bytecode selector combination",
 		})
 	}
 
 	return true
 }
-
 func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
 	var lastErr error
 	ticker := time.NewTicker(anvilPollEvery)
