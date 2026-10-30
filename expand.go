@@ -11,6 +11,8 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	evmole "github.com/cdump/evmole/go"
@@ -87,24 +89,34 @@ var TokenSelectors = []string{
 // =============================================================
 // ClassifyContract
 // =============================================================
+//
+// Fix B: Always run the raw bytecode scan first. evmole is
+// additive enrichment, not the primary source. The old logic
+// returned an empty selector map when evmole succeeded but
+// returned zero functions (common for proxy-heavy contracts),
+// causing RoleLending markets to fall through to RoleUnknown.
 
 func ClassifyContract(ctx context.Context, code []byte) (ContractRole, map[string]int) {
+	selCounts := make(map[string]int)
+
+	// 1. Always scan raw bytecode for PUSH4 selectors.
+	for i := 0; i+5 <= len(code); i++ {
+		if code[i] == 0x63 { // PUSH4
+			selCounts[hex.EncodeToString(code[i+1:i+5])]++
+		}
+	}
+
+	// 2. Enrich with evmole metadata when available. This adds
+	// functions that evmole discovers via a different code path
+	// (rare, but possible with certain jump-table patterns).
 	info, err := evmole.ContractInfo(ctx, code, evmole.Options{
 		Selectors:       true,
 		Arguments:       true,
 		StateMutability: true,
 	})
-	
-	selCounts := make(map[string]int)
-	if err == nil && info != nil {
+	if err == nil && info != nil && len(info.Functions) > 0 {
 		for _, fn := range info.Functions {
 			selCounts[fmt.Sprintf("%08x", fn.Selector)]++
-		}
-	} else {
-		for i := 0; i+5 <= len(code); i++ {
-			if code[i] == 0x63 { // PUSH4
-				selCounts[hex.EncodeToString(code[i+1:i+5])]++
-			}
 		}
 	}
 
@@ -237,20 +249,65 @@ func ScanFactoryEvents(
 }
 
 // =============================================================
-// SQD Portal Discovery (RPC-Free)
+// SQD Portal Discovery (RPC-Free, Batched, Cached, Retried)
 // =============================================================
 
-// ScanFactoryEventsSQD uses the SQD Portal to fetch full historical factory events
-// without touching your RPC provider.
-// Change the signature to accept multiple hashes
-func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Hashes []common.Hash) ([]common.Address, error) {
-	url := "https://portal.sqd.dev/datasets/base-mainnet/stream"
+// sqdCache prevents re-querying the same factory within a single run.
+// Keyed by factory address.
+var sqdCache = make(map[common.Address][]common.Address)
 
-	// Convert []common.Hash to []string for JSON
+// ScanFactoryEventsSQD wraps sqdFetch with retry/backoff for rate limits.
+// Honors the Retry-After header on 429/503/529, caps total retries at 5.
+func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Hashes []common.Hash) ([]common.Address, error) {
+	if cached, ok := sqdCache[factory]; ok {
+		log.Printf("scanner[sqd]: cache hit for factory %s (%d children)", factory.Hex(), len(cached))
+		return cached, nil
+	}
+
 	var topic0Strings []string
 	for _, h := range topic0Hashes {
 		topic0Strings = append(topic0Strings, h.Hex())
 	}
+
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+			log.Printf("scanner[sqd]: retry %d/5 after %v for factory %s", attempt, backoff, factory.Hex())
+			time.Sleep(backoff)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		addrs, retryAfter, err := sqdFetch(ctx, factory, topic0Strings)
+		if err == nil {
+			sqdCache[factory] = addrs
+			return addrs, nil
+		}
+		lastErr = err
+
+		if retryAfter > 0 {
+			log.Printf("scanner[sqd]: rate-limited, honoring Retry-After %v", retryAfter)
+			time.Sleep(retryAfter)
+		} else if !strings.Contains(err.Error(), "529") &&
+			!strings.Contains(err.Error(), "503") &&
+			!strings.Contains(err.Error(), "429") {
+			// Non-retryable error (e.g. malformed request), stop early
+			break
+		}
+	}
+	return nil, lastErr
+}
+
+// sqdFetch performs the actual HTTP + NDJSON pagination. It returns
+// (addresses, retryAfter, error). On 429/503/529 it returns the
+// parsed Retry-After delay so the caller can honor it.
+func sqdFetch(ctx context.Context, factory common.Address, topic0Strings []string) ([]common.Address, time.Duration, error) {
+	url := "https://portal.sqd.dev/datasets/base-mainnet/stream"
 
 	var allFound []common.Address
 	seen := make(map[common.Address]bool)
@@ -260,7 +317,7 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 	for {
 		select {
 		case <-ctx.Done():
-			return allFound, ctx.Err()
+			return allFound, 0, ctx.Err()
 		default:
 		}
 
@@ -271,19 +328,18 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 			"logs": []map[string]interface{}{
 				{
 					"address": []string{factory.Hex()},
-					"topic0":  topic0Strings, // BATCHED HERE
+					"topic0":  topic0Strings,
 				},
 			},
 			"fields": map[string]interface{}{
 				"log": map[string]bool{"address": true, "topics": true, "data": true},
 			},
 		}
-		// FIXED: Removed the extra closing brace that was here
 
 		bodyBytes, _ := json.Marshal(reqBody)
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(bodyBytes))
 		if err != nil {
-			return allFound, err
+			return allFound, 0, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
@@ -291,18 +347,33 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 		client := &http.Client{Timeout: 30 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
-			return allFound, err
+			return allFound, 0, err
+		}
+
+		// 204 = no matching blocks in the requested range. Not an error.
+		if resp.StatusCode == http.StatusNoContent {
+			resp.Body.Close()
+			return allFound, 0, nil
+		}
+
+		// Rate limit / server overload — surface Retry-After.
+		if resp.StatusCode == 429 || resp.StatusCode == 503 || resp.StatusCode == 529 {
+			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return allFound, retryAfter, fmt.Errorf("SQD API error %d: %s", resp.StatusCode, string(body))
 		}
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			return allFound, fmt.Errorf("SQD API error %d: %s", resp.StatusCode, string(body))
+			return allFound, 0, fmt.Errorf("SQD API error %d: %s", resp.StatusCode, string(body))
 		}
 
+		// NDJSON stream. Increase buffer to 10MB to survive very wide logs.
 		scanner := bufio.NewScanner(resp.Body)
-		// FIXED: Initialize to -1 so we can detect if the stream returned any progress
-		lastBlockInStream := int64(-1) 
+		scanner.Buffer(make([]byte, 1024*1024), 1024*1024*10)
+		lastBlockInStream := int64(-1)
 
 		for scanner.Scan() {
 			var chunk struct {
@@ -314,18 +385,17 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 					Data   string   `json:"data"`
 				} `json:"logs"`
 			}
-			
+
 			if err := json.Unmarshal(scanner.Bytes(), &chunk); err != nil {
 				continue
 			}
 
-			// Update the last block we've seen in this stream
 			lastBlockInStream = int64(chunk.Header.Number)
 
 			for _, logEntry := range chunk.Logs {
-				// 1. Check indexed topics
+				// 1. Indexed topics
 				for _, topic := range logEntry.Topics[1:] {
-					if len(topic) == 66 { // 0x + 64 hex chars
+					if len(topic) == 66 {
 						addr := common.HexToAddress(topic)
 						if addr != (common.Address{}) && !seen[addr] {
 							seen[addr] = true
@@ -333,13 +403,12 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 						}
 					}
 				}
-				
-				// 2. Check non-indexed data payload
+
+				// 2. Non-indexed data payload
 				if len(logEntry.Data) > 2 {
 					dataBytes := common.FromHex(logEntry.Data)
 					for i := 0; i+32 <= len(dataBytes); i += 32 {
 						word := dataBytes[i : i+32]
-						// Check if it looks like a padded address (first 12 bytes zero)
 						if bytes.Equal(word[:12], make([]byte, 12)) {
 							addr := common.BytesToAddress(word[12:])
 							if addr != (common.Address{}) && !seen[addr] {
@@ -353,20 +422,34 @@ func ScanFactoryEventsSQD(ctx context.Context, factory common.Address, topic0Has
 		}
 		resp.Body.Close()
 
-		// FIXED: Infinite loop protection
-		// If the stream returned no blocks at all, or we've reached the target, stop.
+		// Infinite loop protection: if no blocks were returned, stop.
 		if lastBlockInStream == -1 || uint64(lastBlockInStream) >= toBlock {
 			break
 		}
 
-		// Advance the cursor to the next block
 		fromBlock = uint64(lastBlockInStream) + 1
 	}
 
 	if len(allFound) > 0 {
-		log.Printf("scanner[sqd]: Found %d historical child contracts for factory %s", len(allFound), factory.Hex())
+		log.Printf("scanner[sqd]: found %d historical child contracts for factory %s", len(allFound), factory.Hex())
 	}
-	return allFound, nil
+	return allFound, 0, nil
+}
+
+// parseRetryAfter parses the Retry-After header into a Duration.
+// SQD sends this in seconds (per the Portal docs). Capped at 60s
+// so a single request cannot stall the pipeline.
+func parseRetryAfter(header string) time.Duration {
+	if header == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(header); err == nil && secs > 0 {
+		if secs > 60 {
+			secs = 60
+		}
+		return time.Duration(secs) * time.Second
+	}
+	return 0
 }
 
 // IsFactoryCandidateBytecode checks if the bytecode contains a PUSH32 of
