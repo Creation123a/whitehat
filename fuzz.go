@@ -20,9 +20,9 @@ type FuzzResult struct {
 	Output          string
 }
 
-// Fix 7: narrow pattern. Only match explicit failure markers.
+// Single-line regex, no greedy cross-line matches.
 var brokenInvariantPattern = regexp.MustCompile(
-	`(?i)(FAILED!\s|assertion failed|broken invariant|property .* failed|\[FAILED\]|invariant .* violated)`,
+	`(?m)^.*(\[FAILED\]|FAILED!|assertion failed|broken invariant|invariant .* violated).*$`,
 )
 
 func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole, rpcURL string, blockNum uint64) (*FuzzResult, error) {
@@ -42,7 +42,9 @@ func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole
 		return nil, fmt.Errorf("write invariants: %w", err)
 	}
 
-	// Fix 10: blockNumber as uint64, not string
+	// Schema: fuzzing.testing.propertyTesting (not fuzzing.propertyTesting).
+	// targetContracts is the harness contract name ("Invariants").
+	// targetContractsBalances funds with ETH only — ERC20 funding is not supported.
 	config := map[string]interface{}{
 		"fuzzing": map[string]interface{}{
 			"workers":            4,
@@ -52,16 +54,16 @@ func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole
 			"coverageEnabled":    true,
 			"targetContracts":    []string{"Invariants"},
 			"targetContractsBalances": []string{
-				"1000000000000000000000000", // 1M ETH for gas
+				"1000000000000000000000000",
 			},
 			"testing": map[string]interface{}{
 				"stopOnFailedTest": true,
+				"assertionTesting": map[string]interface{}{
+					"enabled": true,
+				},
 				"propertyTesting": map[string]interface{}{
 					"enabled":      true,
 					"testPrefixes": []string{"check_"},
-				},
-				"assertionTesting": map[string]interface{}{
-					"enabled": true,
 				},
 			},
 		},
@@ -90,7 +92,6 @@ func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole
 	outStr := string(output)
 
 	result := &FuzzResult{Output: outStr}
-	// Fix 7: narrow match
 	if brokenInvariantPattern.MatchString(outStr) {
 		result.InvariantBroken = true
 		for _, line := range strings.Split(outStr, "\n") {
@@ -106,7 +107,6 @@ func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole
 }
 
 func generateInvariants(role ContractRole, target common.Address) string {
-	// Fix 8: IERC20 interface so harness_deposit can approve
 	header := `// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
@@ -186,9 +186,6 @@ contract Invariants {
         _initialized = true;
     }
 
-    // Fix 8: approve before deposit so the deposit does not revert on allowance.
-    // NOTE: the harness address must still hold the underlying asset. See audit
-    // item 7 — ERC20 funding for the harness is not solved by this call alone.
     function harness_deposit(uint256 amount) public {
         _initBaseline();
         address asset = target.asset();
