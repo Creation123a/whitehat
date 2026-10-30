@@ -9,7 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-)
+
+	"github.com/ethereum/go-ethereum/common"  
 
 type FuzzResult struct {
 	InvariantBroken bool
