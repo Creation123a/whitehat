@@ -96,23 +96,7 @@ jobs:
             exit 1
           fi
           heimdall --version
-      - name: Install z3 and hevm
-        run: |
-          # 1. Install the z3 SMT solver (required by hevm)
-          sudo apt-get update
-          sudo apt-get install -y z3
-
-          # 2. Download the correct hevm release binary
-          mkdir -p $HOME/.hevm/bin
-          wget https://github.com/argotorg/hevm/releases/download/release/0.55.1/hevm-x86_64-linux -O $HOME/.hevm/bin/hevm
-          
-          # 3. Make it executable and add to PATH
-          chmod +x $HOME/.hevm/bin/hevm
-          echo "$HOME/.hevm/bin" >> $GITHUB_PATH
-          
-          # 4. Verify installation (Corrected syntax)
-          $HOME/.hevm/bin/hevm version
-
+   
       - name: Cache Ollama Models
         uses: actions/cache@v4
         with:
