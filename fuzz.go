@@ -19,16 +19,12 @@ type FuzzResult struct {
 	Output          string
 }
 
-// RunMedusaFuzz generates a wrapper invariant file for the target role,
-// then runs Medusa against it. Returns true if any invariant is broken.
 func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole, rpcURL string, blockNum uint64) (*FuzzResult, error) {
-	// 1. Generate the invariant Solidity file
 	invariants := generateInvariants(role, target)
 	if invariants == "" {
-		return nil, fmt.Errorf("no invariants defined for role %s", role)
+		return nil, fmt.Errorf("no invariants for role %s", role)
 	}
 
-	// 2. Write to temp workspace
 	tmpDir, err := os.MkdirTemp("", "medusa-fuzz")
 	if err != nil {
 		return nil, err
@@ -37,48 +33,68 @@ func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole
 
 	invFile := filepath.Join(tmpDir, "Invariants.sol")
 	if err := os.WriteFile(invFile, []byte(invariants), 0644); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("write invariants: %w", err)
 	}
 
-	// 3. Medusa config
-	// NOTE: Medusa defaults to the `fuzz_` prefix for property functions.
-	// Our invariants use `check_`, so we must explicitly list it in testPrefixes.
-	configFile := filepath.Join(tmpDir, "medusa.json")
+	// C6 FIX: propertyTesting is under fuzzing.testing, NOT fuzzing directly.
+	// targetContracts points to "Invariants" (which includes a Harness section).
 	config := map[string]interface{}{
 		"fuzzing": map[string]interface{}{
-			"timeout":         300, // 5 minutes per target
-			"targetContracts": []string{"Invariants"},
-			"testLimit":       100000,
-			"propertyTesting": map[string]interface{}{
-				"enabled":      true,
-				"testPrefixes": []string{"check_", "invariant_"},
+			"workers":            4,
+			"timeout":            300,
+			"testLimit":          100000,
+			"callSequenceLength": 50,
+			"coverageEnabled":    true,
+			"targetContracts":    []string{"Invariants"},
+			"targetContractsBalances": []string{
+				// Give the harness ETH so it can fund deposit calls
+				"1000000000000000000000000", // 1M ETH
 			},
-			"coverageEnabled": true,
+			"testing": map[string]interface{}{
+				"stopOnFailedTest": true,
+				"propertyTesting": map[string]interface{}{
+					"enabled":      true,
+					"testPrefixes": []string{"check_"},
+				},
+				"assertionTesting": map[string]interface{}{
+					"enabled": true,
+				},
+			},
 		},
 		"compilation": map[string]interface{}{
-			"sources":  []string{tmpDir},
-			"platform": "crytic-compile", // default, but explicit is better
+			"platform": "crytic-compile",
+			"platformConfig": map[string]interface{}{
+				"target":      ".",
+				"solcVersion": "0.8.20",
+			},
 		},
-		"chain": map[string]interface{}{
+		"chainConfig": map[string]interface{}{
 			"rpcURL":      rpcURL,
-			"blockNumber": blockNum,
+			"blockNumber": fmt.Sprintf("%d", blockNum),
 		},
 	}
-	configBytes, _ := json.MarshalIndent(config, "", "  ")
-	os.WriteFile(configFile, configBytes, 0644)
 
-	// 4. Run Medusa
+	configBytes, _ := json.MarshalIndent(config, "", "  ")
+	configFile := filepath.Join(tmpDir, "medusa.json")
+	if err := os.WriteFile(configFile, configBytes, 0644); err != nil {
+		return nil, fmt.Errorf("write config: %w", err)
+	}
+
 	cmd := exec.CommandContext(ctx, "medusa", "fuzz", "--config", configFile)
+	cmd.Dir = tmpDir
 	output, err := cmd.CombinedOutput()
 	outStr := string(output)
 
-	// 5. Parse for invariant failures
 	result := &FuzzResult{Output: outStr}
-	if strings.Contains(outStr, "assertion failed") || strings.Contains(outStr, "Failed!") || strings.Contains(outStr, "FAILED") {
+	if strings.Contains(outStr, "assertion failed") ||
+		strings.Contains(outStr, "Failed!") ||
+		strings.Contains(outStr, "FAILED") ||
+		strings.Contains(outStr, "failed") {
 		result.InvariantBroken = true
 		for _, line := range strings.Split(outStr, "\n") {
+			trimmed := strings.TrimSpace(line)
 			if strings.Contains(line, "assertion") || strings.Contains(line, "invariant") || strings.Contains(line, "FAILED") {
-				result.Invariant = strings.TrimSpace(line)
+				result.Invariant = trimmed
 				result.Counterexample = line
 				break
 			}
@@ -90,7 +106,7 @@ func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole
 
 func generateInvariants(role ContractRole, target common.Address) string {
 	header := `// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
 interface ITarget {
 `
@@ -107,30 +123,29 @@ contract Invariants {
     function totalBorrows() external view returns (uint256);
     function totalSupply() external view returns (uint256);
     function getCash() external view returns (uint256);
+    function borrow(uint256) external;
+    function repayBorrow(uint256) external;
 ` + footer + `
-    // Structural bound: borrows must never exceed supply by more than
-    // 1% (allows for reserve accrual). A violation means accounting was
-    // manipulated or shares were inflated without corresponding deposits.
+    // HARNESS: state-changing functions Medusa calls on the target
+    function harness_borrow(uint256 amount) public {
+        target.borrow(amount);
+    }
+    function harness_repay(uint256 amount) public {
+        target.repayBorrow(amount);
+    }
+
     function check_borrows_bounded() public view {
         try target.totalSupply() returns (uint256 supply) {
             try target.totalBorrows() returns (uint256 borrows) {
-                require(
-                    borrows <= (supply * 101) / 100,
-                    "BORROWS_EXCEED_SUPPLY"
-                );
+                require(borrows <= (supply * 101) / 100, "BORROWS_EXCEED_SUPPLY");
             } catch {}
         } catch {}
     }
 
-    // Cash should never exceed supply (cash + borrows == supply + reserves
-    // in a healthy market). More cash than supply means phantom assets.
     function check_cash_bounded() public view {
         try target.totalSupply() returns (uint256 supply) {
             try target.getCash() returns (uint256 cash) {
-                require(
-                    cash <= (supply * 101) / 100,
-                    "CASH_EXCEEDS_SUPPLY"
-                );
+                require(cash <= (supply * 101) / 100, "CASH_EXCEEDS_SUPPLY");
             } catch {}
         } catch {}
     }
@@ -142,13 +157,15 @@ contract Invariants {
     function totalSupply() external view returns (uint256);
     function convertToShares(uint256) external view returns (uint256);
     function convertToAssets(uint256) external view returns (uint256);
+    function deposit(uint256, address) external;
+    function withdraw(uint256, address, address) external;
+    function asset() external view returns (address);
+    function balanceOf(address) external view returns (uint256);
 ` + footer + `
     uint256 private _maxSharePrice;
     uint256 private _initialPrice;
     bool private _initialized;
 
-    // Self-initializing baseline. Medusa may not call setup(), so we
-    // capture the baseline on the first invariant check instead.
     function _initBaseline() internal {
         if (_initialized) return;
         try target.totalSupply() returns (uint256 supply) {
@@ -162,9 +179,18 @@ contract Invariants {
         _initialized = true;
     }
 
-    // Share price (assets per share) should never decrease across operations.
-    // A decrease means someone extracted value they didn't earn — either via
-    // rounding in their favor, a donation attack, or a share dilution bug.
+    // HARNESS: state-changing functions Medusa calls
+    function harness_deposit(uint256 amount) public {
+        _initBaseline();
+        address asset = target.asset();
+        // Approve is handled by Medusa's token balance setup
+        target.deposit(amount, address(this));
+    }
+    function harness_withdraw(uint256 shares) public {
+        _initBaseline();
+        target.withdraw(shares, address(this), address(this));
+    }
+
     function check_share_price_monotonic() public {
         _initBaseline();
         if (_maxSharePrice == 0) return;
@@ -181,9 +207,6 @@ contract Invariants {
         } catch {}
     }
 
-    // Classic ERC-4626 1-wei inflation: attacker inflates price by >100x,
-    // then victim deposits get rounded to 0 shares. This catches the state
-    // that must exist for that attack to succeed.
     function check_price_not_inflated() public {
         _initBaseline();
         if (_initialPrice == 0) return;
@@ -196,9 +219,6 @@ contract Invariants {
         } catch {}
     }
 
-    // Round-trip must favor the protocol. If converting deposits to shares
-    // and back yields MORE than the original deposit, an attacker can
-    // extract value by looping.
     function check_roundtrip_favors_protocol() public view {
         try target.convertToShares(1) returns (uint256 s1) {
             try target.convertToAssets(s1) returns (uint256 a1) {
@@ -221,17 +241,19 @@ contract Invariants {
 	case RoleAMM:
 		return header + `
     function getReserves() external view returns (uint112, uint112, uint32);
+    function swap(uint256, uint256, address, bytes) external;
 ` + footer + `
     uint256 private _maxK;
 
-    // Reserves should never be zero (drain attack). Between checks, K must
-    // not shrink by more than 50% — catches flash manipulation that would
-    // ordinarily leave <50% of the pre-existing liquidity.
+    // HARNESS: state-changing swap function
+    function harness_swap(uint256 amount0Out, uint256 amount1Out) public {
+        target.swap(amount0Out, amount1Out, address(this), new bytes(0));
+    }
+
     function check_k_not_drained() public {
         try target.getReserves() returns (uint112 r0, uint112 r1, uint32 unusedTs) {
             require(r0 > 0, "RESERVE_0_ZERO");
             require(r1 > 0, "RESERVE_1_ZERO");
-
             uint256 k = uint256(r0) * uint256(r1);
             if (_maxK > 0) {
                 require(k >= _maxK / 2, "K_HALVED");
