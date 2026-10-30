@@ -57,12 +57,26 @@ jobs:
           sudo apt-get install -y solc || true
           solc --version || pip install solc-select && solc-select install 0.8.20 && solc-select use 0.8.20     
           
-      - name: Install Medusa
+      - name: Install Medusa and Solidity Toolchain
         run: |
-          go install github.com/crytic/medusa/cmd/medusa@v0.1.5
+          # 1. Install the Medusa fuzzer
+          go install github.com/crytic/medusa@latest
+          
+          # 2. Install the compilation abstraction layer and solc manager
+          pip install crytic-compile solc-select
+          
+          # 3. Install and select a specific Solidity compiler version
+          # Version 0.8.20 is a safe, modern default
+          solc-select install 0.8.20
+          solc-select use 0.8.20
+          
+          # 4. Add the Go binary directory to PATH
           echo "$HOME/go/bin" >> $GITHUB_PATH
-          # use the subcommand form, not the flag
-          medusa version || medusa --help | head -1
+          
+          # 5. Verify that all components are working
+          medusa --help | head -1
+          solc --version
+          crytic-compile --version
           
       - name: Install Heimdall-rs (via Bifrost)
         run: |
