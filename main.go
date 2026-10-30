@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -16,6 +17,8 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
 )
+
+const maxChildrenPerProtocol = 50
 
 func main() { os.Exit(run()) }
 
@@ -137,10 +140,7 @@ func run() int {
 				TVLUSD: proto.TVLUSD, Flags: protoFlags,
 			})
 		}
-		// C12 FIX: bytecode-only flags go to leads, not findings
-		if len(protoLeads) > 0 {
-			leads = append(leads, protoLeads...)
-		}
+		leads = append(leads, protoLeads...)
 	}
 
 	meta := RunMetadata{
@@ -194,7 +194,6 @@ func scanTarget(
 	for _, sig := range FactoryEventSignatures {
 		topic0Hashes = append(topic0Hashes, crypto.Keccak256Hash([]byte(sig)))
 	}
-
 	sqdDeps, err := ScanFactoryEventsSQD(ctx, target, topic0Hashes)
 	if err != nil {
 		log.Printf("scanner[sqd]: Error fetching factory events: %v", err)
@@ -202,13 +201,19 @@ func scanTarget(
 		deps = append(deps, sqdDeps...)
 	}
 
-	// C5 FIX: recurse into discovered dependencies
+	// Fix 6: cap recursion at maxChildrenPerProtocol
+	children := 0
 	for _, dep := range deps {
 		if dep == (common.Address{}) || visited[dep] {
 			continue
 		}
+		if children >= maxChildrenPerProtocol {
+			log.Printf("scanner[cap]: Reached %d children for %s; stopping recursion", maxChildrenPerProtocol, target.Hex())
+			break
+		}
 		scanTarget(ctx, client, rpcClient, rpcURL, exploiter, proto, dep,
 			visited, flags, leads, totalFlags, depth+1, blockNum)
+		children++
 	}
 
 	if role == RoleToken {
@@ -227,15 +232,24 @@ func scanTarget(
 	if err != nil {
 		log.Printf("scanner[anvil]: Harness error: %v", err)
 	} else if exploitResult != nil {
-		provenVuln = true
-		exploitContext = fmt.Sprintf("ANVIL ECONOMIC PROOF:\nType: %s\nTarget: %s\nProfit: %s wei\nDetails: %s\nTx: %s\n",
-			exploitResult.AttackType, exploitResult.Target, exploitResult.ProfitWei.String(),
-			exploitResult.Details, exploitResult.TxHash)
-		log.Printf("scanner[anvil]: PROVEN EXPLOIT! Type: %s, Profit: %s",
-			exploitResult.AttackType, exploitResult.ProfitWei.String())
+		if exploitResult.LeadOnly {
+			// Fix 5: ORACLE_SPOT_DEPENDENT goes to leads, not findings.
+			*leads = append(*leads, LeadReport{
+				RuleID: "ANVIL_ORACLE_SPOT_DEPENDENT", Category: "mixed-source",
+				Severity: "high", ContractAddress: target.Hex(), ContractRole: string(role),
+				Evidence: exploitResult.Details,
+			})
+			log.Printf("scanner[anvil]: Structural lead recorded: %s", exploitResult.Details)
+		} else {
+			provenVuln = true
+			exploitContext = fmt.Sprintf("ANVIL ECONOMIC PROOF:\nType: %s\nTarget: %s\nProfit: %s wei\nDetails: %s\nTx: %s\n",
+				exploitResult.AttackType, exploitResult.Target, exploitResult.ProfitWei.String(),
+				exploitResult.Details, exploitResult.TxHash)
+			log.Printf("scanner[anvil]: PROVEN EXPLOIT! Type: %s, Profit: %s",
+				exploitResult.AttackType, exploitResult.ProfitWei.String())
+		}
 	}
 
-	// C1 FIX: check InvariantBroken BEFORE err
 	if !provenVuln && (role == RoleLending || role == RoleVault || role == RoleAMM) {
 		log.Printf("scanner[fuzz]: Running Medusa invariants for %s (role: %s)", target.Hex(), role)
 		fuzzResult, fuzzErr := RunMedusaFuzz(ctx, target, role, rpcURL, blockNum)
@@ -249,15 +263,16 @@ func scanTarget(
 		}
 	}
 
-	// C10 FIX: shouldDecompile only when proven/tainted (matching DecompileWithHeimdall gate)
 	shouldDecompile := provenVuln || structuralTaint
 
 	var src string
 	if shouldDecompile {
 		log.Printf("scanner[heimdall]: Decompiling %s (Proven: %v, Tainted: %v)", target.Hex(), provenVuln, structuralTaint)
 		decompiled, err := DecompileWithHeimdall(ctx, proto.Slug, target.Hex(), code, rpcURL, provenVuln, structuralTaint)
-		if err != nil {
-			log.Printf("scanner[heimdall]: Skipped/failed: %v", err)
+		if errors.Is(err, ErrDecompileSkipped) {
+			log.Printf("scanner[heimdall]: Decompilation skipped (no proof, no taint)")
+		} else if err != nil {
+			log.Printf("scanner[heimdall]: Decompilation failed: %v", err)
 		} else {
 			src = decompiled
 			log.Printf("scanner[heimdall]: Decompiled %s (%d bytes)", target.Hex(), len(src))
@@ -297,11 +312,9 @@ func scanTarget(
 		}
 	}
 
-	// C12 FIX: bytecode-only flags go to leads, not findings
+	// Fix 5 (continued): bytecode flags are leads, not findings
 	for _, f := range bcFlags {
 		(*totalFlags)++
-		f.ContractAddress = target.Hex()
-		f.ContractRole = string(role)
 		*leads = append(*leads, LeadReport{
 			RuleID: f.RuleID, Category: f.Category, Severity: f.Severity,
 			ContractAddress: target.Hex(), ContractRole: string(role),
