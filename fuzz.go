@@ -18,17 +18,18 @@ type FuzzResult struct {
 	Invariant       string
 	Counterexample  string
 	Output          string
+	Skipped         bool
+	SkipReason      string
 }
+
 
 // Single-line regex, no greedy cross-line matches.
 var brokenInvariantPattern = regexp.MustCompile(
 	`(?m)^.*(\[FAILED\]|FAILED!|assertion failed|broken invariant|invariant .* violated).*$`,
 )
-
 func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole, rpcURL string, blockNum uint64) (*FuzzResult, error) {
-	invariants := generateInvariants(role, target)
-	if invariants == "" {
-		return nil, fmt.Errorf("no invariants for role %s", role)
+	if _, err := exec.LookPath("medusa"); err != nil {
+		return &FuzzResult{Skipped: true, SkipReason: "medusa binary not found in PATH"}, nil
 	}
 
 	tmpDir, err := os.MkdirTemp("", "medusa-fuzz")
