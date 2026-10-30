@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -18,6 +19,11 @@ type FuzzResult struct {
 	Counterexample  string
 	Output          string
 }
+
+// Fix 7: narrow pattern. Only match explicit failure markers.
+var brokenInvariantPattern = regexp.MustCompile(
+	`(?i)(FAILED!\s|assertion failed|broken invariant|property .* failed|\[FAILED\]|invariant .* violated)`,
+)
 
 func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole, rpcURL string, blockNum uint64) (*FuzzResult, error) {
 	invariants := generateInvariants(role, target)
@@ -36,8 +42,7 @@ func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole
 		return nil, fmt.Errorf("write invariants: %w", err)
 	}
 
-	// C6 FIX: propertyTesting is under fuzzing.testing, NOT fuzzing directly.
-	// targetContracts points to "Invariants" (which includes a Harness section).
+	// Fix 10: blockNumber as uint64, not string
 	config := map[string]interface{}{
 		"fuzzing": map[string]interface{}{
 			"workers":            4,
@@ -47,8 +52,7 @@ func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole
 			"coverageEnabled":    true,
 			"targetContracts":    []string{"Invariants"},
 			"targetContractsBalances": []string{
-				// Give the harness ETH so it can fund deposit calls
-				"1000000000000000000000000", // 1M ETH
+				"1000000000000000000000000", // 1M ETH for gas
 			},
 			"testing": map[string]interface{}{
 				"stopOnFailedTest": true,
@@ -70,7 +74,7 @@ func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole
 		},
 		"chainConfig": map[string]interface{}{
 			"rpcURL":      rpcURL,
-			"blockNumber": fmt.Sprintf("%d", blockNum),
+			"blockNumber": blockNum,
 		},
 	}
 
@@ -86,15 +90,12 @@ func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole
 	outStr := string(output)
 
 	result := &FuzzResult{Output: outStr}
-	if strings.Contains(outStr, "assertion failed") ||
-		strings.Contains(outStr, "Failed!") ||
-		strings.Contains(outStr, "FAILED") ||
-		strings.Contains(outStr, "failed") {
+	// Fix 7: narrow match
+	if brokenInvariantPattern.MatchString(outStr) {
 		result.InvariantBroken = true
 		for _, line := range strings.Split(outStr, "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.Contains(line, "assertion") || strings.Contains(line, "invariant") || strings.Contains(line, "FAILED") {
-				result.Invariant = trimmed
+			if brokenInvariantPattern.MatchString(line) {
+				result.Invariant = strings.TrimSpace(line)
 				result.Counterexample = line
 				break
 			}
@@ -105,8 +106,15 @@ func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole
 }
 
 func generateInvariants(role ContractRole, target common.Address) string {
+	// Fix 8: IERC20 interface so harness_deposit can approve
 	header := `// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function approve(address spender, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
 
 interface ITarget {
 `
@@ -126,7 +134,6 @@ contract Invariants {
     function borrow(uint256) external;
     function repayBorrow(uint256) external;
 ` + footer + `
-    // HARNESS: state-changing functions Medusa calls on the target
     function harness_borrow(uint256 amount) public {
         target.borrow(amount);
     }
@@ -179,11 +186,13 @@ contract Invariants {
         _initialized = true;
     }
 
-    // HARNESS: state-changing functions Medusa calls
+    // Fix 8: approve before deposit so the deposit does not revert on allowance.
+    // NOTE: the harness address must still hold the underlying asset. See audit
+    // item 7 — ERC20 funding for the harness is not solved by this call alone.
     function harness_deposit(uint256 amount) public {
         _initBaseline();
         address asset = target.asset();
-        // Approve is handled by Medusa's token balance setup
+        IERC20(asset).approve(address(target), amount);
         target.deposit(amount, address(this));
     }
     function harness_withdraw(uint256 shares) public {
@@ -245,7 +254,6 @@ contract Invariants {
 ` + footer + `
     uint256 private _maxK;
 
-    // HARNESS: state-changing swap function
     function harness_swap(uint256 amount0Out, uint256 amount1Out) public {
         target.swap(amount0Out, amount1Out, address(this), new bytes(0));
     }
