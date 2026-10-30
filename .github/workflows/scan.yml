@@ -54,10 +54,8 @@ jobs:
 
       - name: Install Medusa
         run: |
-          git clone https://github.com/crytic/medusa.git /tmp/medusa
-          cd /tmp/medusa
-          git checkout v0.1.5
-          go build -o /usr/local/bin/medusa ./cmd/medusa
+          go install github.com/crytic/medusa/cmd/medusa@v0.1.5
+          echo "$HOME/go/bin" >> $GITHUB_PATH
           medusa --version
           
       - name: Install Heimdall-rs (via Bifrost)
