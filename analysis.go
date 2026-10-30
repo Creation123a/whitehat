@@ -11,6 +11,28 @@ import (
 )
 
 // =============================================================
+// Package-level compiled regexes
+//
+// All regexes used in hot paths (ClassifyChunk, checkSuppressors)
+// are compiled once at init time instead of per-call. This is a
+// pure performance fix — the patterns are byte-for-byte identical
+// to the previously inline-compiled ones.
+// =============================================================
+
+var (
+	pricingMathPattern   = regexp.MustCompile(`\b(add|sub|mul|div|mulmod|addmod)\b|0x0de0b6b3a7640000`)
+	twapGuardPattern     = regexp.MustCompile(`observe\s*\(|consult\s*\(|twap|timeweighted`)
+	nonReentrantPattern  = regexp.MustCompile(`nonreentrant`)
+	freshnessPattern     = regexp.MustCompile(`updatedat|heartbeat|maxdelay|answeredinround`)
+	decimalsPattern      = regexp.MustCompile(`decimals\s*\(|10\s*\*\*\s*decimals`)
+	virtualSharesPattern = regexp.MustCompile(`virtual|dead|_decimalsoffset|1e[0-9]+`)
+	healthCheckPattern   = regexp.MustCompile(`healthfactor|getaccountliquidity|shortfall`)
+
+	functionBoundaryRegex = regexp.MustCompile(`function\s+Unresolved_[a-zA-Z0-9]+`)
+	addressRegex          = regexp.MustCompile(`0x[a-fA-F0-9]{40}`)
+)
+
+// =============================================================
 // RPC & Bytecode Resolution
 // =============================================================
 
@@ -62,8 +84,6 @@ func FetchBytecode(ctx context.Context, client *ethclient.Client, addr common.Ad
 // Dependency Extraction
 // =============================================================
 
-var addressRegex = regexp.MustCompile(`0x[a-fA-F0-9]{40}`)
-
 func ExtractDependencies(ctx context.Context, client *ethclient.Client, source string, self common.Address) []common.Address {
 	matches := addressRegex.FindAllString(source, -1)
 	seen := make(map[common.Address]bool)
@@ -74,8 +94,8 @@ func ExtractDependencies(ctx context.Context, client *ethclient.Client, source s
 			continue
 		}
 		lower := strings.ToLower(m)
-		if strings.HasPrefix(lower, "0x000") || strings.HasPrefix(lower, "0xfff") || 
-		   strings.HasPrefix(lower, "0xaaa") || strings.HasPrefix(lower, "0x777") {
+		if strings.HasPrefix(lower, "0x000") || strings.HasPrefix(lower, "0xfff") ||
+			strings.HasPrefix(lower, "0xaaa") || strings.HasPrefix(lower, "0x777") {
 			continue
 		}
 		if lower == "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc" {
@@ -99,8 +119,6 @@ func ExtractDependencies(ctx context.Context, client *ethclient.Client, source s
 // Chunking & Classification
 // =============================================================
 
-var functionBoundaryRegex = regexp.MustCompile(`function\s+Unresolved_[a-zA-Z0-9]+`)
-
 // ChunkByFunction splits the decompiled source into individual function chunks
 // based on the `function Unresolved_...` boundaries that Heimdall outputs.
 func ChunkByFunction(source string) []string {
@@ -121,26 +139,22 @@ func ChunkByFunction(source string) []string {
 	return chunks
 }
 
-// ClassifyChunk determines the primary domain of a function chunk
-// by counting keyword occurrences.
-// ClassifyChunk determines the primary domain of a function chunk
-// by counting keyword occurrences.
+// ClassifyChunk determines the primary domain of a function chunk.
+//
+// Priority overrides run first because the keywords below are unambiguous.
+// Only when none of them match do we fall back to numeric scoring, which uses
+// word-boundary regexes for short math tokens (so "address" doesn't score as
+// "add").
 func ClassifyChunk(chunk string) string {
 	lower := strings.ToLower(chunk)
 
-	// =====================================================
-	// PRIORITY OVERRIDES
-	// These signals are strong and unambiguous. If any of
-	// them appear, we return immediately without scoring.
-	// =====================================================
-	
 	// --- Lending signals ---
 	for _, kw := range []string{
 		"unresolved_c5ebeaec", // borrow(uint256)
 		"unresolved_5ec88c79", // getAccountLiquidity
 		"unresolved_bf92857c", // getUserAccountData
 		"unresolved_0e752702", // repayBorrow
-		"liquidate(", "repayBorrow(", "borrowBalanceStored",
+		"liquidate(", "repayborrow(", "borrowbalancestored",
 	} {
 		if strings.Contains(lower, kw) {
 			return "lending"
@@ -175,12 +189,7 @@ func ClassifyChunk(chunk string) string {
 		}
 	}
 
-	// =====================================================
-	// SCORING FALLBACK
-	// Only reached if no unambiguous signal was found.
-	// Uses word boundaries to avoid "address" matching "add".
-	// =====================================================
-	
+	// --- Scoring fallback ---
 	counts := map[string]int{
 		"pricing": 0,
 		"oracle":  0,
@@ -188,17 +197,15 @@ func ClassifyChunk(chunk string) string {
 		"vault":   0,
 	}
 
-	// Pricing: math operations with word boundaries
-	// " add " won't match inside "address", "sub " etc.
-	pricingPattern := regexp.MustCompile(`\b(add|sub|mul|div|mulmod|addmod)\b|0x0de0b6b3a7640000`)
-	counts["pricing"] = len(pricingPattern.FindAllString(lower, -1))
+	// Pricing: math tokens with word boundaries (hoisted regex)
+	counts["pricing"] = len(pricingMathPattern.FindAllString(lower, -1))
 
 	// Oracle keywords
 	for _, kw := range []string{"oracle", "twap", "pricefeed"} {
 		counts["oracle"] += strings.Count(lower, kw)
 	}
 
-	// Lending keywords (safe because they're not substrings of common words)
+	// Lending keywords (not substrings of common words)
 	for _, kw := range []string{"borrow", "collateral", "debt", "liquidation", "healthfactor"} {
 		counts["lending"] += strings.Count(lower, kw)
 	}
@@ -217,13 +224,14 @@ func ClassifyChunk(chunk string) string {
 		}
 	}
 
-	// Threshold: only return a domain if we're actually confident
+	// Only classify when the signal is strong enough
 	if maxCount < 2 {
 		return "general"
 	}
 
 	return maxDomain
 }
+
 // =============================================================
 // Bytecode-Level Rules (v11.0 Pre-Decompilation)
 // =============================================================
@@ -248,8 +256,8 @@ var bytecodeRules = []bytecodeRule{
 		MustNotHave: []string{"07a2d13a"},          // convertToAssets (proxy for virtual offset)
 	},
 	{ID: "BC_LENDING_UNCHECKED", Category: "lending", Severity: "high",
-		MustHave: []string{"c5ebeaec"},             // borrow(uint256)
-		MustNotHave: []string{"5ec88c79"},          // getAccountLiquidity (missing health check)
+		MustHave: []string{"c5ebeaec"},    // borrow(uint256)
+		MustNotHave: []string{"5ec88c79"}, // getAccountLiquidity (missing health check)
 	},
 }
 
@@ -271,12 +279,12 @@ func RunBytecodeRules(selectors map[uint32]bool) []FlagReport {
 	var flags []FlagReport
 	for _, rule := range bytecodeRules {
 		match := true
-		
+
 		// Check MustHave
 		for _, hexStr := range rule.MustHave {
-			if len(hexStr) != 8 { 
+			if len(hexStr) != 8 {
 				match = false
-				break 
+				break
 			}
 			val, err := strconv.ParseUint(hexStr, 16, 32)
 			if err != nil || !selectors[uint32(val)] {
@@ -284,11 +292,15 @@ func RunBytecodeRules(selectors map[uint32]bool) []FlagReport {
 				break
 			}
 		}
-		if !match { continue }
+		if !match {
+			continue
+		}
 
 		// Check MustNotHave
 		for _, hexStr := range rule.MustNotHave {
-			if len(hexStr) != 8 { continue }
+			if len(hexStr) != 8 {
+				continue
+			}
 			val, err := strconv.ParseUint(hexStr, 16, 32)
 			if err == nil && selectors[uint32(val)] {
 				match = false
@@ -353,7 +365,7 @@ var regexRules = []regexRule{
 func RunRegexScan(source string) []FlagReport {
 	var flags []FlagReport
 	lines := strings.Split(source, "\n")
-	
+
 	for _, rule := range regexRules {
 		locs := rule.Pattern.FindAllStringIndex(source, -1)
 		for _, loc := range locs {
@@ -379,9 +391,9 @@ func RunRegexScan(source string) []FlagReport {
 				LineEnd:   lineEnd + 1,
 			}
 			flag.Suppressors = checkSuppressors(rule.ID, snippet)
-			
-			// If a suppressor matches the logic that was previously in the lookahead,
-			// do not append the flag.
+
+			// If any suppressor matched, drop the flag. Suppressors are rule-specific
+			// (see checkSuppressors), so this does not hide findings for other rules.
 			if len(flag.Suppressors) > 0 {
 				continue
 			}
@@ -396,11 +408,11 @@ func checkSuppressors(ruleID, snippet string) []string {
 	var out []string
 	lower := strings.ToLower(snippet)
 
-	// 1. Check for safe libraries (disqualifies math/precision rules)
+	// 1. Known safe library (only disqualifies math/precision rules)
 	if ruleID == "DIV_BEFORE_MUL" || ruleID == "ERC4626_INFLATE" {
 		knownLibs := []string{
 			"credit to remco bloemen", "original credit to remco bloemen",
-			"solady", "openzeppelin", "aave", 
+			"solady", "openzeppelin", "aave",
 			"the whitepaper contains reference", "expwad", "logwad", "muldiv", "sqr",
 		}
 		for _, lib := range knownLibs {
@@ -410,30 +422,31 @@ func checkSuppressors(ruleID, snippet string) []string {
 		}
 	}
 
-	// 2. Rule-specific negative checks (replaces missing lookaheads)
+	// 2. Rule-specific suppressors (hoisted regexes)
 	switch ruleID {
 	case "ORACLE_STALE", "CHAINLINK_ROUND":
-		if regexp.MustCompile(`updatedat|heartbeat|maxdelay|answeredinround`).MatchString(lower) {
+		if freshnessPattern.MatchString(lower) {
 			out = append(out, "has_freshness_check")
 		}
 	case "SPOT_NO_TWAP":
-		if regexp.MustCompile(`observe\s*\(|consult\s*\(|twap|timeweighted`).MatchString(lower) {
+		if twapGuardPattern.MatchString(lower) {
 			out = append(out, "has_twap_guard")
 		}
 	case "ERC4626_INFLATE":
-		if regexp.MustCompile(`virtual|dead|_decimalsoffset|1e[0-9]+`).MatchString(lower) {
+		if virtualSharesPattern.MatchString(lower) {
 			out = append(out, "has_virtual_shares")
 		}
 	case "LIQ_NO_HEALTH":
-		if regexp.MustCompile(`healthfactor|getaccountliquidity|shortfall`).MatchString(lower) {
+		if healthCheckPattern.MatchString(lower) {
 			out = append(out, "has_health_check")
 		}
 	}
 
-// 3. General guards
-if ruleID == "REENTRANCY" && regexp.MustCompile(`nonreentrant`).MatchString(lower) {
-	out = append(out, "has_reentrancy_guard")
-}
-	
+	// 3. General guards — scoped to the relevant rule.
+	// The reentrancy guard must not suppress oracle/math/vault findings.
+	if ruleID == "REENTRANCY" && nonReentrantPattern.MatchString(lower) {
+		out = append(out, "has_reentrancy_guard")
+	}
+
 	return out
 }
