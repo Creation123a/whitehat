@@ -256,9 +256,9 @@ var bytecodeRules = []bytecodeRule{
 		MustNotHave: []string{"07a2d13a"},          // convertToAssets (proxy for virtual offset)
 	},
 	{ID: "BC_LENDING_UNCHECKED", Category: "lending", Severity: "high",
-		MustHave: []string{"c5ebeaec"},    // borrow(uint256)
-		MustNotHave: []string{"5ec88c79"}, // getAccountLiquidity (missing health check)
-	},
+	MustHave:    []string{"c5ebeaec"},              // borrow(uint256)
+	MustNotHave: []string{"5ec88c79", "bf92857c"}, // Compound getAccountLiquidity OR Aave getUserAccountData
+},
 }
 
 // ExtractSelectorsFromBytecode scans raw EVM bytecode for PUSH4 (0x63) and returns a set.
@@ -339,7 +339,7 @@ var regexRules = []regexRule{
 
 	// 2. Spot AMM read without TWAP
 	{ID: "SPOT_NO_TWAP", Category: "spot-amm", Severity: "critical",
-		Pattern: regexp.MustCompile(`getReserves\s*\(\s*\)|slot0\s*\(\s*\)|sqrtPriceX96`)},
+		Pattern: regexp.MustCompile(`getReserves\s*\(\s*\)|slot0\s*\(\s*\)|sqrtPriceX96|get_virtual_price\s*\(\s*\)`)},
 
 	// 3. Division before multiplication
 	{ID: "DIV_BEFORE_MUL", Category: "precision", Severity: "high",
@@ -360,6 +360,10 @@ var regexRules = []regexRule{
 	// 7. Liquidation without health bound
 	{ID: "LIQ_NO_HEALTH", Category: "lending", Severity: "critical",
 		Pattern: regexp.MustCompile(`function\s+liquidate\s*\([^)]*\)`)},
+
+	// 8. REENTRANCY — previously defined suppressor but no rule
+	{ID: "REENTRANCY", Category: "reentrancy", Severity: "high",
+		Pattern: regexp.MustCompile(`\.call\s*\{[^}]*value|\.call\.value|Unresolved_[a-f0-9]+\s*\([^)]*\)\s*;[^}]*\.call`)},
 }
 
 func RunRegexScan(source string) []FlagReport {
