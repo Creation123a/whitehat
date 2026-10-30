@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
@@ -139,11 +140,12 @@ func run() int {
 		scannedSuccessfully := false
 
 		for _, addr := range addrs {
-			// v11.0: Pass depth=0 to initiate recursion
+			// Pass depth=0 to initiate recursion
 			if scanTarget(runCtx, client, rpcClient, effectiveRPC, exploiter, proto, addr, visited, &protoFlags, &totalFlags, 0) {
 				scannedSuccessfully = true
 			}
 		}
+
 		if !scannedSuccessfully {
 			skipped = append(skipped, SkippedProtocol{Name: proto.Name, Slug: proto.Slug, Reason: "decompilation or RPC failed"})
 			continue
@@ -220,7 +222,7 @@ func scanTarget(
 		topic0Hashes = append(topic0Hashes, crypto.Keccak256Hash([]byte(sig)))
 	}
 	
-	// ONE call to SQD instead of 13
+	// ONE call to SQD (Now with retry/cache inside expand.go)
 	sqdDeps, err := ScanFactoryEventsSQD(ctx, target, topic0Hashes)
 	if err != nil {
 		log.Printf("scanner[sqd]: Error fetching factory events: %v", err)
@@ -243,7 +245,6 @@ func scanTarget(
 	var exploitContext string
 	var provenVuln bool
 
-	// Run the generalized economic attack harness.
 	exploitResult, err := exploiter.RunEconomicAttackHarness(ctx, target, role, deps)
 	if err != nil {
 		log.Printf("scanner[anvil]: Harness error: %v", err)
@@ -254,10 +255,48 @@ func scanTarget(
 		log.Printf("scanner[anvil]: PROVEN EXPLOIT! Type: %s, Profit: %s", exploitResult.AttackType, exploitResult.ProfitWei.String())
 	}
 
-	// Step 9: Decompile ONLY if proven or tainted
+	// Step 7.5: FUZZING (Medusa) — runs if economic harness failed
+	if !provenVuln && (role == RoleLending || role == RoleVault || role == RoleAMM) {
+		log.Printf("scanner[fuzz]: Running Medusa invariants for %s (role: %s)", target.Hex(), role)
+		fuzzResult, err := RunMedusaFuzz(ctx, target, role, rpcURL, blockNum)
+		if err != nil {
+			log.Printf("scanner[fuzz]: Medusa error: %v", err)
+		} else if fuzzResult != nil && fuzzResult.InvariantBroken {
+			provenVuln = true
+			exploitContext = fmt.Sprintf("MEDUSA FUZZ PROOF:\nInvariant: %s\nCounterexample: %s\n", 
+				fuzzResult.Invariant, fuzzResult.Counterexample)
+			log.Printf("scanner[fuzz]: PROVEN via invariant break: %s", fuzzResult.Invariant)
+		}
+	}
+
+	// Step 7.6: HEVM (symbolic) — last resort for math-heavy functions
+	if !provenVuln && (role == RoleVault || role == RoleLending) {
+		sig, assertion := "", ""
+		switch role {
+		case RoleVault:
+			sig, assertion = "totalAssets()", "totalAssets() >= totalSupply()"
+		case RoleLending:
+			sig, assertion = "totalBorrows()", "totalSupply() >= totalBorrows()"
+		}
+		if sig != "" {
+			log.Printf("scanner[hevm]: trying symbolic on %s", target.Hex())
+			vuln, proof, _ := exploiter.TestSymbolicInvariant(
+				ctx, target, hexutil.Encode(code), sig, assertion, rpcURL, blockNum)
+			if vuln {
+				provenVuln = true
+				exploitContext += "HEVM SYMBOLIC PROOF:\n" + proof + "\n"
+				log.Printf("scanner[hevm]: PROVEN via symbolic execution")
+			}
+		}
+	}
+
+	// Step 9: Decompile if proven, tainted, OR role is high-value
+	shouldDecompile := provenVuln || structuralTaint || 
+		role == RoleLending || role == RoleVault || role == RoleAMM
+	
 	var src string
-	if provenVuln || structuralTaint {
-		log.Printf("scanner[heimdall]: Attempting decompilation for %s (Proven: %v, Tainted: %v)", target.Hex(), provenVuln, structuralTaint)
+	if shouldDecompile {
+		log.Printf("scanner[heimdall]: Attempting decompilation for %s (Proven: %v, Tainted: %v, Role: %s)", target.Hex(), provenVuln, structuralTaint, role)
 		decompiled, err := DecompileWithHeimdall(ctx, proto.Slug, target.Hex(), code, rpcURL, provenVuln, structuralTaint)
 		if err != nil {
 			log.Printf("scanner[heimdall]: FAILED to decompile %s: %v", target.Hex(), err)
@@ -319,7 +358,6 @@ func scanTarget(
 
 	return true
 }
-
 
 func dialReady(ctx context.Context, url string) (*rpc.Client, error) {
 	var lastErr error
