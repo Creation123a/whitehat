@@ -270,27 +270,7 @@ func scanTarget(
 		}
 	}
 
-	// Step 7.6: HEVM (symbolic) — last resort for math-heavy functions
-	if !provenVuln && (role == RoleVault || role == RoleLending) {
-		sig, assertion := "", ""
-		switch role {
-		case RoleVault:
-			sig, assertion = "totalAssets()", "totalAssets() >= totalSupply()"
-		case RoleLending:
-			sig, assertion = "totalBorrows()", "totalSupply() >= totalBorrows()"
-		}
-		if sig != "" {
-			log.Printf("scanner[hevm]: trying symbolic on %s", target.Hex())
-			vuln, proof, _ := exploiter.TestSymbolicInvariant(
-				ctx, target, hexutil.Encode(code), sig, assertion, rpcURL, blockNum)
-			if vuln {
-				provenVuln = true
-				exploitContext += "HEVM SYMBOLIC PROOF:\n" + proof + "\n"
-				log.Printf("scanner[hevm]: PROVEN via symbolic execution")
-			}
-		}
-	}
-
+	
 	// Step 9: Decompile if proven, tainted, OR role is high-value
 	shouldDecompile := provenVuln || structuralTaint || 
 		role == RoleLending || role == RoleVault || role == RoleAMM
