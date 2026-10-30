@@ -21,7 +21,7 @@ var decompileCache = make(map[common.Hash]string)
 // protocolDecompileCounts tracks how many decompiles have been run for a
 // specific protocol slug during this scan run.
 var protocolDecompileCounts = make(map[string]int)
-
+var ErrDecompileSkipped = fmt.Errorf("skipped: no proof and no structural taint")
 // CanDecompile checks if the protocol has reached the max decompile limit.
 func CanDecompile(protocolSlug string) bool {
 	return protocolDecompileCounts[protocolSlug] < maxDecompilesPerProtocol
@@ -51,9 +51,8 @@ func DecompileWithHeimdall(
 
 	// 1. Gating Check: Do not decompile if there is no proof or structural taint.
 	if !provenVuln && !structuralTaint {
-		return "", fmt.Errorf("skipped: no proof and no structural taint")
-	}
-
+	return "", ErrDecompileSkipped
+}
 	// 2. Limit Check: Enforce maxDecompilesPerProtocol.
 	if !CanDecompile(protocolSlug) {
 		log.Printf("scanner[heimdall]: Max decompiles (%d) reached for protocol %s", maxDecompilesPerProtocol, protocolSlug)
