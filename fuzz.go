@@ -22,14 +22,25 @@ type FuzzResult struct {
 	SkipReason      string
 }
 
-
 // Single-line regex, no greedy cross-line matches.
 var brokenInvariantPattern = regexp.MustCompile(
 	`(?m)^.*(\[FAILED\]|FAILED!|assertion failed|broken invariant|invariant .* violated).*$`,
 )
+
 func RunMedusaFuzz(ctx context.Context, target common.Address, role ContractRole, rpcURL string, blockNum uint64) (*FuzzResult, error) {
 	if _, err := exec.LookPath("medusa"); err != nil {
 		return &FuzzResult{Skipped: true, SkipReason: "medusa binary not found in PATH"}, nil
+	}
+
+	// CRITICAL FIX: generate invariants before writing. If the role has no
+	// defined invariants (RoleMathOracle, RoleUnknown, RoleFactory), skip
+	// cleanly instead of writing an empty file.
+	invariants := generateInvariants(role, target)
+	if invariants == "" {
+		return &FuzzResult{
+			Skipped:    true,
+			SkipReason: fmt.Sprintf("no invariants defined for role %s", role),
+		}, nil
 	}
 
 	tmpDir, err := os.MkdirTemp("", "medusa-fuzz")
