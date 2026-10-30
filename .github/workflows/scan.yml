@@ -54,9 +54,10 @@ jobs:
 
       - name: Install Medusa
         run: |
-          curl -L https://github.com/crytic/medusa/releases/download/v0.1.5/medusa-linux-amd64.tar.gz -o medusa.tar.gz
-          tar xzf medusa.tar.gz
-          sudo mv medusa /usr/local/bin/
+          git clone https://github.com/crytic/medusa.git /tmp/medusa
+          cd /tmp/medusa
+          git checkout v0.1.5
+          go build -o /usr/local/bin/medusa ./cmd/medusa
           medusa --version
           
       - name: Install Heimdall-rs (via Bifrost)
