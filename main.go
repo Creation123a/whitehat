@@ -84,7 +84,8 @@ func run() int {
 	defer rpcClient.Close()
 
 	client := ethclient.NewClient(rpcClient)
-	exploiter := NewAnvilExploiter(client, rpcClient)
+	exploiter, err := NewAnvilExploiter(client, rpcClient)
+	if err != nil { fmt.Fprintf(os.Stderr, "scanner: exploiter: %v\n", err); return 1 }
 
 	runCtx, cancelRun := context.WithTimeout(rootCtx, *timeout)
 	defer cancelRun()
@@ -194,14 +195,13 @@ func scanTarget(
 	for _, sig := range FactoryEventSignatures {
 		topic0Hashes = append(topic0Hashes, crypto.Keccak256Hash([]byte(sig)))
 	}
-	sqdDeps, err := ScanFactoryEventsSQD(ctx, target, topic0Hashes)
+	sqdDeps, err := ScanFactoryEventsSQD(ctx, target, topic0Hashes, blockNum)
 	if err != nil {
 		log.Printf("scanner[sqd]: Error fetching factory events: %v", err)
 	} else {
 		deps = append(deps, sqdDeps...)
 	}
 
-	// Fix 6: cap recursion at maxChildrenPerProtocol
 	children := 0
 	for _, dep := range deps {
 		if dep == (common.Address{}) || visited[dep] {
@@ -233,7 +233,6 @@ func scanTarget(
 		log.Printf("scanner[anvil]: Harness error: %v", err)
 	} else if exploitResult != nil {
 		if exploitResult.LeadOnly {
-			// Fix 5: ORACLE_SPOT_DEPENDENT goes to leads, not findings.
 			*leads = append(*leads, LeadReport{
 				RuleID: "ANVIL_ORACLE_SPOT_DEPENDENT", Category: "mixed-source",
 				Severity: "high", ContractAddress: target.Hex(), ContractRole: string(role),
@@ -253,7 +252,7 @@ func scanTarget(
 	if !provenVuln && (role == RoleLending || role == RoleVault || role == RoleAMM) {
 		log.Printf("scanner[fuzz]: Running Medusa invariants for %s (role: %s)", target.Hex(), role)
 		fuzzResult, fuzzErr := RunMedusaFuzz(ctx, target, role, rpcURL, blockNum)
-		if fuzzResult != nil && fuzzResult.InvariantBroken {
+		if fuzzResult != nil && fuzzResult.InvariantBroken && fuzzErr == nil {
 			provenVuln = true
 			exploitContext = fmt.Sprintf("MEDUSA FUZZ PROOF:\nInvariant: %s\nCounterexample: %s\n",
 				fuzzResult.Invariant, fuzzResult.Counterexample)
@@ -312,7 +311,6 @@ func scanTarget(
 		}
 	}
 
-	// Fix 5 (continued): bytecode flags are leads, not findings
 	for _, f := range bcFlags {
 		(*totalFlags)++
 		*leads = append(*leads, LeadReport{
