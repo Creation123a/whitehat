@@ -4,13 +4,13 @@ pragma solidity ^0.8.20;
 import "forge-std/Test.sol";
 import "forge-std/console2.sol";
 
-// ═══════════════════════════════════════════════════════════
-// STUB 1 — byte-for-byte copy of the two functions in V3Vault
+// ============================================================
+// STUB 1 - byte-for-byte copy of the two functions in V3Vault
 // that decide whether a loan is healthy.
-// ═══════════════════════════════════════════════════════════
+// ============================================================
 contract HealthStub {
     uint256 public constant Q32 = 2 ** 32;
-    uint256 public constant BORROW_SAFETY_BUFFER_X32 = (Q32 * 95) / 100; // 95%
+    uint256 public constant BORROW_SAFETY_BUFFER_X32 = (Q32 * 95) / 100;
 
     /// @dev mirrors V3Vault._checkLoanIsHealthy(tokenId, debt, withBuffer)
     function isHealthy(uint256 collateralValue, uint256 debt, bool withBuffer)
@@ -26,11 +26,10 @@ contract HealthStub {
     }
 }
 
-// ═══════════════════════════════════════════════════════════
-// STUB 2 — copy of V3Oracle._requireMaxDifference plus the
-// derived-price computation that decides whether the check is
-// a no-op when twapSeconds == 0 and pool == reference pool.
-// ═══════════════════════════════════════════════════════════
+// ============================================================
+// STUB 2 - copy of V3Oracle._requireMaxDifference plus the
+// derived-price equality check for twapSeconds == 0.
+// ============================================================
 contract OracleStub {
     /// @dev mirrors V3Oracle._requireMaxDifference
     function requireMaxDifference(uint256 priceX96, uint256 verifyPriceX96, uint16 maxDiffX10000)
@@ -50,19 +49,21 @@ contract OracleStub {
         );
     }
 
-    /// @dev mirrors _populatePrices when twapSeconds == 0:
-    ///   derived = price0 * Q96 / price1
-    ///   price0 comes from _getReferencePoolPriceX96(pool, 0) -> slot0()
-    ///   price1 == Q96 for referenceToken
-    /// If the reference pool IS the position pool, derived == slot0 == priceX96 below.
-    function derivedEqualsSpotWhenSamePool(uint32 twapSeconds, bool samePool) public pure returns (bool) {
+    /// @dev When twapSeconds == 0 and the reference pool IS the
+    /// position pool, derived price equals spot price, so the
+    /// _requireMaxDifference check is a no-op.
+    function derivedEqualsSpotWhenSamePool(uint32 twapSeconds, bool samePool)
+        public
+        pure
+        returns (bool)
+    {
         return twapSeconds == 0 && samePool;
     }
 }
 
-// ═══════════════════════════════════════════════════════════
+// ============================================================
 // TESTS
-// ═══════════════════════════════════════════════════════════
+// ============================================================
 contract ProveV3Bugs is Test {
     HealthStub h;
     OracleStub o;
@@ -72,84 +73,82 @@ contract ProveV3Bugs is Test {
         o = new OracleStub();
     }
 
-    // ───────────────────────────────────────────────────────
-    // FINDING 1 — 100% LTV Bypass
-    // ───────────────────────────────────────────────────────
+    // --------------------------------------------------------
+    // FINDING 1 - 100% LTV Bypass
+    // --------------------------------------------------------
     function test_F1_100pct_ltv_bypass() public {
-    uint256 collateralValue = 1000e18;
-    uint256 debtAt100 = 1000e18;
+        uint256 collateralValue = 1000e18;
+        uint256 debtAt100 = 1000e18;
 
-    // ── Core claim: two paths, two outcomes at 100% LTV ─────
-    bool normalOk    = h.isHealthy(collateralValue, debtAt100, true);  // borrow()
-    bool transformOk = h.isHealthy(collateralValue, debtAt100, false); // transform()
+        // Core claim: two paths, two outcomes at 100% LTV
+        bool normalOk    = h.isHealthy(collateralValue, debtAt100, true);
+        bool transformOk = h.isHealthy(collateralValue, debtAt100, false);
 
-    // ── Exact caps, computed — not assumed ─────────────────
-    uint256 borrowCap    = (collateralValue * h.BORROW_SAFETY_BUFFER_X32()) / h.Q32();
-    uint256 transformCap = collateralValue;
+        // Exact caps, computed - not assumed
+        uint256 borrowCap    = (collateralValue * h.BORROW_SAFETY_BUFFER_X32()) / h.Q32();
+        uint256 transformCap = collateralValue;
 
-    console2.log("collateralValue     :", collateralValue);
-    console2.log("debt at 100% LTV    :", debtAt100);
-    console2.log("borrow() healthy    :", normalOk);
-    console2.log("transform() healthy :", transformOk);
-    console2.log("borrow() cap        :", borrowCap);
-    console2.log("transform() cap     :", transformCap);
-    console2.log("buffer freed        :", transformCap - borrowCap);
+        console2.log("collateralValue     :", collateralValue);
+        console2.log("debt at 100pct LTV  :", debtAt100);
+        console2.log("borrow() healthy    :", normalOk);
+        console2.log("transform() healthy :", transformOk);
+        console2.log("borrow() cap        :", borrowCap);
+        console2.log("transform() cap     :", transformCap);
+        console2.log("buffer freed        :", transformCap - borrowCap);
 
-    // ── The bug ─────────────────────────────────────────────
-    assertFalse(normalOk,   "borrow() MUST reject 100% LTV");
-    assertTrue (transformOk,"BUG CONFIRMED: transform() accepts 100% LTV");
+        // The bug
+        assertFalse(normalOk,    "borrow() MUST reject 100pct LTV");
+        assertTrue (transformOk, "BUG CONFIRMED: transform() accepts 100pct LTV");
 
-    // ── Exact boundaries of each path ──────────────────────
-    assertTrue (h.isHealthy(collateralValue, borrowCap,      true),  "borrow() accepts its exact cap");
-    assertFalse(h.isHealthy(collateralValue, borrowCap + 1,  true),  "borrow() rejects cap + 1 wei");
-    assertTrue (h.isHealthy(collateralValue, transformCap,      false), "transform() accepts its exact cap");
-    assertFalse(h.isHealthy(collateralValue, transformCap + 1,  false), "transform() rejects cap + 1 wei");
+        // Exact boundaries of each path
+        assertTrue (h.isHealthy(collateralValue, borrowCap,     true), "borrow() accepts its exact cap");
+        assertFalse(h.isHealthy(collateralValue, borrowCap + 1, true), "borrow() rejects cap + 1 wei");
+        assertTrue (h.isHealthy(collateralValue, transformCap,     false), "transform() accepts its exact cap");
+        assertFalse(h.isHealthy(collateralValue, transformCap + 1, false), "transform() rejects cap + 1 wei");
 
-    // ── Caps differ by ~5% ─────────────────────────────────
-    assertLt(borrowCap, transformCap, "borrow cap strictly below transform cap");
-    assertApproxEqRel(borrowCap, transformCap * 95 / 100, 0.0001e18, "borrow cap ≈ 95% of transform cap");
+        // Caps differ by roughly 5 pct
+        assertLt(borrowCap, transformCap, "borrow cap strictly below transform cap");
+        assertApproxEqRel(borrowCap, (transformCap * 95) / 100, 0.0001e18, "borrow cap near 95pct of transform cap");
 
-    console2.log("[BUG] transform() lets debt reach 100% of collateralValue");
-    console2.log("[BUG] borrow()    stops at ~95%");
-    console2.log("[BUG] buffer bypassed:", transformCap - borrowCap, "wei of headroom freed");
-}
-    // ───────────────────────────────────────────────────────
-    // FINDING 2 — Oracle Same-Pool Bypass
-    // ───────────────────────────────────────────────────────
+        console2.log("[BUG] transform() lets debt reach 100pct of collateralValue");
+        console2.log("[BUG] borrow()    stops at ~95pct");
+        console2.log("[BUG] buffer bypassed:", transformCap - borrowCap, "wei of headroom freed");
+    }
+
+    // --------------------------------------------------------
+    // FINDING 2 - Oracle Same-Pool Bypass
+    // --------------------------------------------------------
     function test_F2_oracle_same_pool_bypass() public {
-        uint256 spotManipulated = 500e18; // 100x of fair
-        uint16  maxDiff         = 0;      // strictest
+        uint256 spotManipulated = 500e18;
+        uint16  maxDiff         = 0;
 
-        // CASE A: twapSeconds > 0 → derived is TWAP → check catches manipulation
+        // CASE A: twapSeconds > 0 -> derived is TWAP -> caught
         uint256 derivedFromTWAP = spotManipulated / 2;
         vm.expectRevert(bytes("PriceDifferenceExceeded"));
         o.requireMaxDifference(spotManipulated, derivedFromTWAP, maxDiff);
         console2.log("OK   : twapSeconds>0 rejects manipulated spot");
 
-        // CASE B: twapSeconds == 0 + same reference pool → derived == spot → check passes
+        // CASE B: twapSeconds == 0 + same pool -> derived == spot -> passes
         bool samePoolBypass = o.derivedEqualsSpotWhenSamePool(0, true);
         assertTrue(samePoolBypass, "precondition: same-pool + twap=0");
 
-        // Even with maxDifference = 0 (the strictest possible setting), the
-        // manipulated spot price passes because derived == spot.
         o.requireMaxDifference(spotManipulated, spotManipulated, maxDiff);
         console2.log("BUG  : same-pool + twap=0 accepts 100x manipulated spot");
 
-        // CASE C: twapSeconds == 0 but different pool → derived != spot → caught
+        // CASE C: twapSeconds == 0 but different pool -> caught
         bool samePoolBypassC = o.derivedEqualsSpotWhenSamePool(0, false);
         assertFalse(samePoolBypassC, "different pool is caught");
     }
 
-    // ───────────────────────────────────────────────────────
-    // FINDING 3 — Combined Attack Profit
-    // ───────────────────────────────────────────────────────
+    // --------------------------------------------------------
+    // FINDING 3 - Combined Attack Profit
+    // --------------------------------------------------------
     function test_F3_combined_attack_profit() public {
-        uint256 fairCollateral    = 1000e18;
-        uint256 manipulatedValue  = 2000e18;   // 2x inflation via Bug 2
-        uint256 collateralFactor  = 90;        // 90% CF (max)
+        uint256 fairCollateral   = 1000e18;
+        uint256 manipulatedValue = 2000e18;
+        uint256 collateralFactor = 90;
 
-        // Bug 2 inflates value, Bug 1 permits 100% LTV of that inflated value.
-        uint256 borrowed = (manipulatedValue * collateralFactor) / 100; // 1800
+        uint256 borrowed = (manipulatedValue * collateralFactor) / 100;
         uint256 profit   = borrowed > fairCollateral ? borrowed - fairCollateral : 0;
         uint256 badDebt  = borrowed > fairCollateral ? borrowed - fairCollateral : 0;
 
@@ -165,10 +164,10 @@ contract ProveV3Bugs is Test {
     }
 }
 
-// ═══════════════════════════════════════════════════════════
-// OPTIONAL — verifies deployed config on Base via fork.
+// ============================================================
+// OPTIONAL - verify deployed config on Base via fork.
 // Runs only when BASE_FORK_URL and ORACLE_ADDRESS are set.
-// ═══════════════════════════════════════════════════════════
+// ============================================================
 interface IV3OracleReader {
     function feedConfigs(address) external view returns (
         address feed,
@@ -208,7 +207,7 @@ contract ForkVerify is Test {
 
         address token = address(uint160(vm.envOr("TOKEN_ADDRESS", uint256(0))));
         if (token == address(0)) {
-            console2.log("SKIP: TOKEN_ADDRESS not set (cannot inspect feedConfigs)");
+            console2.log("SKIP: TOKEN_ADDRESS not set");
             return;
         }
 
@@ -223,18 +222,17 @@ contract ForkVerify is Test {
             uint16 maxDiffToken
         ) = oracle.feedConfigs(token);
 
-        console2.log("token             :", token);
-        console2.log("twapSeconds       :", twapSeconds);
-        console2.log("reference pool    :", pool);
-        console2.log("isToken0          :", isToken0);
-        console2.log("mode (4=TWAP)     :", mode);
-        console2.log("maxDifference     :", maxDiffToken);
+        console2.log("token          :", token);
+        console2.log("twapSeconds    :", twapSeconds);
+        console2.log("reference pool :", pool);
+        console2.log("isToken0       :", isToken0);
+        console2.log("mode (4=TWAP)  :", mode);
+        console2.log("maxDifference  :", maxDiffToken);
 
-        // Mode enum: 0=NOT_SET 1=CL_TWAP 2=TWAP_CL 3=CHAINLINK 4=TWAP
         if (mode == 4 && twapSeconds == 0) {
             console2.log("BUG 2 CONFIRMED LIVE: TWAP mode + twapSeconds==0");
         } else {
-            console2.log("this token is NOT vulnerable (mode/twap combination safe)");
+            console2.log("this token is NOT vulnerable");
         }
     }
 }
