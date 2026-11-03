@@ -236,3 +236,69 @@ contract ForkVerify is Test {
         }
     }
 }
+    // --------------------------------------------------------
+    // FINDING 4 - END-TO-END ATTACK SIMULATION (profit check)
+    // --------------------------------------------------------
+    function test_simulate_attack_profitability() public {
+        // === CONFIG ===
+        uint256 lpFairValue      = 1_000e18;   // LP position at true price
+        uint256 flashLoanSize    = 5_000e18;   // to swing the pool
+        uint256 flashLoanFeeBps  = 9;          // 0.09% (Aave V3 / Balancer)
+        uint256 gasBudget        = 50e18;      // rough $50 for all txs
+
+        // === ATTACKER'S ROUND TRIP ===
+        //
+        // 1. Holds LP (fair $1000)
+        // 2. Flash-borrows -> pool swings 2x -> oracle reads inflated value
+        // 3. Borrows via transform() at 100% LTV of 90% CF (Finding 1 + 2)
+        // 4. Unwinds flash loan -> pool back to fair
+        // 5. Self-liquidates: pays liquidatorCost, gets LP back
+        // 6. Position: LP($1000) + leftover cash, debt wiped
+        //
+
+        // Step 2 cost
+        uint256 flashFee = (flashLoanSize * flashLoanFeeBps) / 10_000;
+
+        // Step 3: borrowed = 90% CF * 2x manipulated LP
+        uint256 manipulatedValue = lpFairValue * 2;
+        uint256 borrowed = (manipulatedValue * 90) / 100; // = 1800
+
+        // Step 4: unwind. Real position: debt=$1800, fair LP=$1000
+        // _calculateLiquidation(debt=1800, fullValue=1000, collValue=900):
+        //   fullValue(1000) < maxPenaltyValue(1800*1.10=1980) -> else branch
+        //   penalty        = 10% * debt = 180
+        //   liquidatorCost = fullValue - penalty = 820
+        //   vaultWriteoff  = debt - liquidatorCost = 980
+        uint256 penalty        = (borrowed * 10) / 100;
+        uint256 liquidatorCost = lpFairValue - penalty;
+        uint256 vaultWriteoff  = borrowed - liquidatorCost;
+
+        // Step 5-6: cash + recovered LP
+        uint256 attackerCash = borrowed - flashFee - liquidatorCost - gasBudget;
+        uint256 attackerLP   = lpFairValue; // returned via liquidation
+
+        uint256 attackerFinal  = attackerCash + attackerLP;
+        uint256 attackerStart  = lpFairValue;
+        int256  pnl            = int256(attackerFinal) - int256(attackerStart);
+
+        // === REPORT ===
+        console2.log("=== ATTACK SIMULATION ===");
+        console2.log("LP fair value            :", lpFairValue);
+        console2.log("Manipulated LP value     :", manipulatedValue);
+        console2.log("Borrowed (transform 100%):", borrowed);
+        console2.log("Flash loan fee           :", flashFee);
+        console2.log("Liquidation cost paid    :", liquidatorCost);
+        console2.log("Gas                      :", gasBudget);
+        console2.log("---");
+        console2.log("Attacker final cash      :", attackerCash);
+        console2.log("Attacker final LP        :", attackerLP);
+        console2.log("Attacker final total     :", attackerFinal);
+        console2.log("Attacker start assets    :", attackerStart);
+        console2.log("---");
+        console2.log("ATTACKER PnL             :", uint256(pnl));
+        console2.log("VAULT BAD DEBT           :", vaultWriteoff);
+        console2.log("PROFITABLE               :", pnl > 0);
+
+        assertGt(pnl, 0, "attack must be profitable");
+        assertGt(vaultWriteoff, 0, "vault must take loss");
+    }
