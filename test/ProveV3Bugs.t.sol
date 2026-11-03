@@ -76,29 +76,43 @@ contract ProveV3Bugs is Test {
     // FINDING 1 — 100% LTV Bypass
     // ───────────────────────────────────────────────────────
     function test_F1_100pct_ltv_bypass() public {
-        uint256 collateralValue = 1000e18;
-        uint256 debtAt100 = 1000e18; // 100% LTV
+    uint256 collateralValue = 1000e18;
+    uint256 debtAt100 = 1000e18;
 
-        bool normalOk   = h.isHealthy(collateralValue, debtAt100, true);  // borrow() path
-        bool transformOk = h.isHealthy(collateralValue, debtAt100, false); // transform() path
+    // ── Core claim: two paths, two outcomes at 100% LTV ─────
+    bool normalOk    = h.isHealthy(collateralValue, debtAt100, true);  // borrow()
+    bool transformOk = h.isHealthy(collateralValue, debtAt100, false); // transform()
 
-        console2.log("collateralValue     :", collateralValue);
-        console2.log("debt at 100% LTV    :", debtAt100);
-        console2.log("borrow() healthy    :", normalOk);
-        console2.log("transform() healthy :", transformOk);
-        console2.log("borrow() cap (95%)  :", (collateralValue * 95) / 100);
-        console2.log("transform() cap     :", collateralValue);
-        console2.log("buffer freed        :", collateralValue - (collateralValue * 95) / 100);
+    // ── Exact caps, computed — not assumed ─────────────────
+    uint256 borrowCap    = (collateralValue * h.BORROW_SAFETY_BUFFER_X32()) / h.Q32();
+    uint256 transformCap = collateralValue;
 
-        assertFalse(normalOk,   "normal borrow() MUST reject 100% LTV");
-        assertTrue(transformOk, "BUG CONFIRMED: transform() ACCEPTS 100% LTV");
+    console2.log("collateralValue     :", collateralValue);
+    console2.log("debt at 100% LTV    :", debtAt100);
+    console2.log("borrow() healthy    :", normalOk);
+    console2.log("transform() healthy :", transformOk);
+    console2.log("borrow() cap        :", borrowCap);
+    console2.log("transform() cap     :", transformCap);
+    console2.log("buffer freed        :", transformCap - borrowCap);
 
-        // Exact boundary proof
-        assertFalse(h.isHealthy(collateralValue, 951e18, true),  "borrow() rejects 951");
-        assertTrue (h.isHealthy(collateralValue, 950e18, true),  "borrow() accepts 950");
-        assertTrue (h.isHealthy(collateralValue, 1000e18, false), "transform() accepts 1000 << BUG");
-    }
+    // ── The bug ─────────────────────────────────────────────
+    assertFalse(normalOk,   "borrow() MUST reject 100% LTV");
+    assertTrue (transformOk,"BUG CONFIRMED: transform() accepts 100% LTV");
 
+    // ── Exact boundaries of each path ──────────────────────
+    assertTrue (h.isHealthy(collateralValue, borrowCap,      true),  "borrow() accepts its exact cap");
+    assertFalse(h.isHealthy(collateralValue, borrowCap + 1,  true),  "borrow() rejects cap + 1 wei");
+    assertTrue (h.isHealthy(collateralValue, transformCap,      false), "transform() accepts its exact cap");
+    assertFalse(h.isHealthy(collateralValue, transformCap + 1,  false), "transform() rejects cap + 1 wei");
+
+    // ── Caps differ by ~5% ─────────────────────────────────
+    assertLt(borrowCap, transformCap, "borrow cap strictly below transform cap");
+    assertApproxEqRel(borrowCap, transformCap * 95 / 100, 0.0001e18, "borrow cap ≈ 95% of transform cap");
+
+    console2.log("[BUG] transform() lets debt reach 100% of collateralValue");
+    console2.log("[BUG] borrow()    stops at ~95%");
+    console2.log("[BUG] buffer bypassed:", transformCap - borrowCap, "wei of headroom freed");
+}
     // ───────────────────────────────────────────────────────
     // FINDING 2 — Oracle Same-Pool Bypass
     // ───────────────────────────────────────────────────────
