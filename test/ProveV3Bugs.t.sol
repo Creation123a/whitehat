@@ -16,18 +16,16 @@ interface IV3Vault {
 }
 
 interface IV3Oracle {
-    // Same struct shape as V3Oracle.TokenConfig. ABI matches the
-    // auto-generated mapping getter, so returns decode as-is.
     struct FeedConfig {
         address feed;
-        uint32 maxFeedAge;
-        uint8 feedDecimals;
-        uint8 tokenDecimals;
-        uint32 twapSeconds;
+        uint32  maxFeedAge;
+        uint8   feedDecimals;
+        uint8   tokenDecimals;
+        uint32  twapSeconds;
         address pool;
-        bool isToken0;
-        uint8 mode;
-        uint16 maxDifference;
+        bool    isToken0;
+        uint8   mode;
+        uint16  maxDifference;
     }
     function referenceToken() external view returns (address);
     function feedConfigs(address) external view returns (FeedConfig memory);
@@ -72,7 +70,7 @@ contract ProveV3BugsFork is Test {
     }
 
     // ---------------------------------------------------------
-    // F2 - full same-pool bypass scan
+    // F2 - discover every configured token via logs, scan each
     // ---------------------------------------------------------
     function test_F2_same_pool_scan() public {
         address ref = oracle.referenceToken();
@@ -97,7 +95,6 @@ contract ProveV3BugsFork is Test {
         internal
         returns (uint256 vulnCount)
     {
-        // Fetch logs. vm.rpc returns the raw JSON as bytes.
         bytes memory raw = vm.rpc(
             "eth_getLogs",
             string.concat(
@@ -108,9 +105,8 @@ contract ProveV3BugsFork is Test {
             )
         );
 
-        // Parse the JSON response to a string array of data fields.
-        // path ".result[*].data" works with vm.parseJsonStringArray.
-        string[] memory dataList = vm.parseJsonStringArray(raw, ".result[*].data");
+        string memory rawStr = string(raw);
+        string[] memory dataList = vm.parseJsonStringArray(rawStr, ".result[*].data");
         console2.log("F2 logs fetched:", dataList.length);
 
         address[] memory seen = new address[](dataList.length);
@@ -134,18 +130,17 @@ contract ProveV3BugsFork is Test {
         }
     }
 
-    // data = 0x + 32-byte token + 32-byte cf + 32-byte limit.
-    // token is the first 20 bytes of the first word.
+    // SetTokenConfig(address,uint32,uint32) - token is NOT indexed,
+    // so it sits as the first 20 bytes of data.
     function _decodeTokenFromData(string memory data)
         internal
         pure
         returns (address)
     {
         bytes memory b = bytes(data);
-        if (b.length < 66) return address(0); // "0x" + 64 hex
+        if (b.length < 66) return address(0);
 
         uint160 v = 0;
-        // token occupies chars [2..41] (40 hex chars = 20 bytes)
         for (uint256 i = 2; i < 42; i++) {
             v = (v << 4) | uint160(_hexVal(uint8(b[i])));
         }
@@ -153,9 +148,9 @@ contract ProveV3BugsFork is Test {
     }
 
     function _hexVal(uint8 c) internal pure returns (uint8) {
-        if (c >= 48 && c <= 57) return c - 48;      // 0-9
-        if (c >= 97 && c <= 102) return c - 87;     // a-f
-        if (c >= 65 && c <= 70) return c - 55;      // A-F
+        if (c >= 48 && c <= 57) return c - 48;
+        if (c >= 97 && c <= 102) return c - 87;
+        if (c >= 65 && c <= 70) return c - 55;
         revert("bad hex");
     }
 
@@ -170,8 +165,37 @@ contract ProveV3BugsFork is Test {
         return false;
     }
 
+    function _isVulnerable(address T, address ref, bool refIsCollateral)
+        internal
+        view
+        returns (bool)
+    {
+        (uint32 cf, , ) = vault.tokenConfigs(T);
+        if (cf == 0) return false;
+
+        IV3Oracle.FeedConfig memory cfg = oracle.feedConfigs(T);
+        if (cfg.twapSeconds != 0) return false;
+        if (cfg.mode != 4) return false;
+
+        if (cfg.pool == address(0)) return false;
+        if (cfg.pool.code.length == 0) return false;
+
+        IUniswapV3Pool p = IUniswapV3Pool(cfg.pool);
+        address p0 = p.token0();
+        address p1 = p.token1();
+
+        bool oriented = cfg.isToken0
+            ? (p0 == T && p1 == ref)
+            : (p1 == T && p0 == ref);
+        if (!oriented) return false;
+
+        if (!refIsCollateral) return false;
+
+        return true;
+    }
+
     // ---------------------------------------------------------
-    // F3 - economic preconditions (flash feasibility)
+    // F3 - economic preconditions
     // ---------------------------------------------------------
     function test_F3_economics() public {
         address poolAddr     = vm.parseAddress("0xd0b53d9277642d899df5c87a3966a349a798f224");
@@ -181,9 +205,9 @@ contract ProveV3BugsFork is Test {
         uint256 flash2x  = poolUsdc * 2;
         uint256 avail    = _aaveAvail(aavePoolAddr);
 
-        console2.log("F3 pool USDC   :", poolUsdc);
-        console2.log("F3 flash 2x    :", flash2x);
-        console2.log("F3 aave avail  :", avail);
+        console2.log("F3 pool USDC  :", poolUsdc);
+        console2.log("F3 flash 2x   :", flash2x);
+        console2.log("F3 aave avail :", avail);
 
         if (avail >= flash2x) {
             console2.log("PRECONDITIONS MET");
@@ -202,8 +226,6 @@ contract ProveV3BugsFork is Test {
 
         address aT;
         address vD;
-        // getReserveData ABI layout, slot 8 = aToken, slot 10 = variableDebt
-        // offset = ret + 32 + 32*slot
         assembly {
             aT := and(mload(add(ret, 288)), 0xffffffffffffffffffffffffffffffffffffffff)
             vD := and(mload(add(ret, 352)), 0xffffffffffffffffffffffffffffffffffffffff)
