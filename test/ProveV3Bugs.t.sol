@@ -7,6 +7,7 @@ import "forge-std/console2.sol";
 interface IV3Vault {
     function BORROW_SAFETY_BUFFER_X32() external view returns (uint32);
     function asset() external view returns (address);
+    function oracle() external view returns (address);
 }
 
 interface IV3Oracle {
@@ -61,7 +62,14 @@ contract ProveV3BugsFork is Test {
         assertEq(asset, USDC, "vault asset is USDC");
     }
 
-    function test_fork_F2_twap_scan() public {
+        function test_fork_F2_twap_scan() public {
+        // Auto-discover the oracle address from the vault itself.
+        address oracleAddr = vault.oracle();
+        console2.log("vault.oracle() returns:", oracleAddr);
+        assertTrue(oracleAddr != address(0), "vault.oracle() is zero");
+        assertTrue(oracleAddr.code.length > 0, "vault.oracle() has no code");
+
+        IV3Oracle liveOracle = IV3Oracle(oracleAddr);
         address[3] memory tokens = [WETH, USDC, CBBTC];
 
         for (uint256 i = 0; i < 3; i++) {
@@ -72,7 +80,7 @@ contract ProveV3BugsFork is Test {
                 bool isToken0,
                 uint8 mode,
                 uint16 maxDiff
-            ) = oracle.feedConfigs(tokens[i]);
+            ) = liveOracle.feedConfigs(tokens[i]);
 
             console2.log("token        :", tokens[i]);
             console2.log("  twapSeconds:", twapSeconds);
@@ -86,9 +94,8 @@ contract ProveV3BugsFork is Test {
             }
         }
 
-        console2.log("global maxPoolPriceDifference:", oracle.maxPoolPriceDifference());
+        console2.log("global maxPoolPriceDifference:", liveOracle.maxPoolPriceDifference());
     }
-
     function test_fork_F3_economic_preconditions() public {
         uint256 aaveUsdc = IERC20(USDC).balanceOf(AAVE_V3_POOL);
         uint256 poolUsdc = IERC20(USDC).balanceOf(WETH_USDC_POOL);
