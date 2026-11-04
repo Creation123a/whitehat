@@ -147,7 +147,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x6b0f53cbd9272d8117e9535fe25371dedf39a1be"),   //  skip
 	},
 	"surf-liquid": {
-		common.HexToAddress("0xcDca2EaAe4a8a6B83D7a3589946C2301040dAFbf"),
+		common.HexToAddress("0xcDca2EaAe4a8a6B83D7a3589946C2301040dAFbf"),  //  skip
 	},
 	"gilder": {
 		common.HexToAddress("0x9C907FdFDda7BC57e2F05D7CefbB198c313CdE1c"),
