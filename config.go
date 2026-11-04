@@ -186,21 +186,21 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0xae35ff1bc4fbb45aaeef9768a3d9610786cac98b"),   //  skip
 	},
 	"frgmnt": {
-		common.HexToAddress("0xeB82611A2B2dC9FBEAF5903d5decDf801765B759"),
+		common.HexToAddress("0xeB82611A2B2dC9FBEAF5903d5decDf801765B759"),  //  skip
 	},
 	"autopilot": {
 		common.HexToAddress("0x31A421271414641cb5063B71594b642D2666dB6B"),
-		common.HexToAddress("0xEd5d22F133bB20deE41629b84348F60925E8bDE0"),
+		common.HexToAddress("0xEd5d22F133bB20deE41629b84348F60925E8bDE0"),  //  skip
 	},
 	"maxapy": {
 		common.HexToAddress("0x7a63e8FC1d0A5E9BE52f05817E8C49D9e2d6efAe"),
 		common.HexToAddress("0x1c117e6cC629C414377Fdbb427db329fD0821F9a"),
-		common.HexToAddress("0x9FDfd9c1e23D687F7a154610816de6E47Fb4FC64"),
+		common.HexToAddress("0x9FDfd9c1e23D687F7a154610816de6E47Fb4FC64"), //  skip
 	},
 
 	// CDP
 	"btcfi-cdp": {
-		common.HexToAddress("0xe4b20925D9E9a62F1E492e15a81dC0de62804dd4"),
+		common.HexToAddress("0xe4b20925D9E9a62F1E492e15a81dC0de62804dd4"),   //  skip
 	},
 	"qidao": {
 		common.HexToAddress("0xbf1aeA8670D2528E08334083616dD9C5F3B087aE"),
@@ -209,13 +209,13 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x76A9A0062ec6712b99B4f63bD2b4270185759dd5"),
 		common.HexToAddress("0x4Dde0e308CFB60515218C6ad2DF1134Fc48531FC"),
 		common.HexToAddress("0x08417cdb7F52a5021bB4eb6E0deAf3f295c3f182"),
-		common.HexToAddress("0xfD28f108e95f4D41daAE9dbfFf707D677985998E"),
+		common.HexToAddress("0xfD28f108e95f4D41daAE9dbfFf707D677985998E"), //  skip
 	},
 	"base-dollar": {
-		common.HexToAddress("0x252d36f435582ecb01686448d21e8c9ea0b2ca65"),
+		common.HexToAddress("0x252d36f435582ecb01686448d21e8c9ea0b2ca65"),   //  skip
 	},
 	"vaultedge": {
-		common.HexToAddress("0x89AbeeE01B8c544cc7516B1e44102a063D79cd4D"),
+		common.HexToAddress("0x89AbeeE01B8c544cc7516B1e44102a063D79cd4D"),  //  skip
 	},
 
 	// Basis Trading
