@@ -35,30 +35,30 @@ const (
 var BaseProtocolRegistry = map[string][]common.Address{
 	// Lending
 	"native-credit-pool": {
-		common.HexToAddress("0x74a4Cd023e5AfB88369E3f22b02440F2614a1367"),
+		common.HexToAddress("0x74a4Cd023e5AfB88369E3f22b02440F2614a1367"),  //no bugs
 	},
 	"exactly": {
 		common.HexToAddress("0x0Aeb0BCB919858C0a4dceC3EeD879985034A597c"),
-		common.HexToAddress("0x85c21fA8AeE39891E115E2b28c3dB2dE5B0AaF4f"),
+		common.HexToAddress("0x85c21fA8AeE39891E115E2b28c3dB2dE5B0AaF4f"),  // latent bugs
 	},
 	"morpho-midnight": {
-		common.HexToAddress("0xAdedD8ab6dE832766Fedf0FaC4992E5C4D3EA18A"),
+		common.HexToAddress("0xAdedD8ab6dE832766Fedf0FaC4992E5C4D3EA18A"), //no bugs
 	},
 	"revert-lend": {
-		common.HexToAddress("0x36AEAe0E411a1E28372e0d66f02E57744EbE7599"),
+		common.HexToAddress("0x36AEAe0E411a1E28372e0d66f02E57744EbE7599"),  // latent bugs
 	},
 	"seamless-v2": {
-		common.HexToAddress("0x8F44Fd754285aa6A2b8B9B97739B79746e0475a7"),
+		common.HexToAddress("0x8F44Fd754285aa6A2b8B9B97739B79746e0475a7"),  // latent bugs
 	},
 	"extra-finance-xlend": {
 		common.HexToAddress("0xbb505c54d71e9e599cb8435b4f0ceec05fc71cbd"),
-		common.HexToAddress("0xf9cfb8a62f50e10adde5aa888b44cf01c5957055"),
+		common.HexToAddress("0xf9cfb8a62f50e10adde5aa888b44cf01c5957055"),  // bugs but require whitelisted vaul
 	},
 	"surge-credit": {
-		common.HexToAddress("0xEE755F1BbcbF6e3260469D0f473522d71d3bdDda"),
+		common.HexToAddress("0xEE755F1BbcbF6e3260469D0f473522d71d3bdDda"), //  latent bugs
 	},
 	"mortgagefi": {
-		common.HexToAddress("0x233c539b5eb3d349c85a15de0ab5458456bb358e"),
+		common.HexToAddress("0x233c539b5eb3d349c85a15de0ab5458456bb358e"),  //   ! major bug 
 	},
 	"teller": {
 		common.HexToAddress("0x48EE9c344d5C6d202F4b3225A694957a3412008d"),
