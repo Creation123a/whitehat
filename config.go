@@ -133,7 +133,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x21FE3e26E824783cA7E374355A8D30Ae8BBf6E37"),
 	},
 	"royco-v1": {
-		common.HexToAddress("0x783251f103555068c1E9D755f69458f39eD937c0"),
+		common.HexToAddress("0x783251f103555068c1E9D755f69458f39eD937c0"),   //  skip
 	},
 	"zircuit-finance": {
 		common.HexToAddress("0x0792C46723d479D4C29De5D78D93C0146EdF3f5B"),
