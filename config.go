@@ -154,7 +154,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 	},
 	"gammaswap-yield-tokens": {
 		common.HexToAddress("0xc4d44c155f95FD4E94600d191a4a01bb571dF7DF"),
-		common.HexToAddress("0xaeAAc90117fb85a7DC961522DdFe96ABB358445B"),
+		common.HexToAddress("0xaeAAc90117fb85a7DC961522DdFe96ABB358445B"),  //  skip
 	},
 
 	// Yield Aggregator
