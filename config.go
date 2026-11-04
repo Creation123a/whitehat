@@ -144,7 +144,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 	},
 	"velvet-v3": {
 		common.HexToAddress("0xbF927b841994731C573BDF09ceB0c6B0Aa887cDd"),
-		common.HexToAddress("0x6b0f53cbd9272d8117e9535fe25371dedf39a1be"),
+		common.HexToAddress("0x6b0f53cbd9272d8117e9535fe25371dedf39a1be"),   //  skip
 	},
 	"surf-liquid": {
 		common.HexToAddress("0xcDca2EaAe4a8a6B83D7a3589946C2301040dAFbf"),
