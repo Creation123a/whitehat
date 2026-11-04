@@ -183,7 +183,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 	"stratex": {
 		common.HexToAddress("0xe5f2fe713CDB192C85e67A912Ff8891b4E636614"),
 		common.HexToAddress("0x9213d24f617dE982dB528c95A701eD1b2AF29cB2"),
-		common.HexToAddress("0xae35ff1bc4fbb45aaeef9768a3d9610786cac98b"),
+		common.HexToAddress("0xae35ff1bc4fbb45aaeef9768a3d9610786cac98b"),   //  skip
 	},
 	"frgmnt": {
 		common.HexToAddress("0xeB82611A2B2dC9FBEAF5903d5decDf801765B759"),
