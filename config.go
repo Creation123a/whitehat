@@ -61,7 +61,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x233c539b5eb3d349c85a15de0ab5458456bb358e"),  //   ! major bug 
 	},
 	"teller": {
-		common.HexToAddress("0x48EE9c344d5C6d202F4b3225A694957a3412008d"),
+		common.HexToAddress("0x48EE9c344d5C6d202F4b3225A694957a3412008d"),  //  ! major bug
 	},
 	"tarot": {
 		common.HexToAddress("0xf544251d25f3d243a36b07e7e7962a678f952691"),
