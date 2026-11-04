@@ -283,7 +283,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x20Ff0d43681e6bE06f89015E55fB909338A21cbF"),  //  skip
 	},
 
-	// RWA
+	// RWA             // skipped !!!!!!
 	"re": {
 		common.HexToAddress("0x7D214438D0F27AfCcC23B3d1e1a53906aCE5CFEa"),
 		common.HexToAddress("0xaDC4794909605570D4C43040EB2bd5c0871feDDA"),
