@@ -99,7 +99,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 	"stake-dao-yield": {
 		common.HexToAddress("0xB0552b6860CE5C0202976Db056b5e3Cc4f9CC765"),
 		common.HexToAddress("0x5DA07af8913A4EAf09E5F569c20138b658906c17"),
-		common.HexToAddress("0x32dA29D7F3aD8cF157C6427CecFD3f0665042A37"),
+		common.HexToAddress("0x32dA29D7F3aD8cF157C6427CecFD3f0665042A37"),  //   ! major bug 
 	},
 	"infinifi": {
 		common.HexToAddress("0x4cE95DaF47410f21008fDa15D27c801f462Fb872"),
