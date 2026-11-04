@@ -245,7 +245,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x548f93779fbc992010c07467cbaf329dd5f059b7"),
 	},
 	"ipor-derivatives": {
-		common.HexToAddress("0x41883F367ab187B1C676A4A4767758916A6a01Fa"),
+		common.HexToAddress("0x41883F367ab187B1C676A4A4767758916A6a01Fa"),   //  skip
 	},
 	"rollx": {
 		common.HexToAddress("0xab6363da0c80cef3ae105bd6241e30872355d021"),
