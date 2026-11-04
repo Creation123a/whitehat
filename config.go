@@ -102,16 +102,16 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x32dA29D7F3aD8cF157C6427CecFD3f0665042A37"),  //   ! major bug 
 	},
 	"infinifi": {
-		common.HexToAddress("0x4cE95DaF47410f21008fDa15D27c801f462Fb872"),
+		common.HexToAddress("0x4cE95DaF47410f21008fDa15D27c801f462Fb872"), // skip
 	},
 	"autofinance": {
-		common.HexToAddress("0xC7d7F434C015F2A7E77dF9763ADE300F2171a05a"),
+		common.HexToAddress("0xC7d7F434C015F2A7E77dF9763ADE300F2171a05a"), // skip
 	},
 	"royco-v2": {
 		common.HexToAddress("0xaf55a0c251690d9322b5F94b7e50EE895750262c"),
 		common.HexToAddress("0xaAAaaAAAaE46cA12Bf3810DF8C13c5E8A4400812"),
 		common.HexToAddress("0x387e025306cb1C41fe7AB752D9C04607E03Bb8CE"),
-		common.HexToAddress("0x783251f103555068c1e9d755f69458f39ed937c0"),
+		common.HexToAddress("0x783251f103555068c1e9d755f69458f39ed937c0"),   // ! major bug
 	},
 	"spectra-v2": {
 		common.HexToAddress("0x64fcc3a02eeeba05ef701b7eed066c6ebd5d4e51"),
@@ -280,7 +280,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x981A7bF20D62d8076A9A0062ec6712b99B4f63bD"),
 	},
 	"bakerfi": {
-		common.HexToAddress("0x20Ff0d43681e6bE06f89015E55fB909338A21cbF"),
+		common.HexToAddress("0x20Ff0d43681e6bE06f89015E55fB909338A21cbF"),  //  skip
 	},
 
 	// RWA
