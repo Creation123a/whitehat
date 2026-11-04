@@ -255,13 +255,13 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x859bC5FE903dFe749fE3331512Ff7297D2E924f3"),  //  skip
 	},
 	"infinitypools": {
-		common.HexToAddress("0x86342D7bBe93cB640A6c57d4781f04d93a695f08"),
+		common.HexToAddress("0x86342D7bBe93cB640A6c57d4781f04d93a695f08"),  //  skip
 	},
 	"domination-finance": {
-		common.HexToAddress("0xA194082Aabb75Dd1Ca9Dc1BA573A5528BeB8c2Fb"),
+		common.HexToAddress("0xA194082Aabb75Dd1Ca9Dc1BA573A5528BeB8c2Fb"),   //  skip
 	},
 	"javsphere": {
-		common.HexToAddress("0xEdC6136B26A0E341103f75e48936900Fe39aF2C6"),
+		common.HexToAddress("0xEdC6136B26A0E341103f75e48936900Fe39aF2C6"),   //  skip
 	},
 
 	// Liquid Staking
