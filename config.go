@@ -223,7 +223,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x624e2e7fDc8903165F64891672267AB0FCB98831"),
 	},
 
-	// Derivatives
+	// Derivatives          skipped !!!!
 	"apex-omni": {
 		common.HexToAddress("0xeE7981C4642dE8d19AeD11dA3bac59277DfD59D7"),
 	},
