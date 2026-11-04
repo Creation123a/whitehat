@@ -252,7 +252,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 	},
 	"bmx-classic-perps": {
 		common.HexToAddress("0x9a99a30e4740d496484f04ef4a097d6ce584fb46"),
-		common.HexToAddress("0x859bC5FE903dFe749fE3331512Ff7297D2E924f3"),
+		common.HexToAddress("0x859bC5FE903dFe749fE3331512Ff7297D2E924f3"),  //  skip
 	},
 	"infinitypools": {
 		common.HexToAddress("0x86342D7bBe93cB640A6c57d4781f04d93a695f08"),
