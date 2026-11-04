@@ -150,7 +150,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0xcDca2EaAe4a8a6B83D7a3589946C2301040dAFbf"),  //  skip
 	},
 	"gilder": {
-		common.HexToAddress("0x9C907FdFDda7BC57e2F05D7CefbB198c313CdE1c"),
+		common.HexToAddress("0x9C907FdFDda7BC57e2F05D7CefbB198c313CdE1c"),   //  skip
 	},
 	"gammaswap-yield-tokens": {
 		common.HexToAddress("0xc4d44c155f95FD4E94600d191a4a01bb571dF7DF"),
