@@ -198,7 +198,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x9FDfd9c1e23D687F7a154610816de6E47Fb4FC64"), //  skip
 	},
 
-	// CDP
+	// CDP                skipped !!!!!!
 	"btcfi-cdp": {
 		common.HexToAddress("0xe4b20925D9E9a62F1E492e15a81dC0de62804dd4"),   //  skip
 	},
@@ -218,7 +218,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x89AbeeE01B8c544cc7516B1e44102a063D79cd4D"),  //  skip
 	},
 
-	// Basis Trading
+	// Basis Trading          skipped !!!!
 	"sosovalue-basis": {
 		common.HexToAddress("0x624e2e7fDc8903165F64891672267AB0FCB98831"),
 	},
@@ -264,7 +264,7 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0xEdC6136B26A0E341103f75e48936900Fe39aF2C6"),   //  skip
 	},
 
-	// Liquid Staking
+	// Liquid Staking      skipped !!!!!!
 	"ether.fi-stake": {
 		common.HexToAddress("0x1a44076050125825900e736c501f859c50fE728c"),
 	},
