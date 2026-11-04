@@ -64,37 +64,37 @@ var BaseProtocolRegistry = map[string][]common.Address{
 		common.HexToAddress("0x48EE9c344d5C6d202F4b3225A694957a3412008d"),  //  ! major bug
 	},
 	"tarot": {
-		common.HexToAddress("0xf544251d25f3d243a36b07e7e7962a678f952691"),
+		common.HexToAddress("0xf544251d25f3d243a36b07e7e7962a678f952691"),  //  skip
 	},
 	"impermax-v2": {
-		common.HexToAddress("0x74497E4efe07E7A71d1d857C6b68bD2115EB948F"),
+		common.HexToAddress("0x74497E4efe07E7A71d1d857C6b68bD2115EB948F"),  //  skip
 	},
 	"seamless-v1": {
 		common.HexToAddress("0x59a11C2f543790b8ce1A2DC46C4ad08A4536BdC8"),
-		common.HexToAddress("0x8f44fd754285aa6A2b8B9B97739B79746e0475a7"),
+		common.HexToAddress("0x8f44fd754285aa6A2b8B9B97739B79746e0475a7"),  //  skip
 	},
 	"radiant-v2": {
 		common.HexToAddress("0x30798cFe2CCa822321ceed7e6085e633aAbC492F"),
-		common.HexToAddress("0x5D64926bEF21BD772e7d6F89AED16d8c1A93dD66"),
+		common.HexToAddress("0x5D64926bEF21BD772e7d6F89AED16d8c1A93dD66"),  //  skip
 	},
 	"ripe-protocol": {
-		common.HexToAddress("0x6162df1b329E157479F8f1407E888260E0EC3d2b"),
+		common.HexToAddress("0x6162df1b329E157479F8f1407E888260E0EC3d2b"),  //  skip
 	},
 	"astaria-v2": {
 		common.HexToAddress("0x0000000000A6F0986c92cf1EC4d2e77aFBE1466D"),
-		common.HexToAddress("0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC"),
+		common.HexToAddress("0x00000000000000ADc04C56Bf30aC9d3c0aAF14dC"),  //  skip
 	},
 	"sonne-finance": {
-		common.HexToAddress("0x60CF091cD3f50420d50fD7f707414d0DF4751C58"),
+		common.HexToAddress("0x60CF091cD3f50420d50fD7f707414d0DF4751C58"),  //  skip
 	},
 
 	// Yield
 	"spark-savings": {
 		common.HexToAddress("0x5875eEE11Cf8398102FdAd704C9E96607675467a"),
-		common.HexToAddress("0x3128a0F7f0ea68E7B7c9B00AFa7E41045828e858"),
+		common.HexToAddress("0x3128a0F7f0ea68E7B7c9B00AFa7E41045828e858"),  //  skip
 	},
 	"pendle-v2": {
-		common.HexToAddress("0x888888888889758F76e7103c6CbF23ABbF58F946"),
+		common.HexToAddress("0x888888888889758F76e7103c6CbF23ABbF58F946"),  //  skip
 	},
 	"stake-dao-yield": {
 		common.HexToAddress("0xB0552b6860CE5C0202976Db056b5e3Cc4f9CC765"),
