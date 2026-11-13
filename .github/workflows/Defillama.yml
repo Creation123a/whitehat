@@ -1,9 +1,9 @@
 name: Fetch DefiLlama Lending Protocols
 
 on:
-  workflow_dispatch: # Allows you to trigger this manually from the GitHub Actions tab
+  workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *' # Optional: Runs automatically every day at midnight UTC
+    - cron: '0 0 * * *'
 
 jobs:
   fetch-protocols:
@@ -20,7 +20,7 @@ jobs:
 
       - name: Run DefiLlama Extraction Script
         run: |
-          python3 -c '
+          python3 << 'EOF'
           import csv
           import json
           import requests
@@ -39,19 +39,19 @@ jobs:
           for p in data:
               tvl = p.get("tvl") or 0
               if p.get("category") == "Lending" and min_tvl <= tvl <= max_tvl:
-                  # Check if forked from Compound V2 (ID "114")
                   forked_ids = p.get("forkedFromIds") or p.get("forkedFrom") or []
                   is_compound_v2_fork = "114" in [str(x) for x in forked_ids]
+                  slug = p.get("slug") or ""
 
                   filtered.append({
                       "name": p.get("name"),
-                      "slug": p.get("slug"),
+                      "slug": slug,
                       "tvl_usd": round(tvl, 2),
                       "chains": ", ".join(p.get("chains") or []),
                       "is_compound_v2_fork": is_compound_v2_fork,
                       "forked_from_ids": ", ".join(str(x) for x in forked_ids),
                       "url": p.get("url"),
-                      "defillama_url": f"https://defillama.com{p.get(\"slug\")}"
+                      "defillama_url": f"https://defillama.com{slug}"
                   })
 
           # Sort highest TVL first
@@ -68,7 +68,7 @@ jobs:
                   writer.writerows(filtered)
 
           print(f"Successfully exported {len(filtered)} protocols.")
-          '
+          EOF
 
       - name: Upload Results as ZIP Artifact
         uses: actions/upload-artifact@v4
@@ -76,4 +76,4 @@ jobs:
           name: defillama-lending-results
           path: |
             lending_protocols.csv
-            lenddefillama-lending-resultsesults
+            lending_protocols.json
