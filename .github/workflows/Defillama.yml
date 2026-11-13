@@ -31,28 +31,54 @@ jobs:
           response.raise_for_status()
           data = response.json()
 
-          # 2. Filter: Lending category, TVL between $50k and $10M
+          # 2. Filter: Lending category, TVL between $50k and $10M,
+          #    Arbitrum chain only, and Compound V2 fork only
           min_tvl = 50_000
           max_tvl = 10_000_000
 
           filtered = []
           for p in data:
-              tvl = p.get("tvl") or 0
-              if p.get("category") == "Lending" and min_tvl <= tvl <= max_tvl:
-                  forked_ids = p.get("forkedFromIds") or p.get("forkedFrom") or []
-                  is_compound_v2_fork = "114" in [str(x) for x in forked_ids]
-                  slug = p.get("slug") or ""
+              if p.get("category") != "Lending":
+                  continue
 
-                  filtered.append({
-                      "name": p.get("name"),
-                      "slug": slug,
-                      "tvl_usd": round(tvl, 2),
-                      "chains": ", ".join(p.get("chains") or []),
-                      "is_compound_v2_fork": is_compound_v2_fork,
-                      "forked_from_ids": ", ".join(str(x) for x in forked_ids),
-                      "url": p.get("url"),
-                      "defillama_url": f"https://defillama.com{slug}"
-                  })
+              tvl = p.get("tvl") or 0
+              try:
+                  tvl = float(tvl)
+              except (TypeError, ValueError):
+                  continue
+
+              if not (min_tvl <= tvl <= max_tvl):
+                  continue
+
+              chain_list = p.get("chains") or []
+              if isinstance(chain_list, str):
+                  chain_list = [chain_list]
+              chain_names = [str(c) for c in chain_list]
+
+              if "Arbitrum" not in chain_names:
+                  continue
+
+              forked_ids = p.get("forkedFromIds") or p.get("forkedFrom") or []
+              if isinstance(forked_ids, (str, int)):
+                  forked_ids = [forked_ids]
+              forked_id_strings = [str(x) for x in forked_ids]
+
+              is_compound_v2_fork = "114" in forked_id_strings
+              if not is_compound_v2_fork:
+                  continue
+
+              slug = p.get("slug") or ""
+
+              filtered.append({
+                  "name": p.get("name"),
+                  "slug": slug,
+                  "tvl_usd": round(tvl, 2),
+                  "chains": ", ".join(chain_names),
+                  "is_compound_v2_fork": is_compound_v2_fork,
+                  "forked_from_ids": ", ".join(forked_id_strings),
+                  "url": p.get("url"),
+                  "defillama_url": f"https://defillama.com{slug}"
+              })
 
           # Sort highest TVL first
           filtered.sort(key=lambda x: x["tvl_usd"], reverse=True)
