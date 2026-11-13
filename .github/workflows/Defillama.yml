@@ -1,0 +1,79 @@
+name: Fetch DefiLlama Lending Protocols
+
+on:
+  workflow_dispatch: # Allows you to trigger this manually from the GitHub Actions tab
+  schedule:
+    - cron: '0 0 * * *' # Optional: Runs automatically every day at midnight UTC
+
+jobs:
+  fetch-protocols:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run DefiLlama Extraction Script
+        run: |
+          python3 -c '
+          import csv
+          import json
+          import requests
+
+          # 1. Fetch data from DefiLlama API
+          url = "https://llama.fi"
+          response = requests.get(url, timeout=30)
+          response.raise_for_status()
+          data = response.json()
+
+          # 2. Filter: Lending category, TVL between $50k and $10M
+          min_tvl = 50_000
+          max_tvl = 10_000_000
+
+          filtered = []
+          for p in data:
+              tvl = p.get("tvl") or 0
+              if p.get("category") == "Lending" and min_tvl <= tvl <= max_tvl:
+                  # Check if forked from Compound V2 (ID "114")
+                  forked_ids = p.get("forkedFromIds") or p.get("forkedFrom") or []
+                  is_compound_v2_fork = "114" in [str(x) for x in forked_ids]
+
+                  filtered.append({
+                      "name": p.get("name"),
+                      "slug": p.get("slug"),
+                      "tvl_usd": round(tvl, 2),
+                      "chains": ", ".join(p.get("chains") or []),
+                      "is_compound_v2_fork": is_compound_v2_fork,
+                      "forked_from_ids": ", ".join(str(x) for x in forked_ids),
+                      "url": p.get("url"),
+                      "defillama_url": f"https://defillama.com{p.get(\"slug\")}"
+                  })
+
+          # Sort highest TVL first
+          filtered.sort(key=lambda x: x["tvl_usd"], reverse=True)
+
+          # 3. Save outputs (CSV and JSON)
+          with open("lending_protocols.json", "w", encoding="utf-8") as jf:
+              json.dump(filtered, jf, indent=2)
+
+          with open("lending_protocols.csv", "w", newline="", encoding="utf-8") as cf:
+              if filtered:
+                  writer = csv.DictWriter(cf, fieldnames=filtered[0].keys())
+                  writer.writeheader()
+                  writer.writerows(filtered)
+
+          print(f"Successfully exported {len(filtered)} protocols.")
+          '
+
+      - name: Upload Results as ZIP Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: defillama-lending-results
+          path: |
+            lending_protocols.csv
+            lenddefillama-lending-resultsesults
