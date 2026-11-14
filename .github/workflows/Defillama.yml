@@ -55,7 +55,7 @@ jobs:
                   chain_list = [chain_list]
               chain_names = [str(c) for c in chain_list]
 
-              if "Base" not in chain_names:
+              if "Binance" not in chain_names:
                   continue
 
               forked_ids = p.get("forkedFromIds") or p.get("forkedFrom") or []
