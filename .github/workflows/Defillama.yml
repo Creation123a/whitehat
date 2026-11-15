@@ -9,6 +9,9 @@ on:
 jobs:
   scan-markets:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
 
     steps:
       - name: Set up Python 3.11
@@ -25,10 +28,11 @@ jobs:
         env:
           TRONGRID_API_KEY: ${{ secrets.TRONGRID_API_KEY }}
         run: |
-          python -u - << 'EOF'
+          python -u - << 'PYEOF'
           import os
           import sys
           from decimal import Decimal, getcontext
+
           from tronpy import Tron
           from tronpy.providers import HTTPProvider
 
@@ -72,106 +76,81 @@ jobs:
           ]
 
           JTOKEN_ABI = [
-              {
-                  "constant": True,
-                  "inputs": [],
-                  "name": "symbol",
-                  "outputs": [{"name": "", "type": "string"}],
-                  "type": "function",
-              },
-              {
-                  "constant": True,
-                  "inputs": [],
-                  "name": "decimals",
-                  "outputs": [{"name": "", "type": "uint8"}],
-                  "type": "function",
-              },
-              {
-                  "constant": True,
-                  "inputs": [],
-                  "name": "totalSupply",
-                  "outputs": [{"name": "", "type": "uint256"}],
-                  "type": "function",
-              },
-              {
-                  "constant": True,
-                  "inputs": [],
-                  "name": "getCash",
-                  "outputs": [{"name": "", "type": "uint256"}],
-                  "type": "function",
-              },
-              {
-                  "constant": True,
-                  "inputs": [],
-                  "name": "exchangeRateStored",
-                  "outputs": [{"name": "", "type": "uint256"}],
-                  "type": "function",
-              },
-              {
-                  "constant": True,
-                  "inputs": [],
-                  "name": "underlying",
-                  "outputs": [{"name": "", "type": "address"}],
-                  "type": "function",
-              },
+              {"constant": True, "inputs": [], "name": "symbol",
+               "outputs": [{"name": "", "type": "string"}], "type": "function"},
+              {"constant": True, "inputs": [], "name": "decimals",
+               "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
+              {"constant": True, "inputs": [], "name": "totalSupply",
+               "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
+              {"constant": True, "inputs": [], "name": "getCash",
+               "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
+              {"constant": True, "inputs": [], "name": "exchangeRateStored",
+               "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
+              {"constant": True, "inputs": [], "name": "underlying",
+               "outputs": [{"name": "", "type": "address"}], "type": "function"},
           ]
 
           ERC20_ABI = [
-              {
-                  "constant": True,
-                  "inputs": [],
-                  "name": "symbol",
-                  "outputs": [{"name": "", "type": "string"}],
-                  "type": "function",
-              },
-              {
-                  "constant": True,
-                  "inputs": [],
-                  "name": "decimals",
-                  "outputs": [{"name": "", "type": "uint8"}],
-                  "type": "function",
-              },
+              {"constant": True, "inputs": [], "name": "symbol",
+               "outputs": [{"name": "", "type": "string"}], "type": "function"},
+              {"constant": True, "inputs": [], "name": "decimals",
+               "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
           ]
 
           ORACLE_ABI = [
-              {
-                  "constant": True,
-                  "inputs": [{"name": "jToken", "type": "address"}],
-                  "name": "getUnderlyingPrice",
-                  "outputs": [{"name": "", "type": "uint256"}],
-                  "type": "function",
-              }
+              {"constant": True, "inputs": [{"name": "jToken", "type": "address"}],
+               "name": "getUnderlyingPrice",
+               "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
           ]
 
 
+          def safe_call(fn, default=None, label="rpc"):
+              """Invoke fn(); swallow exceptions and return default on failure."""
+              try:
+                  return fn()
+              except Exception as exc:
+                  print(f"[WARN] {label} failed: {exc}")
+                  return default
+
+
           def get_working_client() -> Tron:
+              """Return the first RPC endpoint that can serve getAllMarkets()."""
               api_key = os.getenv("TRONGRID_API_KEY", "").strip()
               candidates = []
               if api_key:
-                  candidates.append(("TronGrid (Auth)", HTTPProvider(endpoint_uri="https://api.trongrid.io", api_key=api_key)))
+                  candidates.append((
+                      "TronGrid (Auth)",
+                      HTTPProvider(endpoint_uri="https://api.trongrid.io", api_key=api_key),
+                  ))
               candidates.extend([
-                  ("PublicNode", HTTPProvider(endpoint_uri="https://tron-rpc.publicnode.com")),
+                  ("PublicNode",       HTTPProvider(endpoint_uri="https://tron-rpc.publicnode.com")),
                   ("TronGrid (Public)", HTTPProvider(endpoint_uri="https://api.trongrid.io")),
-                  ("dRPC", HTTPProvider(endpoint_uri="https://tron.drpc.org")),
+                  ("dRPC",             HTTPProvider(endpoint_uri="https://tron.drpc.org")),
               ])
 
+              last_error = None
               for name, provider in candidates:
                   try:
                       client = Tron(provider=provider)
-                      test_comp = Contract(addr=UNITROLLER_ADDRESS, abi=COMPTROLLER_ABI, client=client)
-                      markets = test_comp.functions.getAllMarkets()
-                      if markets and len(markets) > 0:
-                          print(f"Connected to TRON Mainnet via {name} ({len(markets)} markets detected).")
+                      probe = client.get_contract(UNITROLLER_ADDRESS)
+                      probe.abi = COMPTROLLER_ABI
+                      markets = probe.functions.getAllMarkets()
+                      if markets:
+                          print(f"Connected to TRON Mainnet via {name} "
+                                f"({len(markets)} markets detected).")
                           return client
                   except Exception as exc:
+                      last_error = exc
                       print(f"[WARN] RPC {name} unavailable: {exc}")
 
-              raise RuntimeError("All TRON Mainnet RPC endpoints failed.")
+              raise RuntimeError(
+                  f"All TRON Mainnet RPC endpoints failed. Last error: {last_error}"
+              )
 
 
           def main() -> None:
               print("Initializing TRON Mainnet client...")
-              client = get_tron_client()
+              client = get_working_client()          # <-- was get_tron_client() (undefined)
 
               comptroller = client.get_contract(UNITROLLER_ADDRESS)
               comptroller.abi = COMPTROLLER_ABI
@@ -189,66 +168,76 @@ jobs:
                   jtoken = client.get_contract(m_addr)
                   jtoken.abi = JTOKEN_ABI
 
+                  # --- core jToken state (must succeed) ---
                   try:
-                      j_symbol = jtoken.functions.symbol()
+                      j_symbol   = jtoken.functions.symbol()
                       j_decimals = jtoken.functions.decimals()
                       raw_supply = jtoken.functions.totalSupply()
-                      raw_cash = jtoken.functions.getCash()
-                      raw_ex_rate = jtoken.functions.exchangeRateStored()
-
-                      if j_symbol == "jTRX":
-                          u_symbol = "TRX"
-                          u_decimals = 6
-                      else:
-                          try:
-                              u_addr = jtoken.functions.underlying()
-                              u_contract = client.get_contract(u_addr)
-                              u_contract.abi = ERC20_ABI
-                              u_symbol = u_contract.functions.symbol()
-                              u_decimals = u_contract.functions.decimals()
-                          except Exception:
-                              u_symbol = "UNKNOWN"
-                              u_decimals = 6
-
-                      market_info = comptroller.functions.markets(m_addr)
-                      cf_mantissa = market_info[1]
-                      cf_pct = (Decimal(cf_mantissa) / Decimal(10**18)) * Decimal(100)
-
-                      mint_paused = comptroller.functions.mintGuardianPaused(m_addr)
-                      oracle_price = oracle.functions.getUnderlyingPrice(m_addr)
-
-                      scale_exp = 18 + u_decimals - j_decimals
-                      human_ex_rate = Decimal(raw_ex_rate) / (Decimal(10) ** scale_exp)
-                      human_supply = Decimal(raw_supply) / (Decimal(10) ** j_decimals)
-                      human_cash = Decimal(raw_cash) / (Decimal(10) ** u_decimals)
-
-                      is_dust = raw_supply < 100_000
-                      is_critical = (
-                          is_dust
-                          and not mint_paused
-                          and cf_mantissa > 0
-                          and oracle_price > 0
-                      )
-
-                      results.append(
-                          {
-                              "j_symbol": j_symbol,
-                              "u_symbol": u_symbol,
-                              "address": m_addr,
-                              "raw_supply": raw_supply,
-                              "raw_cash": raw_cash,
-                              "human_supply": human_supply,
-                              "human_cash": human_cash,
-                              "human_ex_rate": human_ex_rate,
-                              "cf_pct": cf_pct,
-                              "mint_paused": mint_paused,
-                              "oracle_price": oracle_price,
-                              "is_dust": is_dust,
-                              "is_critical": is_critical,
-                          }
-                      )
+                      raw_cash   = jtoken.functions.getCash()
+                      raw_ex     = jtoken.functions.exchangeRateStored()
                   except Exception as exc:
-                      print(f"[ERROR] Failed querying market {m_addr}: {exc}")
+                      print(f"[ERROR] Skipping market {m_addr}: {exc}")
+                      continue
+
+                  # --- underlying resolution ---
+                  if j_symbol == "jTRX":
+                      u_symbol, u_decimals = "TRX", 6
+                  else:
+                      u_addr = safe_call(jtoken.functions.underlying, None, "underlying")
+                      if u_addr:
+                          u_contract = client.get_contract(u_addr)
+                          u_contract.abi = ERC20_ABI
+                          u_symbol   = safe_call(u_contract.functions.symbol,   "UNKNOWN", "underlying.symbol")
+                          u_decimals = safe_call(u_contract.functions.decimals, 6,         "underlying.decimals")
+                      else:
+                          u_symbol, u_decimals = "UNKNOWN", 6
+
+                  # --- market config (safe defaults) ---
+                  cf_mantissa   = 0
+                  market_info   = safe_call(lambda: comptroller.functions.markets(m_addr),
+                                            None, "markets()")
+                  if market_info:
+                      try:
+                          cf_mantissa = int(market_info[1])
+                      except Exception:
+                          cf_mantissa = 0
+
+                  # Default to True → never false-flag as critical if RPC fails.
+                  mint_paused  = bool(safe_call(lambda: comptroller.functions.mintGuardianPaused(m_addr),
+                                                True, "mintGuardianPaused()"))
+                  oracle_price = int(safe_call(lambda: oracle.functions.getUnderlyingPrice(m_addr),
+                                               0, "getUnderlyingPrice()"))
+
+                  cf_pct = (Decimal(cf_mantissa) / Decimal(10**18)) * Decimal(100)
+
+                  scale_exp       = 18 + u_decimals - j_decimals
+                  human_ex_rate   = Decimal(raw_ex)     / (Decimal(10) ** scale_exp)
+                  human_supply    = Decimal(raw_supply) / (Decimal(10) ** j_decimals)
+                  human_cash      = Decimal(raw_cash)   / (Decimal(10) ** u_decimals)
+
+                  is_dust = raw_supply < 100_000
+                  is_critical = (
+                      is_dust
+                      and not mint_paused
+                      and cf_mantissa > 0
+                      and oracle_price > 0
+                  )
+
+                  results.append({
+                      "j_symbol":     j_symbol,
+                      "u_symbol":     u_symbol,
+                      "address":      m_addr,
+                      "raw_supply":   raw_supply,
+                      "raw_cash":     raw_cash,
+                      "human_supply": human_supply,
+                      "human_cash":   human_cash,
+                      "human_ex_rate": human_ex_rate,
+                      "cf_pct":       cf_pct,
+                      "mint_paused":  mint_paused,
+                      "oracle_price": oracle_price,
+                      "is_dust":      is_dust,
+                      "is_critical":  is_critical,
+                  })
 
               results.sort(key=lambda x: x["raw_supply"])
 
@@ -261,12 +250,9 @@ jobs:
               print("-" * len(header))
 
               for r in results:
-                  if r["is_critical"]:
-                      status = "CRITICAL_DUST"
-                  elif r["is_dust"]:
-                      status = "DUST (MITIGATED)"
-                  else:
-                      status = "NORMAL"
+                  if   r["is_critical"]: status = "CRITICAL_DUST"
+                  elif r["is_dust"]:     status = "DUST (MITIGATED)"
+                  else:                  status = "NORMAL"
 
                   print(
                       f"{r['j_symbol']:<10} | {r['u_symbol']:<10} | {r['raw_supply']:<16} | "
@@ -283,15 +269,17 @@ jobs:
                       print(
                           f"Market: {d['j_symbol']} ({d['address']}) | "
                           f"Underlying: {d['u_symbol']} | "
-                           f"Raw Supply: {d['raw_supply']} | "
-                           f"Raw Cash: {d['raw_cash']} | "
-                           f"Oracle Price: {d['oracle_price']} | "
-                           f"Mint Paused: {d['mint_paused']}"
-                       )
+                          f"Raw Supply: {d['raw_supply']} ({d['human_supply']}) | "
+                          f"Raw Cash: {d['raw_cash']} ({d['human_cash']}) | "
+                          f"Oracle Price: {d['oracle_price']} | "
+                          f"Mint Paused: {d['mint_paused']}"
+                      )
+
+
           if __name__ == "__main__":
               try:
                   main()
               except Exception as exc:
                   print("Fatal execution error:", exc, file=sys.stderr)
                   sys.exit(1)
-          EOF
+          PYEOF
