@@ -144,12 +144,12 @@ jobs:
           ]
 
 
-          def get_tron_client() -> Tron:
+                    def get_tron_client() -> Tron:
               api_key = os.getenv("TRONGRID_API_KEY", "").strip()
               if api_key:
-                  provider = HTTPProvider(endpoint_uri="https://api.trongrid.io", api_key=api_key)
+                  provider = HTTPProvider(endpoint_uri="https://trongrid.io", api_key=api_key)
               else:
-                  provider = HTTPProvider(endpoint_uri="https://api.trongrid.io")
+                  provider = HTTPProvider(endpoint_uri="https://trongrid.io")
               return Tron(provider=provider)
 
 
