@@ -1,105 +1,282 @@
-name: Fetch DefiLlama Lending Protocols
+name: JustLend V1 Dust Market Audit
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * *'
+  push:
+    paths:
+      - ".github/workflows/justlend-audit.yml"
 
 jobs:
-  fetch-protocols:
+  scan-markets:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests
-
-      - name: Run DefiLlama Extraction Script
         run: |
-          python3 << 'EOF'
-          import csv
-          import json
-          import requests
+          python -m pip install --upgrade pip
+          pip install tronpy==0.5.0
 
-          # 1. Fetch data from the exact DefiLlama API endpoint
-          url = "https://api.llama.fi/protocols"
-          response = requests.get(url, timeout=30)
-          response.raise_for_status()
-          data = response.json()
+      - name: Run JustLend V1 On-Chain Dust Market Audit
+        env:
+          TRONGRID_API_KEY: ${{ secrets.TRONGRID_API_KEY }}
+        run: |
+          python -u - << 'EOF'
+          import os
+          import sys
+          from decimal import Decimal, getcontext
+          from tronpy import Tron
+          from tronpy.providers import HTTPProvider
 
-          # 2. Filter: Lending category, TVL between $50k and $10M,
-          #    Arbitrum chain only, and Compound V2 fork only
-          min_tvl = 50_000
-          max_tvl = 10_000_000
+          getcontext().prec = 50
 
-          filtered = []
-          for p in data:
-              if p.get("category") != "Lending":
-                  continue
+          UNITROLLER_ADDRESS = "TGjYzgCyPobsNS9n6WcbdLVR9dH7mWqFx7"
 
-              tvl = p.get("tvl") or 0
-              try:
-                  tvl = float(tvl)
-              except (TypeError, ValueError):
-                  continue
+          COMPTROLLER_ABI = [
+              {
+                  "constant": True,
+                  "inputs": [],
+                  "name": "getAllMarkets",
+                  "outputs": [{"name": "", "type": "address[]"}],
+                  "type": "function",
+              },
+              {
+                  "constant": True,
+                  "inputs": [{"name": "", "type": "address"}],
+                  "name": "markets",
+                  "outputs": [
+                      {"name": "isListed", "type": "bool"},
+                      {"name": "collateralFactorMantissa", "type": "uint256"},
+                      {"name": "isComped", "type": "bool"},
+                  ],
+                  "type": "function",
+              },
+              {
+                  "constant": True,
+                  "inputs": [{"name": "", "type": "address"}],
+                  "name": "mintGuardianPaused",
+                  "outputs": [{"name": "", "type": "bool"}],
+                  "type": "function",
+              },
+              {
+                  "constant": True,
+                  "inputs": [],
+                  "name": "oracle",
+                  "outputs": [{"name": "", "type": "address"}],
+                  "type": "function",
+              },
+          ]
 
-              if not (min_tvl <= tvl <= max_tvl):
-                  continue
+          JTOKEN_ABI = [
+              {
+                  "constant": True,
+                  "inputs": [],
+                  "name": "symbol",
+                  "outputs": [{"name": "", "type": "string"}],
+                  "type": "function",
+              },
+              {
+                  "constant": True,
+                  "inputs": [],
+                  "name": "decimals",
+                  "outputs": [{"name": "", "type": "uint8"}],
+                  "type": "function",
+              },
+              {
+                  "constant": True,
+                  "inputs": [],
+                  "name": "totalSupply",
+                  "outputs": [{"name": "", "type": "uint256"}],
+                  "type": "function",
+              },
+              {
+                  "constant": True,
+                  "inputs": [],
+                  "name": "getCash",
+                  "outputs": [{"name": "", "type": "uint256"}],
+                  "type": "function",
+              },
+              {
+                  "constant": True,
+                  "inputs": [],
+                  "name": "exchangeRateStored",
+                  "outputs": [{"name": "", "type": "uint256"}],
+                  "type": "function",
+              },
+              {
+                  "constant": True,
+                  "inputs": [],
+                  "name": "underlying",
+                  "outputs": [{"name": "", "type": "address"}],
+                  "type": "function",
+              },
+          ]
 
-              chain_list = p.get("chains") or []
-              if isinstance(chain_list, str):
-                  chain_list = [chain_list]
-              chain_names = [str(c) for c in chain_list]
+          ERC20_ABI = [
+              {
+                  "constant": True,
+                  "inputs": [],
+                  "name": "symbol",
+                  "outputs": [{"name": "", "type": "string"}],
+                  "type": "function",
+              },
+              {
+                  "constant": True,
+                  "inputs": [],
+                  "name": "decimals",
+                  "outputs": [{"name": "", "type": "uint8"}],
+                  "type": "function",
+              },
+          ]
 
-              if "Binance" not in chain_names:
-                  continue
+          ORACLE_ABI = [
+              {
+                  "constant": True,
+                  "inputs": [{"name": "jToken", "type": "address"}],
+                  "name": "getUnderlyingPrice",
+                  "outputs": [{"name": "", "type": "uint256"}],
+                  "type": "function",
+              }
+          ]
 
-              forked_ids = p.get("forkedFromIds") or p.get("forkedFrom") or []
-              if isinstance(forked_ids, (str, int)):
-                  forked_ids = [forked_ids]
-              forked_id_strings = [str(x) for x in forked_ids]
 
-              is_compound_v2_fork = "114" in forked_id_strings
-              if not is_compound_v2_fork:
-                  continue
+          def get_tron_client() -> Tron:
+              api_key = os.getenv("TRONGRID_API_KEY", "").strip()
+              if api_key:
+                  provider = HTTPProvider(endpoint_uri="https://api.trongrid.io", api_key=api_key)
+              else:
+                  provider = HTTPProvider(endpoint_uri="https://api.trongrid.io")
+              return Tron(provider=provider)
 
-              slug = p.get("slug") or ""
 
-              filtered.append({
-                  "name": p.get("name"),
-                  "slug": slug,
-                  "tvl_usd": round(tvl, 2),
-                  "chains": ", ".join(chain_names),
-                  "is_compound_v2_fork": is_compound_v2_fork,
-                  "forked_from_ids": ", ".join(forked_id_strings),
-                  "url": p.get("url"),
-                  "defillama_url": f"https://defillama.com{slug}"
-              })
+          def main() -> None:
+              print("Initializing TRON Mainnet client...")
+              client = get_tron_client()
 
-          # Sort highest TVL first
-          filtered.sort(key=lambda x: x["tvl_usd"], reverse=True)
+              comptroller = client.get_contract(UNITROLLER_ADDRESS)
+              comptroller.abi = COMPTROLLER_ABI
 
-          # 3. Save outputs (CSV and JSON)
-          with open("lending_protocols.json", "w", encoding="utf-8") as jf:
-              json.dump(filtered, jf, indent=2)
+              oracle_addr = comptroller.functions.oracle()
+              oracle = client.get_contract(oracle_addr)
+              oracle.abi = ORACLE_ABI
 
-          with open("lending_protocols.csv", "w", newline="", encoding="utf-8") as cf:
-              if filtered:
-                  writer = csv.DictWriter(cf, fieldnames=filtered[0].keys())
-                  writer.writeheader()
-                  writer.writerows(filtered)
+              all_markets = comptroller.functions.getAllMarkets()
+              print(f"Found {len(all_markets)} markets in JustLend V1 Unitroller.\n")
 
-          print(f"Successfully exported {len(filtered)} protocols.")
-          EOF
+              results = []
 
-      - name: Upload Results as ZIP Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: defillama-lending-results
-          path: |
-            lending_protocols.csv
-            lending_protocols.json
+              for m_addr in all_markets:
+                  jtoken = client.get_contract(m_addr)
+                  jtoken.abi = JTOKEN_ABI
+
+                  try:
+                      j_symbol = jtoken.functions.symbol()
+                      j_decimals = jtoken.functions.decimals()
+                      raw_supply = jtoken.functions.totalSupply()
+                      raw_cash = jtoken.functions.getCash()
+                      raw_ex_rate = jtoken.functions.exchangeRateStored()
+
+                      if j_symbol == "jTRX":
+                          u_symbol = "TRX"
+                          u_decimals = 6
+                      else:
+                          try:
+                              u_addr = jtoken.functions.underlying()
+                              u_contract = client.get_contract(u_addr)
+                              u_contract.abi = ERC20_ABI
+                              u_symbol = u_contract.functions.symbol()
+                              u_decimals = u_contract.functions.decimals()
+                          except Exception:
+                              u_symbol = "UNKNOWN"
+                              u_decimals = 6
+
+                      market_info = comptroller.functions.markets(m_addr)
+                      cf_mantissa = market_info[1]
+                      cf_pct = (Decimal(cf_mantissa) / Decimal(10**18)) * Decimal(100)
+
+                      mint_paused = comptroller.functions.mintGuardianPaused(m_addr)
+                      oracle_price = oracle.functions.getUnderlyingPrice(m_addr)
+
+                      scale_exp = 18 + u_decimals - j_decimals
+                      human_ex_rate = Decimal(raw_ex_rate) / (Decimal(10) ** scale_exp)
+                      human_supply = Decimal(raw_supply) / (Decimal(10) ** j_decimals)
+                      human_cash = Decimal(raw_cash) / (Decimal(10) ** u_decimals)
+
+                      is_dust = raw_supply < 100_000
+                      is_critical = (
+                          is_dust
+                          and not mint_paused
+                          and cf_mantissa > 0
+                          and oracle_price > 0
+                      )
+
+                      results.append(
+                          {
+                              "j_symbol": j_symbol,
+                              "u_symbol": u_symbol,
+                              "address": m_addr,
+                              "raw_supply": raw_supply,
+                              "raw_cash": raw_cash,
+                              "human_supply": human_supply,
+                              "human_cash": human_cash,
+                              "human_ex_rate": human_ex_rate,
+                              "cf_pct": cf_pct,
+                              "mint_paused": mint_paused,
+                              "oracle_price": oracle_price,
+                              "is_dust": is_dust,
+                              "is_critical": is_critical,
+                          }
+                      )
+                  except Exception as exc:
+                      print(f"[ERROR] Failed querying market {m_addr}: {exc}")
+
+              results.sort(key=lambda x: x["raw_supply"])
+
+              header = (
+                  f"{'SYMBOL':<10} | {'UNDERLYING':<10} | {'RAW_SUPPLY':<16} | "
+                  f"{'RAW_CASH':<20} | {'EXCH_RATE':<14} | {'CF%':<6} | "
+                  f"{'PAUSED':<6} | {'STATUS'}"
+              )
+              print(header)
+              print("-" * len(header))
+
+              for r in results:
+                  if r["is_critical"]:
+                      status = "CRITICAL_DUST"
+                  elif r["is_dust"]:
+                      status = "DUST (MITIGATED)"
+                  else:
+                      status = "NORMAL"
+
+                  print(
+                      f"{r['j_symbol']:<10} | {r['u_symbol']:<10} | {r['raw_supply']:<16} | "
+                      f"{r['raw_cash']:<20} | {r['human_ex_rate']:<14.6f} | {r['cf_pct']:<6.1f} | "
+                      f"{str(r['mint_paused']):<6} | {status}"
+                  )
+
+              print("\n--- DETAILED ADDRESS & ORACLE DUMP FOR DUST MARKETS ---")
+              dust_markets = [r for r in results if r["is_dust"]]
+              if not dust_markets:
+                  print("No dust markets found below threshold.")
+              else:
+                  for d in dust_markets:
+                      print(
+                          f"Market: {d['j_symbol']} ({d['address']}) | "
+                          f"Underlying: {d['u_symbol']} | "
+                           f"Raw Supply: {d['raw_supply']} | "
+                           f"Raw Cash: {d['raw_cash']} | "
+                           f"Oracle Price: {d['oracle_price']} | "
+                           f"Mint Paused: {d['mint_paused']}"
+                       )
+if name == "main":
+try:
+  main()
+except Exception as e:
+       )
+       print("Fatal execution error:", exc, file=sys.stderr)
+     sys.exit(1)
+    EOF
