@@ -144,15 +144,29 @@ jobs:
           ]
 
 
-          def get_tron_client() -> Tron:
+          def get_working_client() -> Tron:
               api_key = os.getenv("TRONGRID_API_KEY", "").strip()
+              candidates = []
               if api_key:
-                  print("Using TronGrid API with key...")
-                  provider = HTTPProvider(endpoint_uri="https://trongrid.io", api_key=api_key)
-              else:
-                  print("No TRONGRID_API_KEY set; using PublicNode TRON RPC...")
-                  provider = HTTPProvider(endpoint_uri="https://publicnode.com")
-              return Tron(provider=provider)
+                  candidates.append(("TronGrid (Auth)", HTTPProvider(endpoint_uri="https://api.trongrid.io", api_key=api_key)))
+              candidates.extend([
+                  ("PublicNode", HTTPProvider(endpoint_uri="https://tron-rpc.publicnode.com")),
+                  ("TronGrid (Public)", HTTPProvider(endpoint_uri="https://api.trongrid.io")),
+                  ("dRPC", HTTPProvider(endpoint_uri="https://tron.drpc.org")),
+              ])
+
+              for name, provider in candidates:
+                  try:
+                      client = Tron(provider=provider)
+                      test_comp = Contract(addr=UNITROLLER_ADDRESS, abi=COMPTROLLER_ABI, client=client)
+                      markets = test_comp.functions.getAllMarkets()
+                      if markets and len(markets) > 0:
+                          print(f"Connected to TRON Mainnet via {name} ({len(markets)} markets detected).")
+                          return client
+                  except Exception as exc:
+                      print(f"[WARN] RPC {name} unavailable: {exc}")
+
+              raise RuntimeError("All TRON Mainnet RPC endpoints failed.")
 
 
           def main() -> None:
