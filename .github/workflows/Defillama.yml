@@ -272,11 +272,10 @@ jobs:
                            f"Oracle Price: {d['oracle_price']} | "
                            f"Mint Paused: {d['mint_paused']}"
                        )
-if name == "main":
-try:
-  main()
-except Exception as e:
-       )
-       print("Fatal execution error:", exc, file=sys.stderr)
-     sys.exit(1)
-    EOF
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as exc:
+                  print("Fatal execution error:", exc, file=sys.stderr)
+                  sys.exit(1)
+          EOF
