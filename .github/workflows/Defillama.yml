@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install tronpy==0.5.0
+          pip install tronpy==0.8.0
 
       - name: Run JustLend V1 On-Chain Dust Market Audit
         env:
@@ -31,6 +31,7 @@ jobs:
           python -u - << 'PYEOF'
           import os
           import sys
+          import time
           from decimal import Decimal, getcontext
 
           from tronpy import Tron
@@ -114,19 +115,29 @@ jobs:
 
 
           def get_working_client() -> Tron:
-              """Return the first RPC endpoint that can serve getAllMarkets()."""
+              """
+              Return the first RPC endpoint that can actually serve getAllMarkets().
+
+              Endpoint notes:
+                * PublicNode is the only keyless endpoint that speaks the java-tron
+                  HTTP API (wallet/*) that tronpy requires. It is shared, so we pace
+                  queries below.
+                * TronGrid public is kept only as a last-resort fallback; without an
+                  API key it throttles to ~3 req/s and returns 429 quickly.
+                * dRPC (https://tron.drpc.org) was REMOVED: its free tier serves only
+                  JSON-RPC (eth_*) and cannot answer java-tron HTTP API calls.
+              """
               api_key = os.getenv("TRONGRID_API_KEY", "").strip()
-              candidates = []
+
+              candidates = [("PublicNode (keyless)",
+                             HTTPProvider("https://tron-rpc.publicnode.com"))]
+
               if api_key:
-                  candidates.append((
-                      "TronGrid (Auth)",
-                      HTTPProvider(endpoint_uri="https://api.trongrid.io", api_key=api_key),
-                  ))
-              candidates.extend([
-                  ("PublicNode",       HTTPProvider(endpoint_uri="https://tron-rpc.publicnode.com")),
-                  ("TronGrid (Public)", HTTPProvider(endpoint_uri="https://api.trongrid.io")),
-                  ("dRPC",             HTTPProvider(endpoint_uri="https://tron.drpc.org")),
-              ])
+                  candidates.append(("TronGrid (Auth)",
+                                     HTTPProvider("https://api.trongrid.io", api_key=api_key)))
+              else:
+                  candidates.append(("TronGrid (public, rate-limited)",
+                                     HTTPProvider("https://api.trongrid.io")))
 
               last_error = None
               for name, provider in candidates:
@@ -136,21 +147,22 @@ jobs:
                       probe.abi = COMPTROLLER_ABI
                       markets = probe.functions.getAllMarkets()
                       if markets:
-                          print(f"Connected to TRON Mainnet via {name} "
-                                f"({len(markets)} markets detected).")
+                          print(f"Connected via {name} ({len(markets)} markets detected).")
                           return client
                   except Exception as exc:
                       last_error = exc
                       print(f"[WARN] RPC {name} unavailable: {exc}")
 
               raise RuntimeError(
-                  f"All TRON Mainnet RPC endpoints failed. Last error: {last_error}"
+                  "No keyless HTTP API endpoint available. "
+                  "PublicNode and TronGrid both failed. "
+                  f"Last error: {last_error}"
               )
 
 
           def main() -> None:
               print("Initializing TRON Mainnet client...")
-              client = get_working_client()          # <-- was get_tron_client() (undefined)
+              client = get_working_client()          # <-- fixed: was get_tron_client()
 
               comptroller = client.get_contract(UNITROLLER_ADDRESS)
               comptroller.abi = COMPTROLLER_ABI
@@ -165,79 +177,90 @@ jobs:
               results = []
 
               for m_addr in all_markets:
-                  jtoken = client.get_contract(m_addr)
-                  jtoken.abi = JTOKEN_ABI
-
-                  # --- core jToken state (must succeed) ---
                   try:
-                      j_symbol   = jtoken.functions.symbol()
-                      j_decimals = jtoken.functions.decimals()
-                      raw_supply = jtoken.functions.totalSupply()
-                      raw_cash   = jtoken.functions.getCash()
-                      raw_ex     = jtoken.functions.exchangeRateStored()
-                  except Exception as exc:
-                      print(f"[ERROR] Skipping market {m_addr}: {exc}")
-                      continue
+                      jtoken = client.get_contract(m_addr)
+                      jtoken.abi = JTOKEN_ABI
 
-                  # --- underlying resolution ---
-                  if j_symbol == "jTRX":
-                      u_symbol, u_decimals = "TRX", 6
-                  else:
-                      u_addr = safe_call(jtoken.functions.underlying, None, "underlying")
-                      if u_addr:
-                          u_contract = client.get_contract(u_addr)
-                          u_contract.abi = ERC20_ABI
-                          u_symbol   = safe_call(u_contract.functions.symbol,   "UNKNOWN", "underlying.symbol")
-                          u_decimals = safe_call(u_contract.functions.decimals, 6,         "underlying.decimals")
-                      else:
-                          u_symbol, u_decimals = "UNKNOWN", 6
-
-                  # --- market config (safe defaults) ---
-                  cf_mantissa   = 0
-                  market_info   = safe_call(lambda: comptroller.functions.markets(m_addr),
-                                            None, "markets()")
-                  if market_info:
+                      # --- core jToken state (must succeed or skip) ---
                       try:
-                          cf_mantissa = int(market_info[1])
-                      except Exception:
-                          cf_mantissa = 0
+                          j_symbol   = jtoken.functions.symbol()
+                          j_decimals = jtoken.functions.decimals()
+                          raw_supply = jtoken.functions.totalSupply()
+                          raw_cash   = jtoken.functions.getCash()
+                          raw_ex     = jtoken.functions.exchangeRateStored()
+                      except Exception as exc:
+                          print(f"[ERROR] Skipping market {m_addr}: {exc}")
+                          continue
 
-                  # Default to True → never false-flag as critical if RPC fails.
-                  mint_paused  = bool(safe_call(lambda: comptroller.functions.mintGuardianPaused(m_addr),
-                                                True, "mintGuardianPaused()"))
-                  oracle_price = int(safe_call(lambda: oracle.functions.getUnderlyingPrice(m_addr),
-                                               0, "getUnderlyingPrice()"))
+                      # --- underlying resolution ---
+                      if j_symbol == "jTRX":
+                          u_symbol, u_decimals = "TRX", 6
+                      else:
+                          u_addr = safe_call(jtoken.functions.underlying, None, "underlying")
+                          if u_addr:
+                              u_contract = client.get_contract(u_addr)
+                              u_contract.abi = ERC20_ABI
+                              u_symbol   = safe_call(u_contract.functions.symbol,
+                                                     "UNKNOWN", "underlying.symbol")
+                              u_decimals = safe_call(u_contract.functions.decimals,
+                                                     6, "underlying.decimals")
+                          else:
+                              u_symbol, u_decimals = "UNKNOWN", 6
 
-                  cf_pct = (Decimal(cf_mantissa) / Decimal(10**18)) * Decimal(100)
+                      # --- market config (safe defaults, never false-flag) ---
+                      cf_mantissa = 0
+                      market_info = safe_call(
+                          lambda: comptroller.functions.markets(m_addr),
+                          None, "markets()")
+                      if market_info:
+                          try:
+                              cf_mantissa = int(market_info[1])
+                          except Exception:
+                              cf_mantissa = 0
 
-                  scale_exp       = 18 + u_decimals - j_decimals
-                  human_ex_rate   = Decimal(raw_ex)     / (Decimal(10) ** scale_exp)
-                  human_supply    = Decimal(raw_supply) / (Decimal(10) ** j_decimals)
-                  human_cash      = Decimal(raw_cash)   / (Decimal(10) ** u_decimals)
+                      # If pause/oracle lookup fails, assume paused=TRUE & price=0
+                      # so a transient RPC blip cannot produce a false CRITICAL.
+                      mint_paused = bool(safe_call(
+                          lambda: comptroller.functions.mintGuardianPaused(m_addr),
+                          True, "mintGuardianPaused()"))
+                      oracle_price = int(safe_call(
+                          lambda: oracle.functions.getUnderlyingPrice(m_addr),
+                          0, "getUnderlyingPrice()"))
 
-                  is_dust = raw_supply < 100_000
-                  is_critical = (
-                      is_dust
-                      and not mint_paused
-                      and cf_mantissa > 0
-                      and oracle_price > 0
-                  )
+                      cf_pct = (Decimal(cf_mantissa) / Decimal(10**18)) * Decimal(100)
 
-                  results.append({
-                      "j_symbol":     j_symbol,
-                      "u_symbol":     u_symbol,
-                      "address":      m_addr,
-                      "raw_supply":   raw_supply,
-                      "raw_cash":     raw_cash,
-                      "human_supply": human_supply,
-                      "human_cash":   human_cash,
-                      "human_ex_rate": human_ex_rate,
-                      "cf_pct":       cf_pct,
-                      "mint_paused":  mint_paused,
-                      "oracle_price": oracle_price,
-                      "is_dust":      is_dust,
-                      "is_critical":  is_critical,
-                  })
+                      scale_exp     = 18 + u_decimals - j_decimals
+                      human_ex_rate = Decimal(raw_ex)     / (Decimal(10) ** scale_exp)
+                      human_supply  = Decimal(raw_supply) / (Decimal(10) ** j_decimals)
+                      human_cash    = Decimal(raw_cash)   / (Decimal(10) ** u_decimals)
+
+                      is_dust = raw_supply < 100_000
+                      is_critical = (
+                          is_dust
+                          and not mint_paused
+                          and cf_mantissa > 0
+                          and oracle_price > 0
+                      )
+
+                      results.append({
+                          "j_symbol":      j_symbol,
+                          "u_symbol":      u_symbol,
+                          "address":       m_addr,
+                          "raw_supply":    raw_supply,
+                          "raw_cash":      raw_cash,
+                          "human_supply":  human_supply,
+                          "human_cash":    human_cash,
+                          "human_ex_rate": human_ex_rate,
+                          "cf_pct":        cf_pct,
+                          "mint_paused":   mint_paused,
+                          "oracle_price":  oracle_price,
+                          "is_dust":       is_dust,
+                          "is_critical":   is_critical,
+                      })
+                  finally:
+                      # PublicNode is shared; pace the batch to survive its throttle.
+                      # 250 ms between markets keeps us under fair-use limits.
+                      time.sleep(0.25)
 
               results.sort(key=lambda x: x["raw_supply"])
 
