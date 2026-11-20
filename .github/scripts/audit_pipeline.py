@@ -146,7 +146,7 @@ def strip_comments(code: str) -> str:
                 j = code.find("*/", i + 2)
                 if j == -1:
                     break
-                # Preserve line count so LLM + Aderyn line numbers line up
+                # Preserve line count so LLM line numbers line up with source
                 out.append("\n" * code[i:j + 2].count("\n"))
                 i = j + 2
                 continue
@@ -158,33 +158,33 @@ def strip_comments(code: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Aderyn (single run over project root)
+# Slither (single run over project root)
 # ---------------------------------------------------------------------------
-def run_aderyn(root: str = ".") -> dict | None:
-    output_json = "aderyn-report.json"
+def run_slither(root: str = ".") -> dict | None:
+    output_json = "slither-report.json"
     if os.path.exists(output_json):
         os.remove(output_json)
 
     try:
         subprocess.run(
-            ["aderyn", root, "-o", output_json],
+            ["slither", root, "--json", output_json],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             check=False,
         )
     except FileNotFoundError:
-        print("[WARN] `aderyn` binary not found on PATH.")
+        print("[WARN] `slither` binary not found on PATH.")
         return None
 
     if not os.path.exists(output_json):
-        print("[WARN] Aderyn produced no output file (project build likely failed).")
+        print("[WARN] Slither produced no output file (project build likely failed).")
         return None
 
     try:
         with open(output_json, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        print(f"[WARN] Could not parse Aderyn JSON: {e}")
+        print(f"[WARN] Could not parse Slither JSON: {e}")
         return None
     finally:
         try:
@@ -192,7 +192,13 @@ def run_aderyn(root: str = ".") -> dict | None:
         except OSError:
             pass
 
-    return data
+    # Slither wraps everything in a top-level object; we only care about the
+    # `results` key which contains the `detectors` array.
+    if not data.get("success") or "results" not in data:
+        print("[WARN] Slither JSON missing a valid 'results' block.")
+        return None
+
+    return data["results"]
 
 
 def _norm_path(p: str) -> str:
@@ -202,53 +208,40 @@ def _norm_path(p: str) -> str:
     return p[2:] if p.startswith("./") else p
 
 
-def _pick_block(data: dict, keys: tuple) -> object:
-    for k in keys:
-        if data.get(k):
-            return data[k]
-    return {}
-
-
-def findings_for_file(aderyn_data: dict | None, filepath: str) -> list:
-    if not aderyn_data:
+def findings_for_file(slither_results: dict | None, filepath: str) -> list:
+    if not slither_results:
         return []
 
     target = _norm_path(filepath)
     findings = []
 
-    for sev_keys, sev_name in (
-        (("high_issues", "high"), "High"),
-        (("low_issues", "low"), "Low"),
-    ):
-        block = _pick_block(aderyn_data, sev_keys)
-        if isinstance(block, dict):
-            issues = block.get("issues") or []
-        elif isinstance(block, list):
-            issues = block
-        else:
-            issues = []
+    for det in slither_results.get("detectors", []):
+        # Slither's finding location is driven by the first element, which
+        # is chosen by the detector to represent the primary code location.
+        elements = det.get("elements", [])
+        if not elements:
+            continue
 
-        for issue in issues:
-            matched = []
-            for inst in issue.get("instances", []):
-                cpath = _norm_path(inst.get("contract_path", ""))
-                if not cpath:
-                    continue
-                if (
-                    cpath == target
-                    or cpath.endswith("/" + target)
-                    or target.endswith("/" + cpath)
-                ):
-                    matched.append(
-                        f"Line {inst.get('line_no')}: {inst.get('src_char', '')}"
-                    )
-            if matched:
-                findings.append({
-                    "severity": sev_name,
-                    "title": issue.get("title", ""),
-                    "description": issue.get("description", ""),
-                    "instances": matched,
-                })
+        source_mapping = elements[0].get("source_mapping", {})
+        rel_path = _norm_path(source_mapping.get("filename_relative", ""))
+        if not rel_path:
+            continue
+
+        # Match the same way as before (exact, suffix, or prefix)
+        if (
+            rel_path == target
+            or rel_path.endswith("/" + target)
+            or target.endswith("/" + rel_path)
+        ):
+            lines = source_mapping.get("lines", [])
+            line_str = f"Line {lines[0]}" if lines else "Unknown line"
+            findings.append({
+                "severity": det.get("impact", "Unknown"),
+                "confidence": det.get("confidence", "Unknown"),
+                "title": det.get("check", ""),
+                "description": det.get("description", ""),
+                "instance": line_str,
+            })
 
     return findings
 
@@ -287,9 +280,9 @@ def main() -> None:
             )
         return
 
-    print("[INFO] Running Aderyn on project root...")
-    aderyn_data = run_aderyn(".")
-    aderyn_ok = aderyn_data is not None
+    print("[INFO] Running Slither on project root...")
+    slither_results = run_slither(".")
+    slither_ok = slither_results is not None
 
     per_file_reports = []
 
@@ -312,25 +305,25 @@ def main() -> None:
                 + "\n// ...[TRUNCATED: file too large for LLM context]..."
             )
 
-        if aderyn_ok:
-            aderyn_findings = json.dumps(
-                findings_for_file(aderyn_data, filepath), indent=2
+        if slither_ok:
+            slither_findings = json.dumps(
+                findings_for_file(slither_results, filepath), indent=2
             )
         else:
-            aderyn_findings = (
-                "Aderyn did not produce output (project build may have failed). "
+            slither_findings = (
+                "Slither did not produce output (project build may have failed). "
                 "Perform the audit from code review only."
             )
 
         file_prompt = f"""You are a senior smart contract security auditor specializing in cross-chain bridges, messaging adapters, message receivers, and wrapped token minters/escrows.
-Audit the Solidity file below alongside its automated Aderyn static-analysis output.
+Audit the Solidity file below alongside its automated Slither static-analysis output.
 
 Respond strictly in two concise sections:
 ### 1. Short File Summary
 - Identify the contract's role (Adapter, Receiver, Wrapped Token Minter/Burner, Escrow, or Router), trust assumptions (relayer/endpoint/sequencer), key state variables, external/public entrypoints, and cross-chain/external calls (under 130 words).
 
 ### 2. File Vulnerabilities
-- Validate Aderyn's findings (confirm True Positives, dismiss False Positives).
+- Validate Slither's findings (confirm True Positives, dismiss False Positives).
 - Identify any High or Medium bridge-specific or general logic bugs:
   * Missing source chain ID, source sender/adapter, or endpoint authentication
   * Replay attacks, missing/broken nonce enforcement, or out-of-order execution flaws
@@ -341,9 +334,9 @@ Respond strictly in two concise sections:
 
 File: `{filepath}`
 
-Aderyn Output:
+Slither Output:
 ```json
-{aderyn_findings}
+{slither_findings}
 ```
 
 Solidity Code:
