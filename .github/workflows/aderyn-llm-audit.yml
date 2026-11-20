@@ -1,4 +1,4 @@
-name: Aderyn + LLM Map-Reduce Audit
+name: Slither + LLM Map-Reduce Audit
 
 on:
   workflow_dispatch:
@@ -76,22 +76,20 @@ jobs:
           fi
 
       # ---------------------------------------------------------------
-      # Aderyn (official installer — NOT github.com | sh)
+      # Slither (official installer — NOT github.com | sh)
       # ---------------------------------------------------------------
-      - name: Install Aderyn
+      - name: Install Slither
         run: |
           set -euo pipefail
-          curl --proto '=https' --tlsv1.2 -LsSf \
-            https://github.com/cyfrin/aderyn/releases/latest/download/aderyn-installer.sh | bash
-          # The installer typically places the binary in a location like ~/.cyfrin/bin or similar.
-          # Verify the path; you may need to add it to $GITHUB_PATH.
-          export PATH="$HOME/.cyfrin/bin:$PATH"
-          aderyn --version || true
-      # ---------------------------------------------------------------
+          python3 -m pip install --upgrade pip
+          pip3 install slither-analyzer solc-select
+          # solc-select will automatically switch to the correct compiler
+          # version based on the project's configuration (e.g., foundry.toml)
+          slither --version || true      # ---------------------------------------------------------------
       # Run the Map-Reduce pipeline from inside the target workspace.
       # Script lives in the auditor checkout, not the target copy.
       # ---------------------------------------------------------------
-      - name: Run Aderyn & LLM Map-Reduce Audit
+      - name: Run Slither & LLM Map-Reduce Audit
         working-directory: target
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
