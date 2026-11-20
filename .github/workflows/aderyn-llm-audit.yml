@@ -23,7 +23,6 @@ on:
 
 permissions:
   contents: read
-  models: read          # <-- ADDED: Grants free access to GitHub Models API
 
 jobs:
   audit:
@@ -52,7 +51,7 @@ jobs:
           EOF
           fi
 
-      # Install Cyfrin Aderyn (fixed full installer URL)
+      # Install Cyfrin Aderyn
       - name: Install Aderyn
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf https://github.com | sh
@@ -61,8 +60,7 @@ jobs:
       # Run Python Map-Reduce Audit Pipeline
       - name: Run Aderyn & LLM Map-Reduce Audit
         working-directory: target
-        env:                                              # <-- ADDED: Passes keys to Python
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
         run: python3 ../auditor/.github/scripts/audit_pipeline.py
@@ -73,4 +71,4 @@ jobs:
         with:
           name: solidity-audit-report
           path: target/final-audit-report.md
-          if-no-files-found: https'
+          if-no-files-found: error
