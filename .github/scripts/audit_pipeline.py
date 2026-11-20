@@ -5,15 +5,76 @@ import json
 import subprocess
 
 
-# =========================================================
-# TODO: Implement your LLM API call here
-# =========================================================
+import os
+import time
+import json
+import urllib.request
+import urllib.error
+
+PROVIDERS = [
+    {
+        "name": "GitHub Models",
+        "url": "https://github.ai",
+        "key_env": "GITHUB_TOKEN",
+        "models": ["deepseek/DeepSeek-R1", "openai/gpt-4o"]
+    },
+    {
+        "name": "OpenRouter Free",
+        "url": "https://openrouter.ai",
+        "key_env": "OPENROUTER_API_KEY",
+        "models": [
+            "deepseek/deepseek-r1:free",
+            "qwen/qwen-2.5-coder-32b-instruct:free",
+            "meta-llama/llama-3.3-70b-instruct:free"
+        ]
+    },
+    {
+        "name": "Cerebras Free",
+        "url": "https://cerebras.ai",
+        "key_env": "CEREBRAS_API_KEY",
+        "models": ["llama-3.3-70b"]
+    }
+]
+
 def call_llm(prompt: str) -> str:
-    """
-    TODO: Connect your preferred LLM API endpoint here (OpenRouter, GitHub Models, Gemini, etc.).
-    Must accept `prompt` (str) and return the model's response text (str).
-    """
-    raise NotImplementedError("TODO: Implement LLM API call in call_llm()")
+    for provider in PROVIDERS:
+        api_key = os.environ.get(provider["key_env"], "").strip()
+        if not api_key:
+            continue
+
+        for model in provider["models"]:
+            payload = json.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                provider["url"],
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "Solidity-MapReduce-Auditor/1.0"
+                }
+            )
+
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    content = data["choices"]["message"]["content"]
+                    time.sleep(4)  # Respect free-tier RPM limits
+                    return f"*Model: `{model}`*\n\n{content}"
+
+            except urllib.error.HTTPError as e:
+                # 429 = Rate limit, 413 = Prompt too big for model tier, 502/503 = Provider busy
+                if e.code in (429, 413, 502, 503):
+                    print(f"[WARN] {provider['name']} ({model}) returned HTTP {e.code}. Trying next...")
+                    time.sleep(2)
+                    continue
+                raise
+
+    return "**[ERROR]** All configured free LLM endpoints hit rate limits or lacked API keys."
 
 
 # =========================================================
