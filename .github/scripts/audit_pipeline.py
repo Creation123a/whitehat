@@ -14,14 +14,17 @@ MAX_REDUCE_CHARS = 100_000    # cap on combined per-file reports for reduce step
 
 # Model IDs change frequently on both providers. Update if a model 404s.
 PROVIDERS = [
-    {
+        {
         "name": "OpenRouter Free",
         "url": "https://openrouter.ai/api/v1/chat/completions",
         "key_env": "OPENROUTER_API_KEY",
         "models": [
-            "deepseek/deepseek-r1:free",
-            "qwen/qwen-2.5-coder-32b-instruct:free",
-            "meta-llama/llama-3.3-70b-instruct:free",
+            # Current free models (as of Nov 2026)
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "google/gemma-4-31b-it:free",
+            "qwen/qwen3-coder:free",
+            "openai/gpt-oss-120b:free",
+            "openrouter/free",  # Router that auto-picks an available free model
         ],
     },
     {
