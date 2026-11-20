@@ -3,11 +3,7 @@ import re
 import glob
 import json
 import subprocess
-
-
-import os
 import time
-import json
 import urllib.request
 import urllib.error
 
