@@ -1,0 +1,71 @@
+name: Aderyn + LLM Map-Reduce Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Input Source Mode'
+        required: true
+        default: 'current_repo'
+        type: choice
+        options:
+          - current_repo
+          - external_github_repo
+          - raw_solidity_code
+      external_repo_url:
+        description: 'GitHub Repo URL (used if mode = external_github_repo)'
+        required: false
+        type: string
+      raw_solidity:
+        description: 'Paste Raw Solidity Code (used if mode = raw_solidity_code)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Auditor Repo
+        uses: actions/checkout@v4
+        with:
+          path: auditor
+
+      # Prepare target workspace based on selected input mode
+      - name: Setup Target Workspace
+        run: |
+          mkdir -p target
+          MODE="${{ github.event.inputs.mode }}"
+
+          if [ "$MODE" = "current_repo" ]; then
+            cp -r auditor/* target/
+            rm -rf target/.github
+          elif [ "$MODE" = "external_github_repo" ]; then
+            git clone --depth 1 "${{ github.event.inputs.external_repo_url }}" target
+          elif [ "$MODE" = "raw_solidity_code" ]; then
+            mkdir -p target/src
+            cat << 'EOF' > target/src/InputContract.sol
+          ${{ github.event.inputs.raw_solidity }}
+          EOF
+          fi
+
+      # Install Cyfrin Aderyn (precompiled binary, no compilation required)
+      - name: Install Aderyn
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com | sh
+          echo "$HOME/.cyfrin/bin" >> $GITHUB_PATH
+
+      # Run Python Map-Reduce Audit Pipeline
+      - name: Run Aderyn & LLM Map-Reduce Audit
+        working-directory: target
+        run: python3 ../auditor/.github/scripts/audit_pipeline.py
+
+      # Upload Final Report as Downloadable Artifact
+      - name: Upload Final Audit Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: solidity-audit-report
+          path: target/final-audit-report.md
+          if-no-files-found: error
