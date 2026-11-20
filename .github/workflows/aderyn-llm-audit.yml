@@ -64,7 +64,7 @@ jobs:
             fi
             mkdir -p target/src
             # Quoted heredoc keeps bash from expanding $ or backticks inside
-            # the Solidity source. The `${{ }}` expression is substituted by
+            # the Solidity source. The expression is substituted by
             # GitHub *before* the shell runs, at column 0 thanks to YAML
             # block-scalar indentation stripping.
             cat << 'RAW_SOLIDITY_EOF' > target/src/InputContract.sol
