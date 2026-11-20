@@ -27,48 +27,84 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
       - name: Checkout Auditor Repo
         uses: actions/checkout@v4
         with:
           path: auditor
 
-      # Prepare target workspace based on selected input mode
+      # ---------------------------------------------------------------
+      # Build the `target/` workspace from the chosen input mode
+      # ---------------------------------------------------------------
       - name: Setup Target Workspace
+        env:
+          MODE: ${{ github.event.inputs.mode }}
         run: |
+          set -euo pipefail
           mkdir -p target
-          MODE="${{ github.event.inputs.mode }}"
 
           if [ "$MODE" = "current_repo" ]; then
-            cp -r auditor/* target/
-            rm -rf target/.github
+            cp -a auditor/. target/
+            rm -rf target/.github target/.git
+
           elif [ "$MODE" = "external_github_repo" ]; then
+            if [ -z "${{ github.event.inputs.external_repo_url }}" ]; then
+              echo "::error::external_repo_url is required for mode=external_github_repo"
+              exit 1
+            fi
             git clone --depth 1 "${{ github.event.inputs.external_repo_url }}" target
+            rm -rf target/.git
+
           elif [ "$MODE" = "raw_solidity_code" ]; then
+            if [ -z "${{ github.event.inputs.raw_solidity }}" ]; then
+              echo "::error::raw_solidity is required for mode=raw_solidity_code"
+              exit 1
+            fi
             mkdir -p target/src
-            cat << 'EOF' > target/src/InputContract.sol
+            # Quoted heredoc keeps bash from expanding $ or backticks inside
+            # the Solidity source. The `${{ }}` expression is substituted by
+            # GitHub *before* the shell runs, at column 0 thanks to YAML
+            # block-scalar indentation stripping.
+            cat << 'RAW_SOLIDITY_EOF' > target/src/InputContract.sol
           ${{ github.event.inputs.raw_solidity }}
-          EOF
+          RAW_SOLIDITY_EOF
+          else
+            echo "::error::Unknown mode: $MODE"
+            exit 1
           fi
 
-      # Install Cyfrin Aderyn
+      # ---------------------------------------------------------------
+      # Aderyn (official installer — NOT github.com | sh)
+      # ---------------------------------------------------------------
       - name: Install Aderyn
         run: |
-          curl --proto '=https' --tlsv1.2 -LsSf https://github.com | sh
-          echo "$HOME/.cyfrin/bin" >> $GITHUB_PATH
+          set -euo pipefail
+          curl -L --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/Cyfrin/aderyn/dev/install.sh | bash
+          echo "$HOME/.cyfrin/bin" >> "$GITHUB_PATH"
+          "$HOME/.cyfrin/bin/aderyn" --version || true
 
-      # Run Python Map-Reduce Audit Pipeline
+      # ---------------------------------------------------------------
+      # Run the Map-Reduce pipeline from inside the target workspace.
+      # Script lives in the auditor checkout, not the target copy.
+      # ---------------------------------------------------------------
       - name: Run Aderyn & LLM Map-Reduce Audit
         working-directory: target
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          CEREBRAS_API_KEY:  ${{ secrets.CEREBRAS_API_KEY }}
         run: python3 ../auditor/.github/scripts/audit_pipeline.py
 
-      # Upload Final Report as Downloadable Artifact
+      # ---------------------------------------------------------------
+      # Upload the markdown report (and be forgiving if the audit crashed
+      # so we don't mask the real error with an "artifact missing" error)
+      # ---------------------------------------------------------------
       - name: Upload Final Audit Report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: solidity-audit-report
           path: target/final-audit-report.md
-          if-no-files-found: error
+          if-no-files-found: warn
