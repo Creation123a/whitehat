@@ -81,11 +81,12 @@ jobs:
       - name: Install Aderyn
         run: |
           set -euo pipefail
-          curl -L --proto '=https' --tlsv1.2 -sSf \
-            https://raw.githubusercontent.com/Cyfrin/aderyn/dev/install.sh | bash
-          echo "$HOME/.cyfrin/bin" >> "$GITHUB_PATH"
-          "$HOME/.cyfrin/bin/aderyn" --version || true
-
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/cyfrin/aderyn/releases/latest/download/aderyn-installer.sh | bash
+          # The installer typically places the binary in a location like ~/.cyfrin/bin or similar.
+          # Verify the path; you may need to add it to $GITHUB_PATH.
+          export PATH="$HOME/.cyfrin/bin:$PATH"
+          aderyn --version || true
       # ---------------------------------------------------------------
       # Run the Map-Reduce pipeline from inside the target workspace.
       # Script lives in the auditor checkout, not the target copy.
