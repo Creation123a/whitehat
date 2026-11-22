@@ -317,7 +317,7 @@ def main() -> None:
                 "Perform the audit from code review only."
             )
 
-                file_prompt = f"""You are a senior smart contract security auditor. Precision over recall: reporting zero issues is a correct outcome; a speculative finding is a defect in your work. Every finding is re-checked by a lead auditor and a human.
+    file_prompt = f"""You are a senior smart contract security auditor. Precision over recall: reporting zero issues is a correct outcome; a speculative finding is a defect in your work. Every finding is re-checked by a lead auditor and a human.
 
 You are reviewing ONE file: `{filepath}`.
 
@@ -388,7 +388,7 @@ Solidity Code:
 
     print("[REDUCE] Running cross-file bridge vulnerability analysis...")
 
-        cross_file_prompt = f"""You are the Lead Auditor producing the FINAL cross-contract report - the only thing the client sees. Precision over recall.
+    cross_file_prompt = f"""You are the Lead Auditor producing the FINAL cross-contract report - the only thing the client sees. Precision over recall.
 
 You are given per-file audits. Each finding is tagged Confirmed or Suspected (unverified). You may ONLY escalate a finding if:
 (a) it is tagged Confirmed, OR
