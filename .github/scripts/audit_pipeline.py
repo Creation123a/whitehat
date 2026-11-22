@@ -24,7 +24,6 @@ PROVIDERS = [
             "google/gemma-4-31b-it:free",
             "qwen/qwen3-coder:free",
             "openai/gpt-oss-120b:free",
-            "openrouter/free",  # Router that auto-picks an available free model
         ],
     },
     {
@@ -54,7 +53,7 @@ def call_llm(prompt: str, max_tokens: int = 3000) -> str:
             payload = json.dumps({
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
+                "temperature": 0.0,
                 "max_tokens": max_tokens,
             }).encode("utf-8")
 
@@ -318,22 +317,53 @@ def main() -> None:
                 "Perform the audit from code review only."
             )
 
-        file_prompt = f"""You are a senior smart contract security auditor specializing in cross-chain bridges, messaging adapters, message receivers, and wrapped token minters/escrows.
-Audit the Solidity file below alongside its automated Slither static-analysis output.
+                file_prompt = f"""You are a senior smart contract security auditor. Precision over recall: reporting zero issues is a correct outcome; a speculative finding is a defect in your work. Every finding is re-checked by a lead auditor and a human.
 
-Respond strictly in two concise sections:
-### 1. Short File Summary
-- Identify the contract's role (Adapter, Receiver, Wrapped Token Minter/Burner, Escrow, or Router), trust assumptions (relayer/endpoint/sequencer), key state variables, external/public entrypoints, and cross-chain/external calls (under 130 words).
+You are reviewing ONE file: `{filepath}`.
 
-### 2. File Vulnerabilities
-- Validate Slither's findings (confirm True Positives, dismiss False Positives).
-- Identify any High or Medium bridge-specific or general logic bugs:
-  * Missing source chain ID, source sender/adapter, or endpoint authentication
-  * Replay attacks, missing/broken nonce enforcement, or out-of-order execution flaws
-  * Unauthorized minting/burning, supply accounting mismatch, or fee-on-transfer/rebasing token issues
-  * Payload decoding/encoding malleability, gas-limit griefing, or stuck failed messages
-  * Reentrancy, access control, and decimal/rounding errors
-- Provide concise remediation steps for confirmed issues.
+## Evidence rules (non-negotiable)
+- Every finding MUST include: exact line number(s), a verbatim quote (1-8 lines) of the relevant code, and a concrete attack path (precondition -> call sequence -> impact).
+- If you cannot quote the buggy code, DO NOT report the bug.
+- Do NOT infer behavior from function names, comments, or NatSpec. Only from visible code.
+- If the source is marked [TRUNCATED], do not speculate about the missing portion; say so.
+- Reporting ZERO issues for a file is valid and expected. Do not manufacture findings.
+
+## Required output (exact structure)
+
+### A. File Summary (max 120 words)
+Contract role; trust model (who is trusted to do what); external entrypoints; cross-chain/external calls.
+
+### B. Slither Triage
+For EACH Slither finding, one row: `[TP]` / `[FP]` / `[INCONCLUSIVE]`, check name + line, one-sentence justification citing code. End with: `Confirmed: N. Dismissed: M.`
+
+### C. Independent Review - Confirmed Findings
+Per finding:
+- Severity: Critical / High / Medium / Low / Informational
+- Confidence: High / Medium
+- Location: `{filepath}:<line>`
+- Evidence:
+  ```solidity
+  <verbatim quoted lines>
+  ```
+- Issue: one sentence.
+- Attack path: precondition -> calls -> impact.
+- Fix: concrete change.
+If none, write exactly: `No confirmed findings.`
+
+### D. Suspected but Unverified
+Issues you cannot prove from this file alone. Same fields as C, plus **Missing evidence:** what you would need to confirm. These are NOT escalated unless corroborated.
+
+### E. Explicit Non-Issues
+List 2-5 things that LOOK suspicious but are actually safe, with the reason (cite the guard/ordering that makes them safe).
+
+## Focus areas (verify each; state exposed / not exposed with the code that proves it)
+- Source chain / source sender / endpoint authentication on inbound messages
+- Replay protection (nonce, message hash, consumed flag)
+- Mint/burn accounting vs lock/unlock invariants
+- Access control on privileged ops (mint, pause, upgrade, peer registration)
+- Reentrancy on external calls that mutate state
+- Rounding / decimal handling
+- Unchecked return values on token transfers
 
 File: `{filepath}`
 
@@ -346,7 +376,6 @@ Solidity Code:
 ```solidity
 {clean_code}
 ```"""
-
         llm_response = call_llm(file_prompt, max_tokens=3000)
         per_file_reports.append(f"## File: `{filepath}`\n\n{llm_response}")
 
@@ -359,19 +388,35 @@ Solidity Code:
 
     print("[REDUCE] Running cross-file bridge vulnerability analysis...")
 
-    cross_file_prompt = f"""You are a Lead Cross-Chain Security Auditor conducting an end-to-end architectural review across bridge adapters, message receivers, and wrapped token minters.
-Below are the individual audit summaries and findings for every file in the codebase.
+        cross_file_prompt = f"""You are the Lead Auditor producing the FINAL cross-contract report - the only thing the client sees. Precision over recall.
 
-Using ONLY these summaries, identify **Cross-Contract & Cross-Chain Vulnerabilities**:
-1. Adapter <-> Receiver Trust & Encoding Mismatches: Differences in payload ABI encoding/decoding, chain ID mappings, peer/trusted remote registration, or relayer verification between sending adapters and receiving endpoints.
-2. Lock/Burn <-> Mint/Unlock Accounting Desynchronization: Scenarios where tokens are minted without corresponding lock/burn, double-minted via replay, or permanently locked if a cross-chain message reverts on the destination chain.
-3. Cross-Contract & Read-Only Reentrancy: Callbacks during token mint/transfer or bridge hooks that corrupt shared bridge state or accounting.
-4. Privilege Escalation & Admin/Guardian Key Risks: Mismatched roles (`MINTER_ROLE`, `ADAPTER_ROLE`, `ENDPOINT`) allowing unauthorized minting or message spoofing across contracts.
+You are given per-file audits. Each finding is tagged Confirmed or Suspected (unverified). You may ONLY escalate a finding if:
+(a) it is tagged Confirmed, OR
+(b) it is tagged Suspected AND you can name the exact counterparty file that supplies the missing evidence, and that file appears in the summaries below.
 
-Format the output as:
+Rules:
+- DROP any finding that is generic, unproven, or not grounded in quoted code. If in doubt, drop it.
+- DEDUPLICATE: same root cause across files -> one entry listing all locations.
+- Do NOT invent new vulnerabilities. Synthesis and filtering only.
+- Weight severity by real impact: fund loss > permanent lock > DoS > griefing > informational.
+
+Output:
+
 ### Executive Summary
-### Cross-Contract & Cross-Chain Vulnerabilities (High / Medium)
-### Prioritized Remediation Checklist
+3-6 sentences. Overall risk posture. State how many confirmed issues by severity, and whether the codebase looks mature or early-stage.
+
+### Confirmed Cross-Contract / Cross-Chain Issues
+Per issue: Severity; Confidence; Components (`fileA:line` <-> `fileB:line`); Evidence (quoted from per-file findings); Attack path across contracts; Fix.
+If none: `No confirmed cross-contract issues were substantiated by the per-file reviews.`
+
+### Per-File Findings Worth Elevating (confirmed only, deduplicated)
+Table: `file:line | severity | one-line issue`
+
+### Coverage Gaps
+Files not fully reviewed (truncated, read error, Slither build failure) and what was not checked.
+
+### Prioritized Remediation
+Ordered list, highest risk first.
 
 Per-File Audit Summaries:
 {combined_file_reports}
