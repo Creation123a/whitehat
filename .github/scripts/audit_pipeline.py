@@ -376,8 +376,8 @@ Solidity Code:
 ```solidity
 {clean_code}
 ```"""
-        llm_response = call_llm(file_prompt, max_tokens=3000)
-        per_file_reports.append(f"## File: `{filepath}`\n\n{llm_response}")
+    llm_response = call_llm(file_prompt, max_tokens=3000)
+    per_file_reports.append(f"## File: `{filepath}`\n\n{llm_response}")
 
     combined_file_reports = "\n\n---\n\n".join(per_file_reports)
     if len(combined_file_reports) > MAX_REDUCE_CHARS:
