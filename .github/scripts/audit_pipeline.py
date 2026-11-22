@@ -10,11 +10,11 @@ import urllib.error
 # Tunables
 # ---------------------------------------------------------------------------
 MAX_CODE_CHARS = 60_000       # per-file code sent to LLM
-MAX_REDUCE_CHARS = 100_000    # cap on combined per-file reports for reduce step
+MAX_REDUCE_CHARS = 400_000    # cap on combined per-file reports for reduce step
 
 # Model IDs change frequently on both providers. Update if a model 404s.
 PROVIDERS = [
-        {
+    {
         "name": "OpenRouter Free",
         "url": "https://openrouter.ai/api/v1/chat/completions",
         "key_env": "OPENROUTER_API_KEY",
@@ -317,7 +317,7 @@ def main() -> None:
                 "Perform the audit from code review only."
             )
 
-    file_prompt = f"""You are a senior smart contract security auditor. Precision over recall: reporting zero issues is a correct outcome; a speculative finding is a defect in your work. Every finding is re-checked by a lead auditor and a human.
+        file_prompt = f"""You are a senior smart contract security auditor. Precision over recall: reporting zero issues is a correct outcome; a speculative finding is a defect in your work. Every finding is re-checked by a lead auditor and a human.
 
 You are reviewing ONE file: `{filepath}`.
 
@@ -376,8 +376,8 @@ Solidity Code:
 ```solidity
 {clean_code}
 ```"""
-    llm_response = call_llm(file_prompt, max_tokens=3000)
-    per_file_reports.append(f"## File: `{filepath}`\n\n{llm_response}")
+        llm_response = call_llm(file_prompt, max_tokens=3000)
+        per_file_reports.append(f"## File: `{filepath}`\n\n{llm_response}")
 
     combined_file_reports = "\n\n---\n\n".join(per_file_reports)
     if len(combined_file_reports) > MAX_REDUCE_CHARS:
