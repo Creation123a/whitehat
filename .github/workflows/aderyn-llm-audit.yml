@@ -92,6 +92,7 @@ jobs:
       - name: Run Slither & LLM Map-Reduce Audit
         working-directory: target
         env:
+          NVIDIA_API_KEY:    ${{ secrets.NVIDIA_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           CEREBRAS_API_KEY:  ${{ secrets.CEREBRAS_API_KEY }}
         run: python3 ../auditor/.github/scripts/audit_pipeline.py
