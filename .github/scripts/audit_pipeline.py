@@ -5,6 +5,7 @@ import subprocess
 import time
 import urllib.request
 import urllib.error
+import threading
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -12,18 +13,52 @@ import urllib.error
 MAX_CODE_CHARS = 60_000       # per-file code sent to LLM
 MAX_REDUCE_CHARS = 400_000    # cap on combined per-file reports for reduce step
 
-# Model IDs change frequently on both providers. Update if a model 404s.
+# ---------------------------------------------------------------------------
+# Rate limiter for NVIDIA NIM: < 40 RPM => 1.6s min gap (37.5 RPM)
+# ---------------------------------------------------------------------------
+_nvidia_lock = threading.Lock()
+_nvidia_last_call = 0.0
+NVIDIA_MIN_INTERVAL = 1.6
+
+
+def _nvidia_wait() -> None:
+    """Block until NVIDIA_MIN_INTERVAL has elapsed since the last NIM call."""
+    global _nvidia_last_call
+    with _nvidia_lock:
+        now = time.time()
+        gap = now - _nvidia_last_call
+        if gap < NVIDIA_MIN_INTERVAL:
+            time.sleep(NVIDIA_MIN_INTERVAL - gap)
+        _nvidia_last_call = time.time()
+
+
 PROVIDERS = [
+    {
+        "name": "NVIDIA NIM",
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "key_env": "NVIDIA_API_KEY",
+        "rate_limit_fn": _nvidia_wait,
+        "max_retries_per_model": 3,
+        "backoff_seconds": 2.0,
+        "models": [
+            "moonshotai/kimi-k3.1-pro",       # primary
+            "minimaxai/minimax-m3.1-flash",   # fallback
+        ],
+        "model_options": {
+            "moonshotai/kimi-k3.1-pro":       {"reasoning_effort": "low"},
+            "minimaxai/minimax-m3.1-flash":   {"top_p": 0.95},
+        },
+    },
     {
         "name": "OpenRouter Free",
         "url": "https://openrouter.ai/api/v1/chat/completions",
         "key_env": "OPENROUTER_API_KEY",
         "models": [
-            # Current free models (as of Nov 2026)
+            # Verified free as of Nov 2026
             "nvidia/nemotron-3-ultra-550b-a55b:free",
-            "google/gemma-4-31b-it:free",
-            "qwen/qwen3-coder:free",
-            "openai/gpt-oss-120b:free",
+            "baidu/ernie-5.5-flash-preview:free",
+            "stepfun/step-3.5-flash:free",
+            "cohere/north-mini-code:free",
         ],
     },
     {
@@ -38,77 +73,106 @@ PROVIDERS = [
     },
 ]
 
-
 # ---------------------------------------------------------------------------
 # LLM call with provider/model fallback
 # ---------------------------------------------------------------------------
 def call_llm(prompt: str, max_tokens: int = 3000) -> str:
     last_error = "no provider configured with an API key"
+
     for provider in PROVIDERS:
         api_key = os.environ.get(provider["key_env"], "").strip()
         if not api_key:
             continue
 
+        rl_fn = provider.get("rate_limit_fn")
+        max_retries = provider.get("max_retries_per_model", 1)
+        backoff = provider.get("backoff_seconds", 2.0)
+        model_opts = provider.get("model_options", {})
+
         for model in provider["models"]:
-            payload = json.dumps({
+            payload_obj = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.0,
                 "max_tokens": max_tokens,
-            }).encode("utf-8")
+            }
+            # Per-model overrides (e.g. reasoning_effort for thinking models)
+            payload_obj.update(model_opts.get(model, {}))
+            payload = json.dumps(payload_obj).encode("utf-8")
 
-            req = urllib.request.Request(
-                provider["url"],
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "Bridge-MapReduce-Auditor/1.1",
-                },
-            )
+            req_headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "Bridge-MapReduce-Auditor/1.2",
+            }
 
-            try:
-                with urllib.request.urlopen(req, timeout=180) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+            # Retry loop per model — transient errors only
+            for attempt in range(1, max_retries + 1):
+                # Apply provider-level rate limit before every network attempt
+                if rl_fn:
+                    rl_fn()
 
-                choices = data.get("choices") or []
-                if not choices:
-                    last_error = f"{provider['name']}/{model}: empty choices"
-                    continue
+                req = urllib.request.Request(
+                    provider["url"], data=payload, headers=req_headers
+                )
 
-                content = (choices[0].get("message") or {}).get("content")
-                # OpenAI-style "parts" content
-                if isinstance(content, list):
-                    content = "".join(
-                        p.get("text", "") for p in content if isinstance(p, dict)
-                    )
-                content = (content or "").strip()
-                if not content:
-                    last_error = f"{provider['name']}/{model}: empty content"
-                    continue
-
-                time.sleep(3)  # be polite to free tiers
-                return f"*Model: `{model}`*\n\n{content}"
-
-            except urllib.error.HTTPError as e:
-                body = ""
                 try:
-                    body = e.read().decode("utf-8", "ignore")[:200]
-                except Exception:
-                    pass
-                last_error = f"{provider['name']}/{model}: HTTP {e.code} {body}"
-                print(f"[WARN] {last_error} — trying next model...")
-                time.sleep(2)
-                continue
-            except Exception as e:  # network, timeout, JSON, etc.
-                last_error = f"{provider['name']}/{model}: {e!r}"
-                print(f"[WARN] {last_error} — trying next model...")
-                time.sleep(1)
-                continue
+                    with urllib.request.urlopen(req, timeout=180) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+
+                    choices = data.get("choices") or []
+                    if not choices:
+                        last_error = f"{provider['name']}/{model}: empty choices"
+                        break  # try next model
+
+                    content = (choices[0].get("message") or {}).get("content")
+                    if isinstance(content, list):
+                        content = "".join(
+                            p.get("text", "") for p in content if isinstance(p, dict)
+                        )
+                    content = (content or "").strip()
+                    if not content:
+                        last_error = f"{provider['name']}/{model}: empty content"
+                        break  # try next model
+
+                    return f"*Model: `{model}`*\n\n{content}"
+
+                except urllib.error.HTTPError as e:
+                    body = ""
+                    try:
+                        body = e.read().decode("utf-8", "ignore")[:200]
+                    except Exception:
+                        pass
+                    last_error = f"{provider['name']}/{model}: HTTP {e.code} {body}"
+
+                    # Retry on transient codes only; 4xx like 404 are terminal
+                    if e.code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                        wait = backoff * (2 ** (attempt - 1))
+                        print(
+                            f"[WARN] {last_error} — retry "
+                            f"{attempt}/{max_retries} in {wait:.1f}s"
+                        )
+                        time.sleep(wait)
+                        continue
+
+                    print(f"[WARN] {last_error} — trying next model...")
+                    break  # try next model
+
+                except Exception as e:  # network, timeout, JSON, etc.
+                    last_error = f"{provider['name']}/{model}: {e!r}"
+                    if attempt < max_retries:
+                        wait = backoff * (2 ** (attempt - 1))
+                        print(
+                            f"[WARN] {last_error} — retry "
+                            f"{attempt}/{max_retries} in {wait:.1f}s"
+                        )
+                        time.sleep(wait)
+                        continue
+                    print(f"[WARN] {last_error} — trying next model...")
+                    break  # try next model
 
     return f"**[ERROR]** All configured LLM endpoints failed. Last error: {last_error}"
-
-
+                    
 # ---------------------------------------------------------------------------
 # Comment stripping that (a) preserves line numbers and (b) ignores strings
 # ---------------------------------------------------------------------------
