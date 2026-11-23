@@ -27,7 +27,7 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout Auditor Repo
@@ -63,10 +63,6 @@ jobs:
               exit 1
             fi
             mkdir -p target/src
-            # Quoted heredoc keeps bash from expanding $ or backticks inside
-            # the Solidity source. The expression is substituted by
-            # GitHub *before* the shell runs, at column 0 thanks to YAML
-            # block-scalar indentation stripping.
             cat << 'RAW_SOLIDITY_EOF' > target/src/InputContract.sol
           ${{ github.event.inputs.raw_solidity }}
           RAW_SOLIDITY_EOF
@@ -76,30 +72,33 @@ jobs:
           fi
 
       # ---------------------------------------------------------------
-      # Slither (official installer — NOT github.com | sh)
+      # Install Slither
       # ---------------------------------------------------------------
       - name: Install Slither
         run: |
           set -euo pipefail
           python3 -m pip install --upgrade pip
           pip3 install slither-analyzer solc-select
-          # solc-select will automatically switch to the correct compiler
-          # version based on the project's configuration (e.g., foundry.toml)
-          slither --version || true      # ---------------------------------------------------------------
+          slither --version || true
+
+      # ---------------------------------------------------------------
       # Run the Map-Reduce pipeline from inside the target workspace.
       # Script lives in the auditor checkout, not the target copy.
+      # PYTHONUNBUFFERED + -u ensure every print() appears immediately,
+      # so a cancelled run still shows which file / phase it was on.
       # ---------------------------------------------------------------
       - name: Run Slither & LLM Map-Reduce Audit
         working-directory: target
         env:
-          NVIDIA_API_KEY:    ${{ secrets.NVIDIA_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+          NVIDIA_API_KEY:     ${{ secrets.NVIDIA_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          CEREBRAS_API_KEY:  ${{ secrets.CEREBRAS_API_KEY }}
-        run: python3 ../auditor/.github/scripts/audit_pipeline.py
+          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_API_KEY }}
+        run: python3 -u ../auditor/.github/scripts/audit_pipeline.py
 
       # ---------------------------------------------------------------
-      # Upload the markdown report (and be forgiving if the audit crashed
-      # so we don't mask the real error with an "artifact missing" error)
+      # Upload the markdown report (if: always() so a crash still
+      # surfaces whatever was written before the failure)
       # ---------------------------------------------------------------
       - name: Upload Final Audit Report
         if: always()
