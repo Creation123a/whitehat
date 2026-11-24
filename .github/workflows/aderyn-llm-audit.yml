@@ -35,12 +35,29 @@ jobs:
         with:
           path: auditor
 
-      # ---------------------------------------------------------------
-      # Build the `target/` workspace from the chosen input mode
-      # ---------------------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check API Keys
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ZAI_API_KEY" ] && [ -z "$MISTRAL_API_KEY" ]; then
+            echo "::error::No LLM key found. Add ZAI_API_KEY (required) and MISTRAL_API_KEY (optional) in Repo Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+          if [ -n "$ZAI_API_KEY" ]; then echo "ZAI_API_KEY: present"; else echo "ZAI_API_KEY: missing - will use Mistral only"; fi
+          if [ -n "$MISTRAL_API_KEY" ]; then echo "MISTRAL_API_KEY: present"; else echo "MISTRAL_API_KEY: missing - will use Z.ai only"; fi
+
       - name: Setup Target Workspace
         env:
           MODE: ${{ github.event.inputs.mode }}
+          EXTERNAL_REPO_URL: ${{ github.event.inputs.external_repo_url }}
+          RAW_SOLIDITY: ${{ github.event.inputs.raw_solidity }}
         run: |
           set -euo pipefail
           mkdir -p target
@@ -50,56 +67,43 @@ jobs:
             rm -rf target/.github target/.git
 
           elif [ "$MODE" = "external_github_repo" ]; then
-            if [ -z "${{ github.event.inputs.external_repo_url }}" ]; then
+            if [ -z "$EXTERNAL_REPO_URL" ]; then
               echo "::error::external_repo_url is required for mode=external_github_repo"
               exit 1
             fi
-            git clone --depth 1 "${{ github.event.inputs.external_repo_url }}" target
+            git clone --depth 1 "$EXTERNAL_REPO_URL" target
             rm -rf target/.git
 
           elif [ "$MODE" = "raw_solidity_code" ]; then
-            if [ -z "${{ github.event.inputs.raw_solidity }}" ]; then
+            if [ -z "$RAW_SOLIDITY" ]; then
               echo "::error::raw_solidity is required for mode=raw_solidity_code"
               exit 1
             fi
             mkdir -p target/src
-            cat << 'RAW_SOLIDITY_EOF' > target/src/InputContract.sol
-          ${{ github.event.inputs.raw_solidity }}
-          RAW_SOLIDITY_EOF
+            # Write via python to avoid heredoc / $ expansion breaking Solidity code
+            python3 -c "import os; open('target/src/InputContract.sol','w',encoding='utf-8').write(os.environ['RAW_SOLIDITY'])"
           else
             echo "::error::Unknown mode: $MODE"
             exit 1
           fi
 
-      # ---------------------------------------------------------------
-      # Install Slither
-      # ---------------------------------------------------------------
       - name: Install Slither
         run: |
           set -euo pipefail
           python3 -m pip install --upgrade pip
           pip3 install slither-analyzer solc-select
+          solc-select install 0.8.20 || true
+          solc-select use 0.8.20 || true
           slither --version || true
 
-      # ---------------------------------------------------------------
-      # Run the Map-Reduce pipeline from inside the target workspace.
-      # Script lives in the auditor checkout, not the target copy.
-      # PYTHONUNBUFFERED + -u ensure every print() appears immediately,
-      # so a cancelled run still shows which file / phase it was on.
-      # ---------------------------------------------------------------
       - name: Run Slither & LLM Map-Reduce Audit
         working-directory: target
         env:
           PYTHONUNBUFFERED: "1"
-          NVIDIA_API_KEY:     ${{ secrets.NVIDIA_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
         run: python3 -u ../auditor/.github/scripts/audit_pipeline.py
 
-      # ---------------------------------------------------------------
-      # Upload the markdown report (if: always() so a crash still
-      # surfaces whatever was written before the failure)
-      # ---------------------------------------------------------------
       - name: Upload Final Audit Report
         if: always()
         uses: actions/upload-artifact@v4
