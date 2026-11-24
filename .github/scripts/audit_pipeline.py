@@ -13,7 +13,7 @@ except ImportError:
 
 FENCE = chr(96) * 3
 MAX_CODE_CHARS = 50000
-STAGE1_BATCH_TOKENS = 50000
+STAGE1_BATCH_TOKENS = 12000
 STAGE1_MAX_TOKENS = 1024
 STAGE2_MAX_TOKENS = 4000
 MAP_BUDGET_SECONDS = 70 * 60
@@ -210,8 +210,8 @@ for i in (1, 2, 3):
 CF_MODELS = [
     "@cf/qwen/qwen2.5-coder-32b-instruct",
     "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    "@cf/google/gemma-3-12b-it",
     "@cf/meta/llama-4-scout-17b-16e-instruct",
+    "@cf/meta/llama-2-7b-chat-int8",
 ]
 _cf_rr = 0
 _cf_lock = threading.Lock()
@@ -240,7 +240,14 @@ def cf_call(prompt_json_instruction, batch_text, max_tokens=1024):
                 if not data.get("success"):
                     print("[WARN] " + acct["label"] + " " + model + " CF error: " + str(data.get("errors"))[:400], flush=True)
                     continue
-                content = ((data.get("result") or {}).get("response") or "").strip()
+                raw_resp = (data.get("result") or {}).get("response") or ""
+                if isinstance(raw_resp, dict):
+                    content = raw_resp.get("content") or raw_resp.get("response") or json.dumps(raw_resp)
+                elif isinstance(raw_resp, list):
+                    content = " ".join([str(x.get("content", x)) if isinstance(x, dict) else str(x) for x in raw_resp])
+                else:
+                    content = str(raw_resp)
+                content = content.strip()
                 if not content:
                     continue
                 content = content.replace(FENCE + "json", "").replace(FENCE, "").strip()
@@ -265,11 +272,17 @@ def cf_call(prompt_json_instruction, batch_text, max_tokens=1024):
                 if e.code == 404:
                     print("[INFO] Model " + model + " not found on CF - trying next model", flush=True)
                     continue
+                if e.code == 413:
+                    print("[INFO] Batch too big for " + model + " - trying next model", flush=True)
+                    continue
+                if e.code == 403:
+                    print("[INFO] Model " + model + " not allowed on " + acct["label"] + " - trying next model", flush=True)
+                    continue
                 if e.code == 429:
                     acct["exhausted"] = True
                     print("[INFO] " + acct["label"] + " marked exhausted (429 Neuron limit)", flush=True)
                     break
-                if e.code in (401, 403):
+                if e.code in (401,):
                     acct["exhausted"] = True
                     break
                 continue
@@ -362,6 +375,14 @@ def stage1_triage(files_with_code, slither_map):
             p = item.get("path", "")
             if p and p not in critical:
                 critical[p] = item.get("reason", "")
+    if not critical:
+        print("[WARN] Stage1 CF returned 0 - falling back to Slither-only triage", flush=True)
+        for fp, code in files_with_code:
+            sl = slither_map.get(fp, [])
+            has_high = any((s.get("severity", "") or "").lower() in ("high", "medium") for s in sl)
+            if has_high:
+                critical[fp] = "Slither HIGH/MEDIUM (CF unavailable, fallback)"
+        print("[INFO] Slither fallback HIGH files: " + str(len(critical)), flush=True)
     return critical
 
 def stage2_deep_audit(filepath, code, slither_findings, all_files_map):
