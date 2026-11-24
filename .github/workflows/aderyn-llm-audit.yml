@@ -1,119 +1,93 @@
 name: Slither + LLM Map-Reduce Audit
-
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Input Source Mode'
-        required: true
-        default: 'current_repo'
+        description: "current_repo or external_github_repo"
+        required: false
+        default: "current_repo"
         type: choice
-        options:
-          - current_repo
-          - external_github_repo
-          - raw_solidity_code
+        options: [current_repo, external_github_repo]
       external_repo_url:
-        description: 'GitHub Repo URL (used if mode = external_github_repo)'
+        description: "External repo URL if mode=external_github_repo"
         required: false
+        default: ""
         type: string
-      raw_solidity:
-        description: 'Paste Raw Solidity Code (used if mode = raw_solidity_code)'
-        required: false
-        type: string
-
-permissions:
-  contents: read
-
 jobs:
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-
     steps:
       - name: Checkout Auditor Repo
         uses: actions/checkout@v4
         with:
           path: auditor
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Check API Keys
-        env:
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "$ZAI_API_KEY" ] && [ -z "$MISTRAL_API_KEY" ]; then
-            echo "::error::No LLM key found. Add ZAI_API_KEY (required) and MISTRAL_API_KEY (optional) in Repo Settings > Secrets and variables > Actions"
-            exit 1
-          fi
-          if [ -n "$ZAI_API_KEY" ]; then echo "ZAI_API_KEY: present"; else echo "ZAI_API_KEY: missing - will use Mistral only"; fi
-          if [ -n "$MISTRAL_API_KEY" ]; then echo "MISTRAL_API_KEY: present"; else echo "MISTRAL_API_KEY: missing - will use Z.ai only"; fi
-
+          submodules: recursive
+          fetch-depth: 1
       - name: Setup Target Workspace
         env:
-          MODE: ${{ github.event.inputs.mode }}
-          EXTERNAL_REPO_URL: ${{ github.event.inputs.external_repo_url }}
-          RAW_SOLIDITY: ${{ github.event.inputs.raw_solidity }}
+          MODE: ${{ inputs.mode }}
+          EXTERNAL_REPO_URL: ${{ inputs.external_repo_url }}
         run: |
           set -euo pipefail
           mkdir -p target
-
-          if [ "$MODE" = "current_repo" ]; then
-            cp -a auditor/. target/
-            rm -rf target/.github target/.git
-
-          elif [ "$MODE" = "external_github_repo" ]; then
-            if [ -z "$EXTERNAL_REPO_URL" ]; then
-              echo "::error::external_repo_url is required for mode=external_github_repo"
-              exit 1
-            fi
-            git clone --depth 1 "$EXTERNAL_REPO_URL" target
+          if [ "$MODE" = "external_github_repo" ]; then
+            git clone --depth 1 --recurse-submodules "$EXTERNAL_REPO_URL" target
             rm -rf target/.git
-
-          elif [ "$MODE" = "raw_solidity_code" ]; then
-            if [ -z "$RAW_SOLIDITY" ]; then
-              echo "::error::raw_solidity is required for mode=raw_solidity_code"
-              exit 1
-            fi
-            mkdir -p target/src
-            # Write via python to avoid heredoc / $ expansion breaking Solidity code
-            python3 -c "import os; open('target/src/InputContract.sol','w',encoding='utf-8').write(os.environ['RAW_SOLIDITY'])"
           else
-            echo "::error::Unknown mode: $MODE"
-            exit 1
+            cp -a auditor/. target/
+            rm -rf target/.git
           fi
-
+          ls -la target/ | head -20
+          ls -la target/lib/ || echo "no lib folder yet"
       - name: Install Foundry + Slither
         uses: foundry-rs/foundry-toolchain@v1
         with:
           version: stable
-
-      - name: Install Slither
+      - name: Install Python Deps
         run: |
           set -euo pipefail
           python3 -m pip install --upgrade pip
-          pip3 install slither-analyzer solc-select
+          pip3 install slither-analyzer solc-select openai
           solc-select install 0.8.20 || true
           solc-select use 0.8.20 || true
           forge --version
           slither --version || true
-
-      - name: Run Slither & LLM Map-Reduce Audit
+      - name: Install Foundry Dependencies in Target
+        working-directory: target
+        run: |
+          set -euo pipefail
+          forge install --no-commit || true
+          if [ ! -d "lib/forge-std" ]; then forge install --no-commit foundry-rs/forge-std || true; fi
+          if [ ! -d "lib/openzeppelin-contracts" ]; then forge install --no-commit OpenZeppelin/openzeppelin-contracts@v5.0.2 || true; fi
+          if [ ! -d "lib/openzeppelin-contracts-upgradeable" ]; then forge install --no-commit OpenZeppelin/openzeppelin-contracts-upgradeable@v5.0.2 || true; fi
+          if [ ! -d "lib/solmate" ]; then forge install --no-commit transmissions11/solmate || true; fi
+          ls -la lib/ || echo "lib still empty"
+      - name: Copy Audit Script Into Target
+        run: |
+          set -euo pipefail
+          cp auditor/.github/scripts/audit_pipeline.py target/audit_pipeline.py
+          python3 -c "import ast; ast.parse(open('target/audit_pipeline.py').read()); print('py OK')"
+      - name: Run Slither + LLM Audit
         working-directory: target
         env:
-          PYTHONUNBUFFERED: "1"
-          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-        run: python3 -u ../auditor/.github/scripts/audit_pipeline.py
-
-      - name: Upload Final Audit Report
+          CF_ACCOUNT_ID_1: ${{ secrets.CF_ACCOUNT_ID_1 }}
+          CF_API_TOKEN_1: ${{ secrets.CF_API_TOKEN_1 }}
+          CF_ACCOUNT_ID_2: ${{ secrets.CF_ACCOUNT_ID_2 }}
+          CF_API_TOKEN_2: ${{ secrets.CF_API_TOKEN_2 }}
+          CF_ACCOUNT_ID_3: ${{ secrets.CF_ACCOUNT_ID_3 }}
+          CF_API_TOKEN_3: ${{ secrets.CF_API_TOKEN_3 }}
+          GONKA_KEY_1: ${{ secrets.GONKA_KEY_1 }}
+          GONKA_KEY_2: ${{ secrets.GONKA_KEY_2 }}
+          GONKA_KEY_3: ${{ secrets.GONKA_KEY_3 }}
+          GONKA_BASE_URL: ${{ secrets.GONKA_BASE_URL }}
+        run: |
+          set -euo pipefail
+          python3 -u audit_pipeline.py
+      - name: Upload Audit Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: solidity-audit-report
-          path: target/final-audit-report.md
+          name: audit-report
+          path: target/audit-report.md
           if-no-files-found: warn
