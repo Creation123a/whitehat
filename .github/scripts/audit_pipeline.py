@@ -194,26 +194,40 @@ def run_slither(root="."):
     output_json = "slither-report.json"
     if os.path.exists(output_json):
         os.remove(output_json)
-    print("[INFO] Trying forge build first to generate compilation artifacts...", flush=True)
+    print("[INFO] Trying forge build first...", flush=True)
     try:
-        subprocess.run(["forge", "build"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False)
-    except Exception:
-        pass
-    slither_cmd = ["slither", root, "--json", output_json, "--filter-paths", "node_modules,lib", "--exclude-dependencies"]
-    print("[INFO] Running: " + " ".join(slither_cmd), flush=True)
-    try:
-        result = subprocess.run(slither_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=300)
-        stderr = result.stderr.decode("utf-8", "ignore")[:2000] if result.stderr else ""
-        if result.returncode != 0 and not os.path.exists(output_json):
-            print("[WARN] Slither exit code " + str(result.returncode) + " stderr: " + stderr, flush=True)
-    except subprocess.TimeoutExpired:
-        print("[WARN] Slither timed out after 300s - skipping static analysis.", flush=True)
-        return None
+        fb = subprocess.run(["forge", "build"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180, check=False)
+        print("[INFO] forge build exit: " + str(fb.returncode), flush=True)
+        if fb.returncode != 0:
+            print("[WARN] forge build failed: " + fb.stderr.decode("utf-8", "ignore")[:2000], flush=True)
+            print("[WARN] forge stdout: " + fb.stdout.decode("utf-8", "ignore")[:1000], flush=True)
     except FileNotFoundError:
-        print("[WARN] slither binary not found on PATH.", flush=True)
-        return None
+        print("[WARN] forge not found - Slither will try solc mode. Install foundry-toolchain in YAML.", flush=True)
+    except Exception as e:
+        print("[WARN] forge build error: " + str(e), flush=True)
+    attempts = [
+        ["slither", root, "--json", output_json, "--filter-paths", "node_modules,lib", "--exclude-dependencies"],
+        ["slither", root, "--json", output_json, "--compile-force-framework", "solc", "--solc", "0.8.20", "--filter-paths", "node_modules,lib", "--exclude-dependencies"],
+        ["slither", root, "--json", output_json, "--compile-force-framework", "solc", "--solc-remaps", "@openzeppelin/=lib/openzeppelin-contracts/", "--filter-paths", "node_modules,lib"],
+    ]
+    for idx, cmd in enumerate(attempts, 1):
+        if os.path.exists(output_json):
+            os.remove(output_json)
+        print("[INFO] Slither attempt " + str(idx) + "/3: " + " ".join(cmd), flush=True)
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=300)
+            stderr = result.stderr.decode("utf-8", "ignore")[:2000] if result.stderr else ""
+            if os.path.exists(output_json):
+                break
+            print("[WARN] Slither attempt " + str(idx) + " failed exit=" + str(result.returncode) + " stderr: " + stderr, flush=True)
+        except subprocess.TimeoutExpired:
+            print("[WARN] Slither attempt " + str(idx) + " timed out after 300s", flush=True)
+            continue
+        except FileNotFoundError:
+            print("[WARN] slither binary not found on PATH.", flush=True)
+            return None
     if not os.path.exists(output_json):
-        print("[WARN] Slither produced no output file. Build likely failed. Check forge build output.", flush=True)
+        print("[WARN] Slither produced no output after 3 attempts. Continuing with LLM-only audit.", flush=True)
         return None
     try:
         with open(output_json, "r", encoding="utf-8") as f:
@@ -227,7 +241,7 @@ def run_slither(root="."):
         except OSError:
             pass
     if not data.get("success") or "results" not in data:
-        print("[WARN] Slither JSON missing valid results block. Success flag: " + str(data.get("success")), flush=True)
+        print("[WARN] Slither JSON missing valid results. Success: " + str(data.get("success")), flush=True)
         return None
     print("[INFO] Slither succeeded with " + str(len(data["results"].get("detectors", []))) + " detectors", flush=True)
     return data["results"]
