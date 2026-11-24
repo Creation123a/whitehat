@@ -3,13 +3,23 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "current_repo or external_github_repo"
+        description: "current_repo or external_github_repo or raw_solidity"
         required: false
         default: "current_repo"
         type: choice
-        options: [current_repo, external_github_repo]
+        options: [current_repo, external_github_repo, raw_solidity]
       external_repo_url:
         description: "External repo URL if mode=external_github_repo"
+        required: false
+        default: ""
+        type: string
+      raw_solidity:
+        description: "Paste raw Solidity code here if mode=raw_solidity (single file audit)"
+        required: false
+        default: ""
+        type: string
+      target_path:
+        description: "Optional sub-path to audit inside repo, e.g. src/contracts. Leave empty = whole repo"
         required: false
         default: ""
         type: string
@@ -28,18 +38,44 @@ jobs:
         env:
           MODE: ${{ inputs.mode }}
           EXTERNAL_REPO_URL: ${{ inputs.external_repo_url }}
+          RAW_SOLIDITY: ${{ inputs.raw_solidity }}
+          TARGET_PATH: ${{ inputs.target_path }}
         run: |
           set -euo pipefail
           mkdir -p target
-          if [ "$MODE" = "external_github_repo" ]; then
+          if [ "$MODE" = "raw_solidity" ]; then
+            echo "Mode: raw_solidity - creating single-file target"
+            mkdir -p target/src
+            printf '%s' "$RAW_SOLIDITY" > target/src/RawAudit.sol
+            # Minimal foundry.toml so forge/slither can compile single file
+            if [ ! -f target/foundry.toml ]; then
+              printf '[profile.default]\nsrc = "src"\nout = "out"\nlibs = ["lib", "dependencies"]\n' > target/foundry.toml
+            fi
+            echo "AUDIT_SINGLE_FILE=src/RawAudit.sol" >> $GITHUB_ENV
+          elif [ "$MODE" = "external_github_repo" ]; then
+            if [ -z "$EXTERNAL_REPO_URL" ]; then
+              echo "::error::external_repo_url is required for mode=external_github_repo"
+              exit 1
+            fi
             git clone --depth 1 --recurse-submodules "$EXTERNAL_REPO_URL" target
             rm -rf target/.git
           else
             cp -a auditor/. target/
             rm -rf target/.git
           fi
-          ls -la target/ | head -20
-          ls -la target/lib/ || echo "no lib folder yet"
+          if [ -n "$TARGET_PATH" ]; then
+            echo "AUDIT_TARGET_PATH=$TARGET_PATH" >> $GITHUB_ENV
+          fi
+          echo "=== target/ ==="
+          ls -la target/ | head -30
+          echo "=== foundry.toml ==="
+          cat target/foundry.toml || echo "no foundry.toml"
+          echo "=== remappings.txt ==="
+          cat target/remappings.txt || echo "no remappings.txt"
+          echo "=== lib/ ==="
+          ls -la target/lib/ || echo "no lib/"
+          echo "=== dependencies/ ==="
+          ls -la target/dependencies/ || echo "no dependencies/ - will be created by forge install"
       - name: Install Foundry + Slither
         uses: foundry-rs/foundry-toolchain@v1
         with:
@@ -57,17 +93,33 @@ jobs:
         working-directory: target
         run: |
           set -euo pipefail
+          echo "=== Detecting libs folder from foundry.toml ==="
+          LIBS_LINE=$(grep -E '^\s*libs\s*=' foundry.toml || echo "")
+          echo "libs line: $LIBS_LINE"
+          # This repo uses dependencies/ not lib/ - forge install must respect that
+          # forge install reads foundry.toml libs, so plain forge install is enough
           forge install --no-commit || true
-          if [ ! -d "lib/forge-std" ]; then forge install --no-commit foundry-rs/forge-std || true; fi
-          if [ ! -d "lib/openzeppelin-contracts" ]; then forge install --no-commit OpenZeppelin/openzeppelin-contracts@v5.0.2 || true; fi
-          if [ ! -d "lib/openzeppelin-contracts-upgradeable" ]; then forge install --no-commit OpenZeppelin/openzeppelin-contracts-upgradeable@v5.0.2 || true; fi
-          if [ ! -d "lib/solmate" ]; then forge install --no-commit transmissions11/solmate || true; fi
-          ls -la lib/ || echo "lib still empty"
+          # Safety net: if BOTH lib/ and dependencies/ are empty, install standard deps
+          if [ ! -d "lib/forge-std" ] && [ ! -d "dependencies/forge-std" ] && [ ! -d "dependencies/forge-std-1.9.7" ]; then
+            echo "No forge-std found - installing standard deps"
+            forge install --no-commit foundry-rs/forge-std || true
+            forge install --no-commit OpenZeppelin/openzeppelin-contracts@v5.0.2 || true
+            forge install --no-commit OpenZeppelin/openzeppelin-contracts-upgradeable@v5.0.2 || true
+            forge install --no-commit transmissions11/solmate || true
+          fi
+          echo "=== after install: lib/ ==="
+          ls -la lib/ || echo "lib still empty (ok if using dependencies/)"
+          echo "=== after install: dependencies/ ==="
+          ls -la dependencies/ || echo "dependencies still empty (ok if using lib/)"
+          echo "=== forge build test ==="
+          forge build --skip test || echo "forge build failed - Slither per-file fallback in Python will handle it"
       - name: Copy Audit Script Into Target
         run: |
           set -euo pipefail
           cp auditor/.github/scripts/audit_pipeline.py target/audit_pipeline.py
           python3 -c "import ast; ast.parse(open('target/audit_pipeline.py').read()); print('py OK')"
+          grep -n "run_slither_per_file" target/audit_pipeline.py || echo "WARNING: per-file Slither NOT in python file - push new python first"
+          grep -n "CF_MODELS" target/audit_pipeline.py || echo "WARNING: CF_MODELS NOT in python file - push new python first"
       - name: Run Slither + LLM Audit
         working-directory: target
         env:
@@ -81,6 +133,8 @@ jobs:
           GONKA_KEY_2: ${{ secrets.GONKA_KEY_2 }}
           GONKA_KEY_3: ${{ secrets.GONKA_KEY_3 }}
           GONKA_BASE_URL: ${{ secrets.GONKA_BASE_URL }}
+          AUDIT_SINGLE_FILE: ${{ env.AUDIT_SINGLE_FILE }}
+          AUDIT_TARGET_PATH: ${{ env.AUDIT_TARGET_PATH }}
         run: |
           set -euo pipefail
           python3 -u audit_pipeline.py
