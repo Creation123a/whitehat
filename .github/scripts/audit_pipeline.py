@@ -62,15 +62,23 @@ def strip_comments(code):
     return "".join(out)
 
 def discover_solidity_files():
-    excluded_dirs = {"node_modules", "lib", "test", "tests", "mock", "mocks", "script", "scripts", "out", "cache", "broadcast", "artifacts", ".git", ".github"}
+    single = os.environ.get("AUDIT_SINGLE_FILE", "").strip()
+    if single and os.path.exists(single):
+        print("[INFO] Raw single-file mode: " + single, flush=True)
+        return [single]
+    target_path = os.environ.get("AUDIT_TARGET_PATH", "").strip()
+    base_glob = target_path.rstrip("/") + "/**/*.sol" if target_path else "**/*.sol"
+    excluded_dirs = {"node_modules", "lib", "dependencies", "test", "tests", "mock", "mocks", "script", "scripts", "out", "cache", "broadcast", "artifacts", ".git", ".github"}
     results = []
-    for f in glob.glob("**/*.sol", recursive=True):
+    for f in glob.glob(base_glob, recursive=True):
         if f.endswith((".t.sol", ".s.sol")):
             continue
         parts = f.replace("\\", "/").split("/")[:-1]
         if any(p in excluded_dirs for p in parts):
             continue
         if "/lib/" in "/" + f.replace("\\", "/") + "/":
+            continue
+        if "/dependencies/" in "/" + f.replace("\\", "/") + "/":
             continue
         results.append(f)
     return sorted(results)
@@ -85,55 +93,94 @@ def run_slither(root="."):
     output_json = "slither-report.json"
     if os.path.exists(output_json):
         os.remove(output_json)
+    print("[INFO] forge install in target ...", flush=True)
+    try:
+        subprocess.run(["forge", "install", "--no-commit"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180, check=False)
+    except Exception as e:
+        print("[WARN] forge install error: " + str(e), flush=True)
     print("[INFO] forge build --skip test ...", flush=True)
     try:
         fb = subprocess.run(["forge", "build", "--skip", "test"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180, check=False)
         print("[INFO] forge build exit: " + str(fb.returncode), flush=True)
         if fb.returncode != 0:
-            print("[WARN] forge build stderr: " + fb.stderr.decode("utf-8", "ignore")[:2000], flush=True)
+            print("[WARN] forge build stderr: " + fb.stderr.decode("utf-8", "ignore")[:1500], flush=True)
     except FileNotFoundError:
         print("[WARN] forge not found - install foundry-toolchain in YAML", flush=True)
     except Exception as e:
         print("[WARN] forge build error: " + str(e), flush=True)
     attempts = [
-        ["slither", root, "--json", output_json, "--filter-paths", "node_modules,lib", "--exclude-dependencies"],
-        ["slither", root, "--json", output_json, "--compile-force-framework", "solc", "--solc", "0.8.20", "--filter-paths", "node_modules,lib", "--exclude-dependencies"],
-        ["slither", root, "--json", output_json, "--compile-force-framework", "solc", "--solc-remaps", "@openzeppelin/=lib/openzeppelin-contracts/", "--filter-paths", "node_modules,lib"],
+        ["slither", root, "--json", output_json, "--filter-paths", "node_modules,lib,dependencies", "--exclude-dependencies"],
+        ["slither", root, "--json", output_json, "--compile-force-framework", "solc", "--solc", "0.8.20", "--filter-paths", "node_modules,lib,dependencies", "--exclude-dependencies"],
     ]
     for idx, cmd in enumerate(attempts, 1):
         if os.path.exists(output_json):
             os.remove(output_json)
-        print("[INFO] Slither attempt " + str(idx) + "/3", flush=True)
+        print("[INFO] Slither project attempt " + str(idx) + "/2", flush=True)
         try:
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=300)
             if os.path.exists(output_json):
                 break
-            print("[WARN] Slither attempt " + str(idx) + " exit=" + str(result.returncode) + " err=" + result.stderr.decode("utf-8", "ignore")[:1500], flush=True)
+            print("[WARN] Project Slither failed exit=" + str(result.returncode) + " err=" + result.stderr.decode("utf-8", "ignore")[:800], flush=True)
         except subprocess.TimeoutExpired:
-            print("[WARN] Slither attempt " + str(idx) + " timeout", flush=True)
+            print("[WARN] Slither project attempt " + str(idx) + " timeout", flush=True)
             continue
         except FileNotFoundError:
             print("[WARN] slither binary not found", flush=True)
             return None
-    if not os.path.exists(output_json):
-        print("[WARN] Slither produced no output after 3 attempts. Continuing LLM-only.", flush=True)
-        return None
-    try:
-        with open(output_json, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        print("[WARN] Could not parse Slither JSON: " + str(e), flush=True)
-        return None
-    finally:
+    if os.path.exists(output_json):
         try:
+            with open(output_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
             os.remove(output_json)
-        except OSError:
-            pass
-    if not data.get("success") or "results" not in data:
-        print("[WARN] Slither JSON invalid. success=" + str(data.get("success")), flush=True)
+            if data.get("success") and "results" in data:
+                print("[INFO] Slither project OK: " + str(len(data["results"].get("detectors", []))) + " detectors", flush=True)
+                return data["results"]
+        except Exception as e:
+            print("[WARN] Could not parse project Slither JSON: " + str(e), flush=True)
+    print("[INFO] Project Slither failed - falling back to per-file Slither", flush=True)
+    return run_slither_per_file()
+
+def run_slither_per_file():
+    all_detectors = []
+    files = discover_solidity_files()
+    remaps = []
+    for base in ("lib", "dependencies"):
+        if os.path.isdir(base):
+            for entry in os.listdir(base):
+                p = os.path.join(base, entry)
+                if os.path.isdir(p):
+                    clean_name = entry.split("-")[0]
+                    if clean_name.startswith("@"):
+                        remaps.append(clean_name + "/=" + p + "/")
+                    else:
+                        remaps.append(clean_name + "=" + p + "/")
+                        remaps.append("@" + clean_name + "/=" + p + "/")
+    print("[INFO] Per-file Slither: " + str(len(files)) + " files, remaps=" + str(remaps[:6]), flush=True)
+    for fp in files:
+        out = "slither-one.json"
+        if os.path.exists(out):
+            os.remove(out)
+        cmd = ["slither", fp, "--json", out, "--compile-force-framework", "solc", "--solc", "0.8.20", "--filter-paths", "node_modules,lib,dependencies", "--exclude-dependencies"]
+        for r in remaps:
+            cmd += ["--solc-remaps", r]
+        try:
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=120)
+        except Exception:
+            continue
+        if not os.path.exists(out):
+            continue
+        try:
+            with open(out, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            os.remove(out)
+            if data.get("success") and "results" in data:
+                all_detectors.extend(data["results"].get("detectors", []))
+        except Exception:
+            continue
+    print("[INFO] Per-file Slither done: " + str(len(all_detectors)) + " detectors", flush=True)
+    if not all_detectors:
         return None
-    print("[INFO] Slither OK: " + str(len(data["results"].get("detectors", []))) + " detectors", flush=True)
-    return data["results"]
+    return {"detectors": all_detectors}
 
 def findings_for_file(slither_results, filepath):
     if not slither_results:
@@ -160,8 +207,12 @@ for i in (1, 2, 3):
     if aid and tok:
         CF_ACCOUNTS.append({"id": aid, "token": tok, "exhausted": False, "label": "CF-" + str(i)})
 
-CF_PRIMARY = "@cf/google/gemma-4-26b-a4b-it"
-CF_FALLBACK = "@cf/meta/llama-4-scout-17b-16e-instruct"
+CF_MODELS = [
+    "@cf/qwen/qwen2.5-coder-32b-instruct",
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "@cf/google/gemma-3-12b-it",
+    "@cf/meta/llama-4-scout-17b-16e-instruct",
+]
 _cf_rr = 0
 _cf_lock = threading.Lock()
 
@@ -179,8 +230,7 @@ def cf_call(prompt_json_instruction, batch_text, max_tokens=1024):
         acct = CF_ACCOUNTS[idx]
         if acct["exhausted"]:
             continue
-        model = CF_PRIMARY
-        for model_try in (CF_PRIMARY, CF_FALLBACK):
+        for model in CF_MODELS:
             url = "https://api.cloudflare.com/client/v4/accounts/" + acct["id"] + "/ai/run/" + model
             payload = json.dumps({"messages": [{"role": "system", "content": "You output strict JSON only. No markdown, no explanation."}, {"role": "user", "content": prompt_json_instruction + "\n\n" + batch_text}], "max_tokens": max_tokens}).encode("utf-8")
             req = urllib.request.Request(url, data=payload, headers={"Authorization": "Bearer " + acct["token"], "Content-Type": "application/json"})
@@ -188,15 +238,14 @@ def cf_call(prompt_json_instruction, batch_text, max_tokens=1024):
                 with urllib.request.urlopen(req, timeout=120) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 if not data.get("success"):
-                    print("[WARN] " + acct["label"] + " CF error: " + str(data.get("errors"))[:500], flush=True)
+                    print("[WARN] " + acct["label"] + " " + model + " CF error: " + str(data.get("errors"))[:400], flush=True)
                     continue
                 content = ((data.get("result") or {}).get("response") or "").strip()
                 if not content:
                     continue
                 content = content.replace(FENCE + "json", "").replace(FENCE, "").strip()
                 try:
-                    parsed = json.loads(content)
-                    return parsed
+                    return json.loads(content)
                 except Exception:
                     m = re.search(r"\{.*\}", content, re.DOTALL)
                     if m:
@@ -204,15 +253,18 @@ def cf_call(prompt_json_instruction, batch_text, max_tokens=1024):
                             return json.loads(m.group(0))
                         except Exception:
                             pass
-                    print("[WARN] " + acct["label"] + " CF returned non-JSON, trying fallback model", flush=True)
+                    print("[WARN] " + acct["label"] + " " + model + " non-JSON, trying next model", flush=True)
                     continue
             except urllib.error.HTTPError as e:
                 body = ""
                 try:
-                    body = e.read().decode("utf-8", "ignore")[:500]
+                    body = e.read().decode("utf-8", "ignore")[:400]
                 except Exception:
                     pass
-                print("[WARN] " + acct["label"] + " CF HTTP " + str(e.code) + " " + body, flush=True)
+                print("[WARN] " + acct["label"] + " " + model + " HTTP " + str(e.code) + " " + body, flush=True)
+                if e.code == 404:
+                    print("[INFO] Model " + model + " not found on CF - trying next model", flush=True)
+                    continue
                 if e.code == 429:
                     acct["exhausted"] = True
                     print("[INFO] " + acct["label"] + " marked exhausted (429 Neuron limit)", flush=True)
@@ -222,7 +274,7 @@ def cf_call(prompt_json_instruction, batch_text, max_tokens=1024):
                     break
                 continue
             except Exception as e:
-                print("[WARN] " + acct["label"] + " CF exception: " + repr(e), flush=True)
+                print("[WARN] " + acct["label"] + " " + model + " exception: " + repr(e), flush=True)
                 continue
     return None
 
@@ -270,6 +322,11 @@ def gonka_call(prompt, max_tokens=4000):
                     with _gonka_lock:
                         _gonka_exhausted.add(pair)
                     continue
+                if "404" in msg or "not found" in msg.lower() or "model" in msg.lower():
+                    with _gonka_lock:
+                        _gonka_exhausted.add(pair)
+                    print("[INFO] Model not found on Gonka, trying next model: " + model, flush=True)
+                    break
                 time.sleep(3)
                 continue
     return "**[ERROR]** All Gonka (model, key) pairs exhausted. Last: " + last_err
@@ -349,7 +406,7 @@ def main():
     print("[INFO] Stage1 HIGH files: " + str(len(critical)) + " -> " + ", ".join(critical.keys()), flush=True)
     if not critical:
         with open("audit-report.md", "w", encoding="utf-8") as f:
-            f.write("# Cross-Chain Bridge Security Audit Report\n\n## Part 1: Triage\n\nNo HIGH risk files flagged by Stage 1 (Cloudflare Gemma-4-26B).\n\nAudited files: " + str(len(files_with_code)) + "\n\n## Part 2: Slither Summary\n\n")
+            f.write("# Cross-Chain Bridge Security Audit Report\n\n## Part 1: Triage\n\nNo HIGH risk files flagged by Stage 1 (Cloudflare Workers AI).\n\nAudited files: " + str(len(files_with_code)) + "\n\n## Part 2: Slither Summary\n\n")
             for fp in files:
                 f.write("### " + fp + "\nSlither findings: " + str(len(slither_map.get(fp, []))) + "\n\n")
         print("[INFO] Done - no HIGH files, no Stage2 needed", flush=True)
