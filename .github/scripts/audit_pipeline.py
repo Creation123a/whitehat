@@ -11,15 +11,15 @@ import socket
 
 FENCE = chr(96) * 3
 
-MAX_CODE_CHARS = 60000
+MAX_CODE_CHARS = 50000
 MAX_REDUCE_BATCH_CHARS = 150000
 
-MAP_BUDGET_SECONDS = 40 * 60
-REDUCE_BUDGET_SECONDS = 8 * 60
+MAP_BUDGET_SECONDS = 70 * 60
+REDUCE_BUDGET_SECONDS = 10 * 60
 
 _zai_lock = threading.Lock()
 _zai_last_call = 0.0
-ZAI_MIN_INTERVAL = 1.2
+ZAI_MIN_INTERVAL = 1.5
 
 _mistral_lock = threading.Lock()
 _mistral_last_call = 0.0
@@ -49,10 +49,10 @@ PROVIDERS = [
         "url": "https://api.z.ai/api/paas/v4/chat/completions",
         "key_env": "ZAI_API_KEY",
         "rate_limit_fn": _zai_wait,
-        "max_retries_per_model": 2,
-        "backoff_seconds": 3.0,
-        "timeout": 120,
-        "models": ["glm-4.7-flash", "glm-4.5-flash"],
+        "max_retries_per_model": 3,
+        "backoff_seconds": 5.0,
+        "timeout": 150,
+        "models": ["glm-4.7-flash"],
         "model_options": {},
     },
     {
@@ -63,12 +63,12 @@ PROVIDERS = [
         "max_retries_per_model": 1,
         "backoff_seconds": 2.0,
         "timeout": 90,
-        "models": ["codestral-latest", "mistral-small-latest"],
+        "models": ["mistral-small-latest"],
         "model_options": {},
     },
 ]
 
-def call_llm(prompt, max_tokens=3000):
+def call_llm(prompt, max_tokens=3500):
     last_error = "no provider configured with an API key"
     for provider in PROVIDERS:
         api_key = os.environ.get(provider["key_env"], "").strip()
@@ -116,7 +116,7 @@ def call_llm(prompt, max_tokens=3000):
                 except urllib.error.HTTPError as e:
                     body = ""
                     try:
-                        body = e.read().decode("utf-8", "ignore")[:300]
+                        body = e.read().decode("utf-8", "ignore")[:400]
                     except Exception:
                         pass
                     last_error = provider["name"] + "/" + model + ": HTTP " + str(e.code) + " " + body
@@ -128,24 +128,16 @@ def call_llm(prompt, max_tokens=3000):
                         print("[WARN] " + last_error + " - retry " + str(attempt) + "/" + str(max_retries) + " in " + str(round(wait, 1)) + "s", flush=True)
                         time.sleep(wait)
                         continue
-                    print("[WARN] " + last_error + " - trying next model...", flush=True)
+                    print("[WARN] " + last_error + " - trying next model/provider...", flush=True)
                     break
                 except (TimeoutError, socket.timeout):
                     last_error = provider["name"] + "/" + model + ": timeout after " + str(timeout) + "s"
-                    print("[WARN] " + last_error + " - trying next model...", flush=True)
-                    break
-                except urllib.error.URLError as e:
-                    if isinstance(getattr(e, "reason", None), (TimeoutError, socket.timeout)):
-                        last_error = provider["name"] + "/" + model + ": timeout after " + str(timeout) + "s"
-                        print("[WARN] " + last_error + " - trying next model...", flush=True)
-                        break
-                    last_error = provider["name"] + "/" + model + ": " + repr(e)
                     if attempt < max_retries:
                         wait = backoff * (2 ** (attempt - 1))
                         print("[WARN] " + last_error + " - retry " + str(attempt) + "/" + str(max_retries) + " in " + str(round(wait, 1)) + "s", flush=True)
                         time.sleep(wait)
                         continue
-                    print("[WARN] " + last_error + " - trying next model...", flush=True)
+                    print("[WARN] " + last_error + " - trying next provider...", flush=True)
                     break
                 except Exception as e:
                     last_error = provider["name"] + "/" + model + ": " + repr(e)
@@ -154,7 +146,7 @@ def call_llm(prompt, max_tokens=3000):
                         print("[WARN] " + last_error + " - retry " + str(attempt) + "/" + str(max_retries) + " in " + str(round(wait, 1)) + "s", flush=True)
                         time.sleep(wait)
                         continue
-                    print("[WARN] " + last_error + " - trying next model...", flush=True)
+                    print("[WARN] " + last_error + " - trying next provider...", flush=True)
                     break
     return "**[ERROR]** All configured LLM endpoints failed. Last error: " + last_error
 
@@ -202,22 +194,26 @@ def run_slither(root="."):
     output_json = "slither-report.json"
     if os.path.exists(output_json):
         os.remove(output_json)
+    print("[INFO] Trying forge build first to generate compilation artifacts...", flush=True)
     try:
-        subprocess.run(
-            ["slither", root, "--json", output_json],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=300,
-        )
+        subprocess.run(["forge", "build"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False)
+    except Exception:
+        pass
+    slither_cmd = ["slither", root, "--json", output_json, "--filter-paths", "node_modules,lib", "--exclude-dependencies"]
+    print("[INFO] Running: " + " ".join(slither_cmd), flush=True)
+    try:
+        result = subprocess.run(slither_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=300)
+        stderr = result.stderr.decode("utf-8", "ignore")[:2000] if result.stderr else ""
+        if result.returncode != 0 and not os.path.exists(output_json):
+            print("[WARN] Slither exit code " + str(result.returncode) + " stderr: " + stderr, flush=True)
     except subprocess.TimeoutExpired:
         print("[WARN] Slither timed out after 300s - skipping static analysis.", flush=True)
         return None
     except FileNotFoundError:
-        print("[WARN] `slither` binary not found on PATH.", flush=True)
+        print("[WARN] slither binary not found on PATH.", flush=True)
         return None
     if not os.path.exists(output_json):
-        print("[WARN] Slither produced no output file (project build likely failed).", flush=True)
+        print("[WARN] Slither produced no output file. Build likely failed. Check forge build output.", flush=True)
         return None
     try:
         with open(output_json, "r", encoding="utf-8") as f:
@@ -231,8 +227,9 @@ def run_slither(root="."):
         except OSError:
             pass
     if not data.get("success") or "results" not in data:
-        print("[WARN] Slither JSON missing a valid 'results' block.", flush=True)
+        print("[WARN] Slither JSON missing valid results block. Success flag: " + str(data.get("success")), flush=True)
         return None
+    print("[INFO] Slither succeeded with " + str(len(data["results"].get("detectors", []))) + " detectors", flush=True)
     return data["results"]
 
 def _norm_path(p):
@@ -291,8 +288,9 @@ def is_critical_file(slither_findings, llm_report):
             return True
     if not llm_report:
         return False
-    if "No confirmed findings." in llm_report:
-        return False
+    if "No confirmed findings." in llm_report and "Suspected but Unverified" not in llm_report:
+        if re.search(r"Severity:\s*(Critical|High|Medium)", llm_report, re.IGNORECASE) is None:
+            return False
     if re.search(r"Severity:\s*(Critical|High|Medium)", llm_report, re.IGNORECASE):
         return True
     if re.search(r"Confirmed:\s*[1-9]", llm_report):
@@ -313,14 +311,14 @@ def chunked_reduce(reports, batch_size=8, deadline=None):
         if len(joined) > MAX_REDUCE_BATCH_CHARS:
             joined = joined[:MAX_REDUCE_BATCH_CHARS] + "\n\n...[batch truncated for context budget]..."
         batch_prompt = "Synthesise cross-contract findings from these file audits only. Precision over recall; drop anything unproven.\n\n" + joined + "\n"
-        batch_summaries.append(call_llm(batch_prompt, max_tokens=2000))
+        batch_summaries.append(call_llm(batch_prompt, max_tokens=2500))
     if not batch_summaries:
         return "**[REDUCE SKIPPED - budget exhausted before any batch ran]** See Part 2 for the individual audits."
     if deadline and time.time() > deadline:
         print("[WARN] Final reduce synthesis skipped - budget exceeded", flush=True)
         return "**[PARTIAL REDUCE - budget exceeded after batch summaries]**\n\nBatch summaries:\n\n" + "\n\n---\n\n".join(batch_summaries)
     final_prompt = "You are the Lead Auditor producing the FINAL cross-contract report - the only thing the client sees. Precision over recall.\n\nYou are given batch summaries of per-file audits. Each finding is tagged Confirmed or Suspected (unverified). You may ONLY escalate a finding if:\n(a) it is tagged Confirmed, OR\n(b) it is tagged Suspected AND you can name the exact counterparty file that supplies the missing evidence, and that file appears in the batch summaries below.\n\nRules:\n- DROP any finding that is generic, unproven, or not grounded in quoted code. If in doubt, drop it.\n- DEDUPLICATE: same root cause across files -> one entry listing all locations.\n- Do NOT invent new vulnerabilities. Synthesis and filtering only.\n- Weight severity by real impact: fund loss > permanent lock > DoS > griefing > informational.\n\nOutput:\n\n### Executive Summary\n3-6 sentences. Overall risk posture. State how many confirmed issues by severity, and whether the codebase looks mature or early-stage.\n\n### Confirmed Cross-Contract / Cross-Chain Issues\nPer issue: Severity; Confidence; Components (`fileA:line` <-> `fileB:line`); Evidence (quoted from per-file findings); Attack path across contracts; Fix.\nIf none: `No confirmed cross-contract issues were substantiated by the per-file reviews.`\n\n### Per-File Findings Worth Elevating (confirmed only, deduplicated)\nTable: `file:line | severity | one-line issue`\n\n### Coverage Gaps\nFiles not fully reviewed (truncated, read error, Slither build failure) and what was not checked.\n\n### Prioritized Remediation\nOrdered list, highest risk first.\n\nBatch summaries:\n" + chr(10).join(batch_summaries) + "\n"
-    return call_llm(final_prompt, max_tokens=4000)
+    return call_llm(final_prompt, max_tokens=4500)
 
 def main():
     START_TIME = time.time()
@@ -332,16 +330,23 @@ def main():
         with open("final-audit-report.md", "w", encoding="utf-8") as f:
             f.write("# Cross-Chain Bridge Security Audit Report\n\nNo Solidity files found to audit.\n")
         return
-    print("[INFO] Running Slither on project root (all files, including deps for call-graph)...", flush=True)
+    print("[INFO] Running Slither on project root...", flush=True)
     slither_results = run_slither(".")
     slither_ok = slither_results is not None
     per_file_reports = []
+    audited_reports = []
     critical_reports = []
     skipped_files = []
+    slither_findings_map = {}
+    if slither_ok:
+        for fp in sol_files:
+            slither_findings_map[fp] = findings_for_file(slither_results, fp)
     for filepath in sol_files:
         if time.time() > MAP_DEADLINE:
-            per_file_reports.append("## File: `" + filepath + "`\n\n**[SKIPPED - runtime budget exceeded]** This file was not audited because the pipeline hit its " + str(MAP_BUDGET_SECONDS // 60) + "-minute map-phase cap. Re-run with a smaller file subset to cover it.")
+            msg = "## File: `" + filepath + "`\n\n**[SKIPPED - runtime budget exceeded]** This file was not audited because the pipeline hit its " + str(MAP_BUDGET_SECONDS // 60) + "-minute map-phase cap."
+            per_file_reports.append(msg)
             skipped_files.append(filepath)
+            print("[MAP] SKIPPED " + filepath + " - budget exceeded", flush=True)
             continue
         print("[MAP] Auditing " + filepath + " ...", flush=True)
         try:
@@ -354,27 +359,30 @@ def main():
         if len(clean_code) > MAX_CODE_CHARS:
             clean_code = clean_code[:MAX_CODE_CHARS] + "\n// ...[TRUNCATED: file too large for LLM context]..."
         if slither_ok:
-            slither_findings = findings_for_file(slither_results, filepath)
+            slither_findings = slither_findings_map.get(filepath, [])
             slither_findings_str = json.dumps(slither_findings, indent=2)
         else:
             slither_findings = []
-            slither_findings_str = "Slither did not produce output (project build may have failed). Perform the audit from code review only."
+            slither_findings_str = "Slither did not produce output (project build may have failed). Perform the audit from code review only. Check logs above for Slither error."
         file_prompt = "You are a senior smart contract security auditor. Precision over recall: reporting zero issues is a correct outcome; a speculative finding is a defect in your work. Every finding is re-checked by a lead auditor and a human.\n\nYou are reviewing ONE file: `" + filepath + "`.\n\n## Evidence rules (non-negotiable)\n- Every finding MUST include: exact line number(s), a verbatim quote (1-8 lines) of the relevant code, and a concrete attack path (precondition -> call sequence -> impact).\n- If you cannot quote the buggy code, DO NOT report the bug.\n- Do NOT infer behavior from function names, comments, or NatSpec. Only from visible code.\n- If the source is marked [TRUNCATED], do not speculate about the missing portion; say so.\n- Reporting ZERO issues for a file is valid and expected. Do not manufacture findings.\n\n## Required output (exact structure)\n\n### A. File Summary (max 120 words)\nContract role; trust model (who is trusted to do what); external entrypoints; cross-chain/external calls.\n\n### B. Slither Triage\nFor EACH Slither finding, one row: `[TP]` / `[FP]` / `[INCONCLUSIVE]`, check name + line, one-sentence justification citing code. End with: `Confirmed: N. Dismissed: M.`\n\n### C. Independent Review - Confirmed Findings\nPer finding:\n- Severity: Critical / High / Medium / Low / Informational\n- Confidence: High / Medium\n- Location: `" + filepath + ":<line>`\n- Evidence:\n" + FENCE + "solidity\n<verbatim quoted lines>\n" + FENCE + "\n- Issue: one sentence.\n- Attack path: precondition -> calls -> impact.\n- Fix: concrete change.\nIf none, write exactly: `No confirmed findings.`\n\n### D. Suspected but Unverified\nIssues you cannot prove from this file alone. Same fields as C, plus **Missing evidence:** what you would need to confirm. These are NOT escalated unless corroborated.\n\n### E. Explicit Non-Issues\nList 2-5 things that LOOK suspicious but are actually safe, with the reason (cite the guard/ordering that makes them safe).\n\n## Focus areas (verify each; state exposed / not exposed with the code that proves it)\n- Source chain / source sender / endpoint authentication on inbound messages\n- Replay protection (nonce, message hash, consumed flag)\n- Mint/burn accounting vs lock/unlock invariants\n- Access control on privileged ops (mint, pause, upgrade, peer registration)\n- Reentrancy on external calls that mutate state\n- Rounding / decimal handling\n- Unchecked return values on token transfers\n\nFile: `" + filepath + "`\n\nSlither Output:\n" + FENCE + "json\n" + slither_findings_str + "\n" + FENCE + "\n\nSolidity Code:\n" + FENCE + "solidity\n" + clean_code + "\n" + FENCE + "\n"
-        llm_response = call_llm(file_prompt, max_tokens=3000)
+        llm_response = call_llm(file_prompt, max_tokens=3500)
         full_report = "## File: `" + filepath + "`\n\n" + llm_response
         per_file_reports.append(full_report)
+        audited_reports.append(full_report)
         if is_critical_file(slither_findings, llm_response):
             critical_reports.append(full_report)
             print("[MAP] " + filepath + " -> CRITICAL, will go to Reduce", flush=True)
         else:
             print("[MAP] " + filepath + " -> clean / low, skipped from Reduce", flush=True)
     combined_file_reports = "\n\n---\n\n".join(per_file_reports)
-    print("[REDUCE] Running cross-file analysis on " + str(len(critical_reports)) + "/" + str(len(per_file_reports)) + " critical files only...", flush=True)
+    print("[REDUCE] Running cross-file analysis: " + str(len(audited_reports)) + " audited, " + str(len(skipped_files)) + " skipped, " + str(len(critical_reports)) + " critical", flush=True)
     if time.time() > REDUCE_DEADLINE:
         print("[WARN] Reduce budget exceeded - writing map-only report.", flush=True)
-        cross_file_report = "**[REDUCE SKIPPED - runtime budget exceeded]** The per-file audits below were produced successfully, but the cross-file synthesis step did not run because the map phase consumed the time budget. See Part 2 for the individual audits."
+        cross_file_report = "**[REDUCE SKIPPED - runtime budget exceeded]** The per-file audits below were produced successfully, but the cross-file synthesis did not run because the map phase consumed the time budget. Audited: " + str(len(audited_reports)) + ", Skipped: " + str(len(skipped_files)) + "."
+    elif not audited_reports:
+        cross_file_report = "No files were successfully audited. All " + str(len(sol_files)) + " files were skipped due to time budget. Re-run with smaller subset or higher MAP_BUDGET_SECONDS."
     elif not critical_reports:
-        cross_file_report = "No confirmed cross-contract issues were substantiated by the per-file reviews.\n\nAll " + str(len(per_file_reports)) + " filtered files were audited in Map phase. None met the Critical threshold (Slither High/Critical OR LLM Confirmed Critical/High/Medium) to escalate to Reduce phase."
+        cross_file_report = "No confirmed cross-contract issues were substantiated by the per-file reviews.\n\nAll " + str(len(audited_reports)) + " files audited in Map phase. " + str(len(skipped_files)) + " files skipped due to time cap. None met the Critical threshold (Slither High/Critical OR LLM Confirmed Critical/High/Medium) to escalate to Reduce phase.\n\nSkipped files: " + ", ".join(skipped_files[:10]) + ("..." if len(skipped_files) > 10 else "")
     else:
         cross_file_report = chunked_reduce(critical_reports, batch_size=8, deadline=REDUCE_DEADLINE)
     with open("final-audit-report.md", "w", encoding="utf-8") as f:
@@ -382,10 +390,15 @@ def main():
         f.write("## Part 1: Cross-Contract & Cross-Chain Security Analysis\n\n")
         f.write(cross_file_report)
         f.write("\n\n---\n\n")
-        f.write("## Part 2: Individual File Audits\n\n")
+        f.write("## Part 2: Individual File Audits (" + str(len(audited_reports)) + " audited, " + str(len(skipped_files)) + " skipped)\n\n")
+        if skipped_files:
+            f.write("### Skipped Files (not audited due to time cap):\n")
+            for sf in skipped_files:
+                f.write("- `" + sf + "`\n")
+            f.write("\n---\n\n")
         f.write(combined_file_reports)
     elapsed = int(time.time() - START_TIME)
-    print("[INFO] Audit complete in " + str(elapsed) + "s. Map=" + str(len(per_file_reports)) + " files, Reduce=" + str(len(critical_reports)) + " critical files. Output written to final-audit-report.md", flush=True)
+    print("[INFO] Audit complete in " + str(elapsed) + "s. Map=" + str(len(audited_reports)) + " audited, " + str(len(skipped_files)) + " skipped, Reduce=" + str(len(critical_reports)) + " critical. Output written to final-audit-report.md", flush=True)
 
 if __name__ == "__main__":
     main()
