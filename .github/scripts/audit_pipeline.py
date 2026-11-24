@@ -366,7 +366,7 @@ def stage1_triage(files_with_code, slither_map):
     for bi, batch in enumerate(batches, 1):
         print("[STAGE1] Batch " + str(bi) + "/" + str(len(batches)), flush=True)
         batch_text = "\n".join(batch)
-        instr = "You are a Solidity triage auditor. Return STRICT JSON only: {\"critical_files\": [{\"path\": \"...\", \"reason\": \"...\"}]}. Include ONLY files with probable HIGH severity: fund loss, unauthorized mint/burn, broken access control on privileged ops, reentrancy with state mutation, missing authentication on cross-chain inbound, replayable mint, broken accounting. If a file is Low/Info or clean, EXCLUDE it. If none, return {\"critical_files\": []}. Do NOT invent. Base only on quoted code + Slither."
+        instr = "You are a Solidity triage auditor for a CROSS-CHAIN BRIDGE. Return STRICT JSON only: {\"critical_files\": [{\"path\": \"...\", \"reason\": \"...\"}]}. Include ANY file that handles: cross-chain messages, mint/burn, lock/unlock, adapter allowlist, sender/source-chain auth, replay nonce, swap, withdraw, privileged admin, delegatecall, proxy. If a file touches funds, auth, or cross-chain state, INCLUDE it even if you are only 30% sure. Missing a bug is worse than flagging a clean file. If a file is pure interface, pure math lib, pure Ownable, EXCLUDE it. If none, return {\"critical_files\": []}. Do NOT invent. Base only on quoted code + Slither."
         parsed = cf_call(instr, batch_text, max_tokens=STAGE1_MAX_TOKENS)
         if not parsed:
             print("[WARN] Stage1 batch " + str(bi) + " returned no result - treating as no HIGH files", flush=True)
@@ -376,13 +376,21 @@ def stage1_triage(files_with_code, slither_map):
             if p and p not in critical:
                 critical[p] = item.get("reason", "")
     if not critical:
-        print("[WARN] Stage1 CF returned 0 - falling back to Slither-only triage", flush=True)
+        print("[WARN] Stage1 CF returned 0 - falling back to BRIDGE keyword triage", flush=True)
+        KEYWORDS = ["mint", "burn", "bridge", "adapter", "cross", "chain", "relay", "message", "nonce", "lock", "unlock", "swap", "withdraw", "deposit", "transfer", "allowlist", "auth", "sender", "source"]
         for fp, code in files_with_code:
+            low = fp.lower()
             sl = slither_map.get(fp, [])
-            has_high = any((s.get("severity", "") or "").lower() in ("high", "medium") for s in sl)
-            if has_high:
-                critical[fp] = "Slither HIGH/MEDIUM (CF unavailable, fallback)"
-        print("[INFO] Slither fallback HIGH files: " + str(len(critical)), flush=True)
+            has_any_slither = len(sl) > 0
+            has_keyword = any(k in low for k in KEYWORDS) or any(k in code.lower()[:5000] for k in ["mint(", "burn(", "bridge", "adapter"])
+            if has_any_slither or has_keyword:
+                critical[fp] = "Bridge fallback: Slither findings or bridge/funds keyword (CF returned 0)"
+        if not critical:
+            print("[WARN] Bridge fallback still 0 - forcing top 5 largest files", flush=True)
+            sorted_files = sorted(files_with_code, key=lambda x: len(x[1]), reverse=True)[:5]
+            for fp, code in sorted_files:
+                critical[fp] = "Forced top-5 largest file (CF + Slither both returned 0, bridge cannot be clean)"
+        print("[INFO] Bridge fallback HIGH files: " + str(len(critical)), flush=True)
     return critical
 
 def stage2_deep_audit(filepath, code, slither_findings, all_files_map):
