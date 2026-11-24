@@ -1,147 +1,199 @@
-name: Slither + LLM Map-Reduce Audit
+name: Audit Any Repo - Paste Name, It Clones + Audits
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "current_repo or external_github_repo or raw_solidity"
+      target_repo:
+        description: "Paste repo like: Morpho-Organization/morpho-blue"
+        required: true
+        default: "Creation123a/whitehat"
+      target_branch:
+        description: "Branch"
         required: false
-        default: "current_repo"
-        type: choice
-        options: [current_repo, external_github_repo, raw_solidity]
-      external_repo_url:
-        description: "External repo URL if mode=external_github_repo"
-        required: false
-        default: ""
-        type: string
-      raw_solidity:
-        description: "Paste raw Solidity code here if mode=raw_solidity (single file audit)"
-        required: false
-        default: ""
-        type: string
-      target_path:
-        description: "Optional sub-path to audit inside repo, e.g. src/contracts. Leave empty = whole repo"
-        required: false
-        default: ""
-        type: string
+        default: "main"
+
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
-  audit:
+  audit-any:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 45
     steps:
-      - name: Checkout Auditor Repo
+      # 1. CLONE
+      - name: Clone target repo
         uses: actions/checkout@v4
         with:
-          path: auditor
-          submodules: recursive
-          fetch-depth: 1
-      - name: Setup Target Workspace
-        env:
-          MODE: ${{ inputs.mode }}
-          EXTERNAL_REPO_URL: ${{ inputs.external_repo_url }}
-          RAW_SOLIDITY: ${{ inputs.raw_solidity }}
-          TARGET_PATH: ${{ inputs.target_path }}
-        run: |
-          set -euo pipefail
-          mkdir -p target
-          if [ "$MODE" = "raw_solidity" ]; then
-            echo "Mode: raw_solidity - creating single-file target"
-            mkdir -p target/src
-            printf '%s' "$RAW_SOLIDITY" > target/src/RawAudit.sol
-            # Minimal foundry.toml so forge/slither can compile single file
-            if [ ! -f target/foundry.toml ]; then
-              printf '[profile.default]\nsrc = "src"\nout = "out"\nlibs = ["lib", "dependencies"]\n' > target/foundry.toml
-            fi
-            echo "AUDIT_SINGLE_FILE=src/RawAudit.sol" >> $GITHUB_ENV
-          elif [ "$MODE" = "external_github_repo" ]; then
-            if [ -z "$EXTERNAL_REPO_URL" ]; then
-              echo "::error::external_repo_url is required for mode=external_github_repo"
-              exit 1
-            fi
-            git clone --depth 1 --recurse-submodules "$EXTERNAL_REPO_URL" target
-            rm -rf target/.git
-          else
-            cp -a auditor/. target/
-            rm -rf target/.git
-          fi
-          if [ -n "$TARGET_PATH" ]; then
-            echo "AUDIT_TARGET_PATH=$TARGET_PATH" >> $GITHUB_ENV
-          fi
-          echo "=== target/ ==="
-          ls -la target/ | head -30
-          echo "=== foundry.toml ==="
-          cat target/foundry.toml || echo "no foundry.toml"
-          echo "=== remappings.txt ==="
-          cat target/remappings.txt || echo "no remappings.txt"
-          echo "=== lib/ ==="
-          ls -la target/lib/ || echo "no lib/"
-          echo "=== dependencies/ ==="
-          ls -la target/dependencies/ || echo "no dependencies/ - will be created by forge install"
-      - name: Install Foundry + Slither
-        uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: stable
-      - name: Install Python Deps
-        run: |
-          set -euo pipefail
-          python3 -m pip install --upgrade pip
-          pip3 install slither-analyzer solc-select openai
-          solc-select install 0.8.20 || true
-          solc-select use 0.8.20 || true
-          forge --version
-          slither --version || true
-      - name: Install Foundry Dependencies in Target
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ inputs.target_branch }}
+          path: target
+          token: ${{ secrets.GH_PAT }} # Only for private repos, leave empty for public
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      # 2. STATIC - Slither
+      - name: Slither
         working-directory: target
         run: |
-          set -euo pipefail
-          echo "=== Detecting libs folder from foundry.toml ==="
-          LIBS_LINE=$(grep -E '^\s*libs\s*=' foundry.toml || echo "")
-          echo "libs line: $LIBS_LINE"
-          # This repo uses dependencies/ not lib/ - forge install must respect that
-          # forge install reads foundry.toml libs, so plain forge install is enough
-          forge install --no-commit || true
-          # Safety net: if BOTH lib/ and dependencies/ are empty, install standard deps
-          if [ ! -d "lib/forge-std" ] && [ ! -d "dependencies/forge-std" ] && [ ! -d "dependencies/forge-std-1.9.7" ]; then
-            echo "No forge-std found - installing standard deps"
-            forge install --no-commit foundry-rs/forge-std || true
-            forge install --no-commit OpenZeppelin/openzeppelin-contracts@v5.0.2 || true
-            forge install --no-commit OpenZeppelin/openzeppelin-contracts-upgradeable@v5.0.2 || true
-            forge install --no-commit transmissions11/solmate || true
-          fi
-          echo "=== after install: lib/ ==="
-          ls -la lib/ || echo "lib still empty (ok if using dependencies/)"
-          echo "=== after install: dependencies/ ==="
-          ls -la dependencies/ || echo "dependencies still empty (ok if using lib/)"
-          echo "=== forge build test ==="
-          forge build --skip test || echo "forge build failed - Slither per-file fallback in Python will handle it"
-      - name: Copy Audit Script Into Target
-        run: |
-          set -euo pipefail
-          cp auditor/.github/scripts/audit_pipeline.py target/audit_pipeline.py
-          python3 -c "import ast; ast.parse(open('target/audit_pipeline.py').read()); print('py OK')"
-          grep -n "run_slither_per_file" target/audit_pipeline.py || echo "WARNING: per-file Slither NOT in python file - push new python first"
-          grep -n "CF_MODELS" target/audit_pipeline.py || echo "WARNING: CF_MODELS NOT in python file - push new python first"
-      - name: Run Slither + LLM Audit
+          pip install slither-analyzer
+          slither . --json ../slither.json || true
+
+      # 3. STATIC - Semgrep
+      - name: Semgrep
         working-directory: target
-        env:
-          CF_ACCOUNT_ID_1: ${{ secrets.CF_ACCOUNT_ID_1 }}
-          CF_API_TOKEN_1: ${{ secrets.CF_API_TOKEN_1 }}
-          CF_ACCOUNT_ID_2: ${{ secrets.CF_ACCOUNT_ID_2 }}
-          CF_API_TOKEN_2: ${{ secrets.CF_API_TOKEN_2 }}
-          CF_ACCOUNT_ID_3: ${{ secrets.CF_ACCOUNT_ID_3 }}
-          CF_API_TOKEN_3: ${{ secrets.CF_API_TOKEN_3 }}
-          GONKA_KEY_1: ${{ secrets.GONKA_KEY_1 }}
-          GONKA_KEY_2: ${{ secrets.GONKA_KEY_2 }}
-          GONKA_KEY_3: ${{ secrets.GONKA_KEY_3 }}
-          GONKA_BASE_URL: ${{ secrets.GONKA_BASE_URL }}
-          AUDIT_SINGLE_FILE: ${{ env.AUDIT_SINGLE_FILE }}
-          AUDIT_TARGET_PATH: ${{ env.AUDIT_TARGET_PATH }}
         run: |
-          set -euo pipefail
-          python3 -u audit_pipeline.py
-      - name: Upload Audit Report
-        if: always()
+          pip install semgrep
+          semgrep --config p/solidity --config p/smart-contracts --sarif --output ../semgrep.sarif . || true
+
+      # 4. STATIC - Wake (Aderyn replacement)
+      - name: Wake Detect
+        working-directory: target
+        run: |
+          pip install eth-wake
+          wake detect all --output ../wake-report.json || true
+
+      # 5. SYMBOLIC - Halmos
+      - name: Halmos Symbolic
+        working-directory: target
+        run: |
+          pip install halmos
+          halmos --function check_ --loop 5 > ../halmos.log 2>&1 || true
+          cat ../halmos.log || true
+
+      # 6. SYMBOLIC - Mythril (only 2 biggest files, slow)
+      - name: Mythril Critical Files Only
+        working-directory: target
+        run: |
+          pip install mythril
+          : > ../mythril.log
+          for f in $(find src contracts -name "*.sol" 2>/dev/null | head -2); do
+            echo "=== Mythril $f ===" >> ../mythril.log
+            timeout 300 myth analyze "$f" --execution-timeout 280 --max-depth 30 >> ../mythril.log 2>&1 || true
+          done
+          cat ../mythril.log || true
+
+      # 7. AUTO-TRIAGE - Counts HIGHs, prints DEEP-DIVE or SKIP
+      - name: Auto-Triage
+        run: |
+          python3 - << 'PY'
+          import json, os, re
+
+          slither_high = slither_med = 0
+          semgrep_high = semgrep_med = 0
+          wake_high = 0
+          halmos_fail = False
+          mythril_high = False
+
+          # Slither - slither.json -> detectors[].impact
+          if os.path.exists("slither.json"):
+              try:
+                  d = json.load(open("slither.json"))
+                  dets = d.get("results", {}).get("detectors", []) if isinstance(d, dict) else []
+                  # slither-action format can also be {"success":..., "results":...}
+                  if not dets and isinstance(d, dict):
+                      dets = d.get("detectors", [])
+                  for x in dets:
+                      imp = str(x.get("impact", "")).lower()
+                      if imp == "high":
+                          slither_high += 1
+                      elif imp == "medium":
+                          slither_med += 1
+              except Exception as e:
+                  print(f"Slither parse error: {e}")
+
+          # Semgrep - semgrep.sarif -> runs[].results[].level
+          if os.path.exists("semgrep.sarif"):
+              try:
+                  d = json.load(open("semgrep.sarif"))
+                  for run in d.get("runs", []):
+                      for r in run.get("results", []):
+                          lvl = str(r.get("level", "")).lower()
+                          if lvl == "error":
+                              semgrep_high += 1
+                          elif lvl == "warning":
+                              semgrep_med += 1
+              except Exception as e:
+                  print(f"Semgrep parse error: {e}")
+
+          # Wake - wake-report.json - format varies, count HIGH / high severity strings
+          if os.path.exists("wake-report.json"):
+              try:
+                  txt = open("wake-report.json", errors="ignore").read()
+                  # Try JSON first
+                  try:
+                      d = json.loads(txt)
+                      s = json.dumps(d).lower()
+                  except:
+                      s = txt.lower()
+                  # Count occurrences of high severity markers, cap to avoid double-count
+                  wake_high = len(re.findall(r'"severity"\s*:\s*"high"', s)) + len(re.findall(r'"impact"\s*:\s*"high"', s))
+                  if wake_high == 0:
+                      # Fallback: raw count of '"high"' near detector names
+                      wake_high = s.count('"high"') // 3 if s.count('"high"') >= 3 else 0
+              except Exception as e:
+                  print(f"Wake parse error: {e}")
+
+          # Halmos - halmos.log -> counterexample / failed
+          if os.path.exists("halmos.log"):
+              txt = open("halmos.log", errors="ignore").read().lower()
+              if "counterexample" in txt or "failed" in txt or "assertion" in txt and "fail" in txt:
+                  # Only flag if it actually found a counterexample, not just "0 failed"
+                  if "counterexample" in txt:
+                      halmos_fail = True
+
+          # Mythril - mythril.log -> SWC / HIGH / issue found
+          if os.path.exists("mythril.log"):
+              txt = open("mythril.log", errors="ignore").read()
+              if "SWC-" in txt or "Issue" in txt or "HIGH" in txt.upper():
+                  # Mythril prints "==== ... ====" for each issue
+                  if txt.count("====") >= 2 or "SWC-" in txt:
+                      mythril_high = True
+
+          total_critical = slither_high + semgrep_high + wake_high + (1 if halmos_fail else 0) + (1 if mythril_high else 0)
+          total_medium = slither_med + semgrep_med
+
+          # Write to GitHub Summary
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"## Audit Result for {os.environ.get('TARGET_REPO', 'unknown')}\n\n")
+              f.write(f"| Tool | HIGH / CRITICAL | MEDIUM |\n")
+              f.write(f"| --- | --- | --- |\n")
+              f.write(f"| Slither | {slither_high} | {slither_med} |\n")
+              f.write(f"| Semgrep | {semgrep_high} | {semgrep_med} |\n")
+              f.write(f"| Wake | {wake_high} | - |\n")
+              f.write(f"| Halmos Counterexample | {'YES' if halmos_fail else 'NO'} | - |\n")
+              f.write(f"| Mythril Issue | {'YES' if mythril_high else 'NO'} | - |\n")
+              f.write(f"\n")
+              if total_critical > 0:
+                  f.write(f"## 🔴 DEEP-DIVE - {total_critical} Critical signals\n\n")
+                  f.write(f"Open the artifact, check the files flagged above. Do NOT skip.\n")
+              elif total_medium > 0:
+                  f.write(f"## 🟡 REVIEW MEDIUM - {total_medium} Medium signals, no Critical\n\n")
+                  f.write(f"Quick skim only, 10 min max. If Mediums look like false positives, skip.\n")
+              else:
+                  f.write(f"## 🟢 SKIP - 0 Critical, 0 Medium\n\n")
+                  f.write(f"Move to next protocol. Do not deep-dive.\n")
+
+          print(f"Slither HIGH={slither_high} MED={slither_med}")
+          print(f"Semgrep HIGH={semgrep_high} MED={semgrep_med}")
+          print(f"Wake HIGH={wake_high}")
+          print(f"Halmos counterexample={halmos_fail}")
+          print(f"Mythril issue={mythril_high}")
+          print(f"VERDICT={'DEEP-DIVE' if total_critical>0 else 'REVIEW-MEDIUM' if total_medium>0 else 'SKIP'}")
+          # Save verdict for next step / artifact name
+          open("verdict.txt","w").write("DEEP-DIVE" if total_critical>0 else "REVIEW-MEDIUM" if total_medium>0 else "SKIP")
+          PY
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+
+      - name: Upload All Reports
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: audit-report
-          path: target/audit-report.md
-          if-no-files-found: warn
+          name: audit-${{ github.run_number }}
+          path: |
+            slither.json
+            semgrep.sarif
+            wake-report.json
+            halmos.log
+            mythril.log
+            verdict.txt
