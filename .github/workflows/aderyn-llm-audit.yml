@@ -27,7 +27,8 @@ jobs:
           repository: ${{ inputs.target_repo }}
           ref: ${{ inputs.target_branch }}
           path: target
-          token: ${{ secrets.GH_PAT }} # Only for private repos, leave empty for public
+          token: ${{ secrets.GH_PAT || github.token }}
+          fetch-depth: 1 # Only for private repos, leave empty for public
 
       - uses: foundry-rs/foundry-toolchain@v1
 
