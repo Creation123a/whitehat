@@ -1,4 +1,4 @@
-name: Audit Any Repo
+name: Audit Any Repo — Bridge-Aware
 
 on:
   workflow_dispatch:
@@ -36,7 +36,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # FIX 1: Node 22, not 20. Hardhat 3 requires >= 22.13.
+      # Node 22 — Hardhat 3 requires >= 22.13; SolAST requires >= 18.
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -51,7 +51,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # FIX 1: Foundry wins. Hardhat only if NO foundry.toml.
+          # Foundry wins. Hardhat only if there is NO foundry.toml.
           PROJECT="plain"
           if [ -f foundry.toml ]; then
             PROJECT="foundry"
@@ -62,47 +62,38 @@ jobs:
           fi
           echo "PROJECT=$PROJECT" | tee ../project.txt
 
-          # FIX 2: NEVER overwrite remappings.txt. Backup if it exists.
+          # NEVER overwrite remappings.txt. Backup if it exists.
           if [ -f remappings.txt ]; then
             cp remappings.txt ../remappings.backup.txt
             echo "Backed up existing remappings.txt"
           fi
 
           if [ "$PROJECT" = "foundry" ]; then
-            # FIX 4: Soldeer must run BEFORE forge build.
-            # --config-location foundry prevents CI interactive prompt.
+            # Soldeer must run BEFORE forge build.
             if grep -q '^\[dependencies\]' foundry.toml 2>/dev/null; then
               echo "Soldeer detected — installing dependencies"
               forge soldeer install --config-location foundry || {
                 echo "FATAL: forge soldeer install failed" >&2
                 exit 1
               }
-              # FAIL FAST if dependencies/ is empty after install.
               if [ -d dependencies ] && [ -z "$(ls -A dependencies 2>/dev/null)" ] && [ ! -d lib ]; then
                 echo "FATAL: dependencies/ is empty after soldeer install" >&2
                 exit 1
               fi
             fi
 
-            # Git submodule deps (lib/)
             forge install --no-commit || true
-
             forge clean || true
             forge build --force 2>&1 | tee ../forge-build.log
-            # Forge build must succeed for downstream tools.
-            if [ ! -d out ] && [ ! -d cache ]; then
-              echo "FATAL: forge build produced no artifacts" >&2
-              exit 1
-            fi
 
-            # FIX 2: Only generate remappings if repo has none.
+            # Only generate remappings if repo has none.
             if [ ! -s remappings.txt ]; then
               forge remappings > remappings.txt 2>/dev/null || true
             fi
             echo "=== remappings.txt ==="
             cat remappings.txt || echo "(none)"
 
-            # Verify every remapping target exists on disk.
+            # Verify every remapping target exists.
             python3 - << 'PY'
           import pathlib
           p = pathlib.Path("remappings.txt")
@@ -114,7 +105,6 @@ jobs:
               line = line.strip()
               if not line or "=" not in line:
                   continue
-              # Contextual remapping: dep:prefix=target
               if ":" in line and "=" in line:
                   _, rest = line.split(":", 1)
                   if "=" in rest:
@@ -131,7 +121,6 @@ jobs:
           PY
 
           elif [ "$PROJECT" = "hardhat" ] || [ "$PROJECT" = "truffle" ]; then
-            # FIX 1: Use project's own Hardhat, never bare npx hardhat.
             if [ -f pnpm-lock.yaml ]; then
               corepack enable && pnpm install
             elif [ -f yarn.lock ]; then
@@ -140,21 +129,26 @@ jobs:
               npm ci || npm install
             fi
             ./node_modules/.bin/hardhat compile 2>&1 | tee ../forge-build.log
-            # Hardhat 3 reads remappings.txt automatically. Do not fake it.
 
           elif [ -f package.json ]; then
             npm ci || npm install
           fi
 
-          echo "=== .sol files (top-level) ==="
+          # FIX: broken pipe. Write to file, then slice — no `find | head`.
           find . -name "*.sol" \
             -not -path "*/node_modules/*" \
             -not -path "*/dependencies/*" \
             -not -path "*/lib/*" \
-            | head -30
+            -not -path "*/out/*" \
+            -not -path "*/cache/*" \
+            -not -path "*/broadcast/*" \
+            -not -path "*/artifacts/*" \
+            > ../sol-files.txt 2>/dev/null || true
+          echo "=== .sol files (top-level) ==="
+          head -30 ../sol-files.txt || true
 
       # ================================================================
-      # STEP 2 — WAKE CONFIGURATION (FIX 3: CORRECT NAMESPACE)
+      # STEP 2 — WAKE CONFIGURATION (correct namespace)
       # ================================================================
       - name: Prepare Wake configuration
         working-directory: target
@@ -164,7 +158,7 @@ jobs:
           PROJECT=$(cut -d= -f2 ../project.txt)
 
           # Wake's documented remapping key is compiler.solc.remappings,
-          # NOT compiler.remappings. Source: ackee.xyz/wake/docs/configuration
+          # NOT compiler.remappings / compiler.allow_paths.
           if [ "$PROJECT" = "foundry" ] && [ -s remappings.txt ]; then
             echo "Writing wake.toml with compiler.solc.remappings"
             {
@@ -173,15 +167,11 @@ jobs:
               while IFS= read -r line; do
                 line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                 [ -z "$line" ] && continue
-                # Skip contextual remappings for Wake (keep it simple, solc-compatible).
-                case "$line" in
-                  *:*) continue ;;
-                esac
+                case "$line" in *:*) continue ;; esac   # skip contextual for Wake
                 printf '  "%s",\n' "$line"
               done < remappings.txt
               echo "]"
             } > wake.toml
-            echo "=== wake.toml ==="
             cat wake.toml
           elif [ -f wake.toml ]; then
             echo "Repo already has wake.toml — leaving untouched"
@@ -198,19 +188,14 @@ jobs:
         run: |
           python3 -m venv /tmp/venv-slither
           /tmp/venv-slither/bin/pip install -q slither-analyzer
-          /tmp/venv-slither/bin/slither . \
-            --exclude-dependencies \
-            --json ../slither.json \
-            2>&1 | tee ../slither.log
-          if [ ! -s ../slither.json ]; then
-            echo "FATAL: slither.json is empty or missing" | tee -a ../slither.log
-            exit 1
-          fi
+          /tmp/venv-slither/bin/slither . --exclude-dependencies \
+            --json ../slither.json 2>&1 | tee ../slither.log
+          [ -s ../slither.json ] || { echo "FATAL: slither.json empty" >&2; exit 1; }
 
       # ================================================================
-      # STEP 4 — SEMGREP
+      # STEP 4 — SEMGREP (generic smart-contracts ruleset)
       # ================================================================
-      - name: Semgrep
+      - name: Semgrep — generic
         working-directory: target
         continue-on-error: true
         run: |
@@ -218,20 +203,88 @@ jobs:
           /tmp/venv-semgrep/bin/pip install -q semgrep
           SOL_DIRS=$(find . -maxdepth 2 -type d \( -name src -o -name contracts \) \
             -not -path "*/node_modules/*" -not -path "*/lib/*" \
-            -not -path "*/dependencies/*" | tr '\n' ' ')
+            -not -path "*/dependencies/*" -not -path "*/out/*" | tr '\n' ' ')
           [ -z "$SOL_DIRS" ] && SOL_DIRS="."
-          /tmp/venv-semgrep/bin/semgrep \
-            --config p/smart-contracts \
-            --include="*.sol" \
-            --sarif --output ../semgrep.sarif \
-            $SOL_DIRS || true
-          if [ ! -s ../semgrep.sarif ]; then
-            echo "FATAL: semgrep.sarif is empty or missing" | tee -a ../semgrep.log
-            exit 1
-          fi
+          /tmp/venv-semgrep/bin/semgrep --config p/smart-contracts \
+            --include="*.sol" --sarif --output ../semgrep.sarif $SOL_DIRS || true
+          [ -s ../semgrep.sarif ] || { echo "FATAL: semgrep.sarif empty" >&2; exit 1; }
 
       # ================================================================
-      # STEP 5 — WAKE DETECT (uses wake.toml from Step 2)
+      # STEP 5 — SOLAST (bridge-specific AST detectors, no solc needed)
+      # ================================================================
+      - name: SolAST — bridge-specific AST scan
+        working-directory: target
+        continue-on-error: true
+        run: |
+          # SolAST parses raw .sol files; no solc, no remappings, no build.
+          # Bridge detectors: message replay, forged proofs, missing nonces,
+          # calldata truncation.
+          SOLAST_TARGETS=""
+          for d in src contracts; do [ -d "$d" ] && SOLAST_TARGETS="$SOLAST_TARGETS $d"; done
+          [ -z "$SOLAST_TARGETS" ] && SOLAST_TARGETS="."
+          npx --yes @snovon/solast scan --format sarif --dedup $SOLAST_TARGETS \
+            > ../solast.sarif 2> ../solast.log || true
+          if [ ! -s ../solast.sarif ]; then
+            echo "SOLAST_EMPTY_OR_FAILED" | tee -a ../solast.log
+            exit 1
+          fi
+          echo "SolAST SARIF written: $(wc -c < ../solast.sarif) bytes"
+          python3 - << 'PY'
+          import json
+          try:
+              d = json.load(open("../solast.sarif"))
+              n = sum(len(r.get("results", [])) for r in d.get("runs", []))
+              print(f"SolAST findings: {n}")
+          except Exception as e:
+              print(f"SolAST parse warning: {e}")
+          PY
+
+      # ================================================================
+      # STEP 6 — SKILLSAUTH CROSS-CHAIN BRIDGE SEMGREP RULES
+      # ================================================================
+      - name: Semgrep — SkillsAuth cross-chain bridge rules
+        working-directory: target
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Install the verified bridge skill. Non-fatal if the registry is
+          # unreachable; the triage will mark bridge-semgrep as not-run.
+          npx --yes skillsauth add apegurus/solidity-argus cross-chain-bridge-vulnerabilities \
+            > ../skillsauth-install.log 2>&1 || {
+              echo "SKILLSAUTH_INSTALL_FAILED" | tee -a ../skillsauth-install.log
+              exit 1
+            }
+          cat ../skillsauth-install.log
+
+          # Find the installed skill directory (skillsauth writes under
+          # .agents/skills/ or ~/.skillsauth). Search both.
+          BRIDGE_RULE_DIR=""
+          for base in . .agents "$HOME/.skillsauth" "$HOME/.agents"; do
+            [ -d "$base" ] || continue
+            found=$(find "$base" -type d -name "cross-chain-bridge-vulnerabilities" 2>/dev/null | head -1 || true)
+            if [ -n "$found" ]; then BRIDGE_RULE_DIR="$found"; break; fi
+          done
+
+          if [ -z "$BRIDGE_RULE_DIR" ]; then
+            echo "BRIDGE_RULE_DIR_NOT_FOUND" | tee -a ../bridge-semgrep.log
+            exit 1
+          fi
+          echo "Bridge rules: $BRIDGE_RULE_DIR"
+
+          SOL_DIRS=$(find . -maxdepth 2 -type d \( -name src -o -name contracts \) \
+            -not -path "*/node_modules/*" -not -path "*/lib/*" \
+            -not -path "*/dependencies/*" -not -path "*/out/*" | tr '\n' ' ')
+          [ -z "$SOL_DIRS" ] && SOL_DIRS="."
+          /tmp/venv-semgrep/bin/semgrep --config "$BRIDGE_RULE_DIR" \
+            --include="*.sol" --sarif --output ../bridge-semgrep.sarif \
+            $SOL_DIRS 2>&1 | tee ../bridge-semgrep.log || true
+          [ -s ../bridge-semgrep.sarif ] || {
+            echo "BRIDGE_SEMGREP_EMPTY" | tee -a ../bridge-semgrep.log
+            exit 1
+          }
+
+      # ================================================================
+      # STEP 7 — WAKE DETECT
       # ================================================================
       - name: Wake Detect
         working-directory: target
@@ -239,16 +292,12 @@ jobs:
         run: |
           python3 -m venv /tmp/venv-wake
           /tmp/venv-wake/bin/pip install -q eth-wake
-          /tmp/venv-wake/bin/wake detect all \
-            --output ../wake-report.json \
+          /tmp/venv-wake/bin/wake detect all --output ../wake-report.json \
             2>&1 | tee ../wake.log
-          if [ ! -s ../wake-report.json ]; then
-            echo "FATAL: wake-report.json is empty or missing" | tee -a ../wake.log
-            exit 1
-          fi
+          [ -s ../wake-report.json ] || { echo "FATAL: wake-report.json empty" >&2; exit 1; }
 
       # ================================================================
-      # STEP 6 — HALMOS (Foundry only)
+      # STEP 8 — HALMOS (Foundry only)
       # ================================================================
       - name: Halmos
         working-directory: target
@@ -268,41 +317,35 @@ jobs:
           fi
 
       # ================================================================
-      # STEP 7 — MYTHRIL (FIX 5: reuse Foundry's solc, pass --solc-json)
+      # STEP 9 — MYTHRIL (reuse Foundry solc, --solc-json remappings)
       # ================================================================
       - name: Mythril
         working-directory: target
         continue-on-error: true
         run: |
           : > ../mythril.log
-
-          # FIX 5: reuse Foundry's solc from ~/.svm, do not download via py-solc-x.
           SOLC_BIN=$(find ~/.svm -name solc -type f 2>/dev/null | head -1)
           echo "Foundry solc: ${SOLC_BIN:-NOT FOUND}" | tee -a ../mythril.log
           if [ -z "$SOLC_BIN" ] || [ ! -x "$SOLC_BIN" ]; then
-            echo "MYTHRIL_NO_SOLC — forge build did not provide a solc binary" >> ../mythril.log
+            echo "MYTHRIL_NO_SOLC — forge build did not provide solc" >> ../mythril.log
             exit 1
           fi
           cp "$SOLC_BIN" /tmp/solc && chmod +x /tmp/solc
           /tmp/solc --version | tee -a ../mythril.log
 
-          # Mythril accepts remappings via --solc-json, not --solc-args.
-          # Build a mythril.json from the repo's real remappings.txt.
+          # Mythril accepts remappings via --solc-json.
           if [ -s remappings.txt ]; then
             python3 - << 'PY'
           import json, pathlib
           remaps = []
-          p = pathlib.Path("remappings.txt")
-          for line in p.read_text().splitlines():
+          for line in pathlib.Path("remappings.txt").read_text().splitlines():
               line = line.strip()
               if not line or "=" not in line:
                   continue
-              case = line.split(":", 1) if ":" in line and "=" in line.split(":", 1)[1] else None
-              if case:
-                  dep, rest = case
-                  if "=" in rest:
-                      prefix, target = rest.split("=", 1)
-                      remaps.append(f"{dep}:{prefix}={target}")
+              if ":" in line and "=" in line.split(":", 1)[1]:
+                  dep, rest = line.split(":", 1)
+                  prefix, target = rest.split("=", 1)
+                  remaps.append(f"{dep}:{prefix}={target}")
               else:
                   prefix, target = line.split("=", 1)
                   remaps.append(f"{prefix}={target}")
@@ -317,109 +360,116 @@ jobs:
           python3 -m venv /tmp/venv-mythril
           /tmp/venv-mythril/bin/pip install -q mythril
 
-          # Top 2 source files only (Mythril is slow).
           FILES=$(find src contracts . -maxdepth 3 -name "*.sol" 2>/dev/null \
-            | grep -v node_modules \
-            | grep -v "/lib/" \
-            | grep -v "/dependencies/" \
-            | grep -v "/test/" \
-            | grep -v "/script/" \
-            | head -2)
-
-          if [ -z "$FILES" ]; then
-            echo "No source files found for Mythril" >> ../mythril.log
-            exit 1
-          fi
+            | grep -v node_modules | grep -v "/lib/" | grep -v "/dependencies/" \
+            | grep -v "/test/" | grep -v "/script/" | grep -v "/out/" \
+            | head -2 || true)
+          [ -z "$FILES" ] && { echo "No source files for Mythril" >> ../mythril.log; exit 1; }
 
           for f in $FILES; do
             echo "=== Mythril $f ===" >> ../mythril.log
-            PATH="/tmp:$PATH" SOLC=/tmp/solc \
-              timeout 300 /tmp/venv-mythril/bin/myth analyze "$f" \
-                $SOLC_JSON \
-                --execution-timeout 280 \
-                --max-depth 30 \
+            PATH="/tmp:$PATH" SOLC=/tmp/solc timeout 300 \
+              /tmp/venv-mythril/bin/myth analyze "$f" $SOLC_JSON \
+                --execution-timeout 280 --max-depth 30 \
                 >> ../mythril.log 2>&1 || true
           done
           cat ../mythril.log
 
       # ================================================================
-      # STEP 8 — AUTO-TRIAGE
+      # STEP 10 — AUTO-TRIAGE (generic + bridge-specific)
       # ================================================================
       - name: Auto-Triage
         run: |
           python3 - << 'PY'
           import json, os, re, pathlib
 
-          project = pathlib.Path("project.txt").read_text().strip().split("=")[1] if pathlib.Path("project.txt").exists() else "unknown"
+          def read_json(p):
+              p = pathlib.Path(p)
+              if p.exists() and p.stat().st_size > 0:
+                  try: return json.loads(p.read_text())
+                  except Exception: return None
+              return None
+
+          project = pathlib.Path("project.txt").read_text().strip().split("=")[1] \
+                    if pathlib.Path("project.txt").exists() else "unknown"
 
           # --- Slither ---
           slither_high = slither_med = 0
-          slither_ok = False
-          sp = pathlib.Path("slither.json")
-          if sp.exists() and sp.stat().st_size > 0:
-              try:
-                  d = json.loads(sp.read_text())
-                  slither_ok = True
-                  for x in d.get("results", {}).get("detectors", []):
-                      imp = str(x.get("impact", "")).lower()
-                      if imp == "high": slither_high += 1
-                      elif imp == "medium": slither_med += 1
-              except Exception:
-                  slither_ok = False
+          d = read_json("slither.json")
+          slither_ok = d is not None
+          if d:
+              for x in d.get("results", {}).get("detectors", []):
+                  imp = str(x.get("impact", "")).lower()
+                  if imp == "high": slither_high += 1
+                  elif imp == "medium": slither_med += 1
 
-          # --- Semgrep (FIX 6: count only solidity.security.* rules) ---
+          # --- Semgrep generic (security rules only) ---
           semgrep_high = semgrep_med = semgrep_low = 0
-          semgrep_ok = False
-          gp = pathlib.Path("semgrep.sarif")
-          if gp.exists() and gp.stat().st_size > 0:
-              try:
-                  d = json.loads(gp.read_text())
-                  semgrep_ok = True
-                  for run in d.get("runs", []):
-                      for r in run.get("results", []):
-                          rid = str(r.get("ruleId", ""))
-                          if "solidity.security." in rid:
-                              semgrep_high += 1
-                          elif "solidity.performance." in rid or "solidity.best-practice." in rid:
-                              semgrep_low += 1
-                          else:
-                              semgrep_med += 1
-              except Exception:
-                  semgrep_ok = False
+          d = read_json("semgrep.sarif")
+          semgrep_ok = d is not None
+          if d:
+              for run in d.get("runs", []):
+                  for r in run.get("results", []):
+                      rid = str(r.get("ruleId", ""))
+                      if "solidity.security." in rid: semgrep_high += 1
+                      elif "solidity.performance." in rid or "solidity.best-practice." in rid:
+                          semgrep_low += 1
+                      else: semgrep_med += 1
+
+          # --- SolAST bridge/generic AST findings ---
+          solast_high = solast_med = 0
+          d = read_json("solast.sarif")
+          solast_ok = d is not None
+          if d:
+              for run in d.get("runs", []):
+                  for r in run.get("results", []):
+                      lvl = str(r.get("level", "")).lower()
+                      rid = str(r.get("ruleId", "")).lower()
+                      if lvl == "error" or lvl == "high":
+                          solast_high += 1
+                      elif lvl == "warning" or lvl == "medium":
+                          solast_med += 1
+                      elif "bridge" in rid or "cross-chain" in rid or "replay" in rid:
+                          solast_high += 1
+                      else:
+                          solast_med += 1
+
+          # --- SkillsAuth bridge Semgrep findings ---
+          bridge_high = bridge_med = 0
+          d = read_json("bridge-semgrep.sarif")
+          bridge_semgrep_ok = d is not None
+          if d:
+              for run in d.get("runs", []):
+                  for r in run.get("results", []):
+                      lvl = str(r.get("level", "")).lower()
+                      if lvl in ("error", "high"): bridge_high += 1
+                      elif lvl in ("warning", "medium"): bridge_med += 1
+                      else: bridge_high += 1   # security bridge rules default HIGH
 
           # --- Wake ---
           wake_high = 0
-          wake_ok = False
-          wp = pathlib.Path("wake-report.json")
-          if wp.exists() and wp.stat().st_size > 0:
-              try:
-                  txt = wp.read_text(errors="ignore").lower()
-                  wake_ok = "parsererror" not in txt and "not found" not in txt
-                  wake_high = len(re.findall(r'"severity"\s*:\s*"high"', txt)) + \
-                              len(re.findall(r'"impact"\s*:\s*"high"', txt))
-              except Exception:
-                  wake_ok = False
+          d = read_json("wake-report.json")
+          wake_ok = d is not None
+          if d:
+              txt = pathlib.Path("wake-report.json").read_text(errors="ignore").lower()
+              wake_high = len(re.findall(r'"severity"\s*:\s*"high"', txt)) + \
+                          len(re.findall(r'"impact"\s*:\s*"high"', txt))
 
           # --- Halmos ---
-          halmos_fail = False
-          halmos_ok = False
-          halmos_skipped = False
+          halmos_fail = halmos_ok = halmos_skipped = False
           hp = pathlib.Path("halmos.log")
           if hp.exists():
               txt = hp.read_text(errors="ignore")
               if "HALMOS_SKIPPED" in txt:
-                  halmos_skipped = True
-                  halmos_ok = True  # intentionally skipped is OK
+                  halmos_skipped = halmos_ok = True
               elif "HALMOS_BUILD_FAILED" in txt or "build failed" in txt.lower():
                   halmos_ok = False
               else:
                   halmos_ok = True
-                  if "counterexample" in txt.lower():
-                      halmos_fail = True
+                  halmos_fail = "counterexample" in txt.lower()
 
           # --- Mythril ---
-          mythril_fail = False
-          mythril_ok = False
+          mythril_fail = mythril_ok = False
           mp = pathlib.Path("mythril.log")
           if mp.exists():
               txt = mp.read_text(errors="ignore")
@@ -427,14 +477,15 @@ jobs:
                   mythril_ok = False
               else:
                   mythril_ok = True
-                  if "SWC-" in txt:
-                      mythril_fail = True
+                  mythril_fail = "SWC-" in txt
 
-          all_ran = all([slither_ok, semgrep_ok, wake_ok, halmos_ok, mythril_ok])
+          all_ran = all([slither_ok, semgrep_ok, solast_ok,
+                         bridge_semgrep_ok, wake_ok, halmos_ok, mythril_ok])
 
-          total_critical = slither_high + semgrep_high + wake_high + \
-                           (1 if halmos_fail else 0) + (1 if mythril_fail else 0)
-          total_medium = slither_med + semgrep_med
+          total_critical = (slither_high + semgrep_high + solast_high +
+                            bridge_high + wake_high +
+                            (1 if halmos_fail else 0) + (1 if mythril_fail else 0))
+          total_medium = slither_med + semgrep_med + solast_med + bridge_med
 
           if not all_ran:
               verdict = "UNKNOWN"
@@ -446,16 +497,18 @@ jobs:
               verdict = "SKIP"
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write(f"## Audit: {os.environ.get('TARGET_REPO', '?')} ({project})\n\n")
+              f.write(f"## Audit: {os.environ.get('TARGET_REPO','?')} ({project})\n\n")
               f.write("| Tool | HIGH | MEDIUM | Status |\n|---|---|---|---|\n")
               f.write(f"| Slither | {slither_high} | {slither_med} | {'OK' if slither_ok else 'FAILED'} |\n")
               f.write(f"| Semgrep (security) | {semgrep_high} | {semgrep_med} | {'OK' if semgrep_ok else 'FAILED'} |\n")
+              f.write(f"| SolAST (bridge AST) | {solast_high} | {solast_med} | {'OK' if solast_ok else 'FAILED'} |\n")
+              f.write(f"| Bridge Semgrep (SkillsAuth) | {bridge_high} | {bridge_med} | {'OK' if bridge_semgrep_ok else 'FAILED'} |\n")
               f.write(f"| Wake | {wake_high} | — | {'OK' if wake_ok else 'FAILED'} |\n")
               f.write(f"| Halmos | {'YES' if halmos_fail else 'NO'} | — | {'SKIPPED' if halmos_skipped else 'OK' if halmos_ok else 'FAILED'} |\n")
               f.write(f"| Mythril | {'YES' if mythril_fail else 'NO'} | — | {'OK' if mythril_ok else 'FAILED'} |\n\n")
               f.write(f"**Verdict: `{verdict}`**\n")
               if semgrep_low:
-                  f.write(f"\n(Semgrep also produced {semgrep_low} gas/style findings, excluded from verdict.)\n")
+                  f.write(f"\n(Semgrep generic produced {semgrep_low} gas/style findings, excluded.)\n")
 
           pathlib.Path("verdict.txt").write_text(verdict)
           print(f"VERDICT={verdict}")
@@ -464,7 +517,7 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
 
       # ================================================================
-      # STEP 9 — ARTIFACTS
+      # STEP 11 — ARTIFACTS
       # ================================================================
       - name: Upload reports
         uses: actions/upload-artifact@v4
@@ -474,6 +527,11 @@ jobs:
           path: |
             slither.json
             semgrep.sarif
+            solast.sarif
+            solast.log
+            bridge-semgrep.sarif
+            bridge-semgrep.log
+            skillsauth-install.log
             wake-report.json
             halmos.log
             mythril.log
