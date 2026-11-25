@@ -36,7 +36,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Node 22 — Hardhat 3 requires >= 22.13; SolAST requires >= 18.
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -51,7 +50,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Foundry wins. Hardhat only if there is NO foundry.toml.
           PROJECT="plain"
           if [ -f foundry.toml ]; then
             PROJECT="foundry"
@@ -62,14 +60,12 @@ jobs:
           fi
           echo "PROJECT=$PROJECT" | tee ../project.txt
 
-          # NEVER overwrite remappings.txt. Backup if it exists.
           if [ -f remappings.txt ]; then
             cp remappings.txt ../remappings.backup.txt
             echo "Backed up existing remappings.txt"
           fi
 
           if [ "$PROJECT" = "foundry" ]; then
-            # Soldeer must run BEFORE forge build.
             if grep -q '^\[dependencies\]' foundry.toml 2>/dev/null; then
               echo "Soldeer detected — installing dependencies"
               forge soldeer install --config-location foundry || {
@@ -86,14 +82,12 @@ jobs:
             forge clean || true
             forge build --force 2>&1 | tee ../forge-build.log
 
-            # Only generate remappings if repo has none.
             if [ ! -s remappings.txt ]; then
               forge remappings > remappings.txt 2>/dev/null || true
             fi
             echo "=== remappings.txt ==="
             cat remappings.txt || echo "(none)"
 
-            # Verify every remapping target exists.
             python3 - << 'PY'
           import pathlib
           p = pathlib.Path("remappings.txt")
@@ -105,7 +99,7 @@ jobs:
               line = line.strip()
               if not line or "=" not in line:
                   continue
-              if ":" in line and "=" in line:
+              if ":" in line and "=" in line.split(":", 1)[1]:
                   _, rest = line.split(":", 1)
                   if "=" in rest:
                       line = rest
@@ -134,7 +128,6 @@ jobs:
             npm ci || npm install
           fi
 
-          # FIX: broken pipe. Write to file, then slice — no `find | head`.
           find . -name "*.sol" \
             -not -path "*/node_modules/*" \
             -not -path "*/dependencies/*" \
@@ -148,7 +141,7 @@ jobs:
           head -30 ../sol-files.txt || true
 
       # ================================================================
-      # STEP 2 — WAKE CONFIGURATION (correct namespace)
+      # STEP 2 — WAKE CONFIGURATION (exclude dependencies, real remappings)
       # ================================================================
       - name: Prepare Wake configuration
         working-directory: target
@@ -157,27 +150,47 @@ jobs:
           set -euo pipefail
           PROJECT=$(cut -d= -f2 ../project.txt)
 
-          # Wake's documented remapping key is compiler.solc.remappings,
-          # NOT compiler.remappings / compiler.allow_paths.
-          if [ "$PROJECT" = "foundry" ] && [ -s remappings.txt ]; then
-            echo "Writing wake.toml with compiler.solc.remappings"
-            {
-              echo "[compiler.solc]"
-              echo "remappings = ["
-              while IFS= read -r line; do
-                line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                [ -z "$line" ] && continue
-                case "$line" in *:*) continue ;; esac   # skip contextual for Wake
-                printf '  "%s",\n' "$line"
-              done < remappings.txt
-              echo "]"
-            } > wake.toml
-            cat wake.toml
-          elif [ -f wake.toml ]; then
-            echo "Repo already has wake.toml — leaving untouched"
-          else
-            echo "No remappings.txt and no wake.toml — Wake will use defaults"
+          # The correct schema is [compiler.solc] with exclude_paths and remappings.
+          # dependencies MUST be excluded — otherwise Wake compiles OpenZeppelin
+          # test/certora files and throws ParserError.
+          cat > wake.toml << 'WAKE'
+          [compiler.solc]
+          exclude_paths = [
+            "dependencies",
+            "node_modules",
+            "lib",
+            "out",
+            "cache",
+            "broadcast",
+            "script",
+            "test"
+          ]
+          include_paths = [
+            "dependencies",
+            "node_modules"
+          ]
+          remappings = []
+          WAKE
+
+          if [ -s remappings.txt ]; then
+            python3 - << 'PY'
+          import pathlib
+          wake = pathlib.Path("wake.toml").read_text()
+          remaps = []
+          for line in pathlib.Path("remappings.txt").read_text().splitlines():
+              line = line.strip()
+              if not line or "=" not in line:
+                  continue
+              if ":" in line and "=" in line.split(":", 1)[1]:
+                  continue  # skip contextual remappings for Wake
+              remaps.append(line)
+          block = "[\n" + "".join(f'  "{r}",\n' for r in remaps) + "]"
+          wake = wake.replace("remappings = []", f"remappings = {block}")
+          pathlib.Path("wake.toml").write_text(wake)
+          PY
           fi
+          echo "=== wake.toml ==="
+          cat wake.toml
 
       # ================================================================
       # STEP 3 — SLITHER
@@ -193,7 +206,7 @@ jobs:
           [ -s ../slither.json ] || { echo "FATAL: slither.json empty" >&2; exit 1; }
 
       # ================================================================
-      # STEP 4 — SEMGREP (generic smart-contracts ruleset)
+      # STEP 4 — SEMGREP (generic smart-contracts)
       # ================================================================
       - name: Semgrep — generic
         working-directory: target
@@ -210,15 +223,12 @@ jobs:
           [ -s ../semgrep.sarif ] || { echo "FATAL: semgrep.sarif empty" >&2; exit 1; }
 
       # ================================================================
-      # STEP 5 — SOLAST (bridge-specific AST detectors, no solc needed)
+      # STEP 5 — SOLAST (bridge-specific AST scan, no solc required)
       # ================================================================
-      - name: SolAST — bridge-specific AST scan
+      - name: SolAST — bridge AST scan
         working-directory: target
         continue-on-error: true
         run: |
-          # SolAST parses raw .sol files; no solc, no remappings, no build.
-          # Bridge detectors: message replay, forged proofs, missing nonces,
-          # calldata truncation.
           SOLAST_TARGETS=""
           for d in src contracts; do [ -d "$d" ] && SOLAST_TARGETS="$SOLAST_TARGETS $d"; done
           [ -z "$SOLAST_TARGETS" ] && SOLAST_TARGETS="."
@@ -229,53 +239,67 @@ jobs:
             exit 1
           fi
           echo "SolAST SARIF written: $(wc -c < ../solast.sarif) bytes"
-          python3 - << 'PY'
-          import json
-          try:
-              d = json.load(open("../solast.sarif"))
-              n = sum(len(r.get("results", [])) for r in d.get("runs", []))
-              print(f"SolAST findings: {n}")
-          except Exception as e:
-              print(f"SolAST parse warning: {e}")
-          PY
 
       # ================================================================
-      # STEP 6 — SKILLSAUTH CROSS-CHAIN BRIDGE SEMGREP RULES
+      # STEP 6 — BRIDGE SEMGREP (your custom bridge-rules.yml)
       # ================================================================
-      - name: Semgrep — SkillsAuth cross-chain bridge rules
+      - name: Semgrep — custom bridge rules
         working-directory: target
         continue-on-error: true
         run: |
           set -euo pipefail
-          # Install the verified bridge skill. Non-fatal if the registry is
-          # unreachable; the triage will mark bridge-semgrep as not-run.
-          npx --yes skillsauth add apegurus/solidity-argus cross-chain-bridge-vulnerabilities \
-            > ../skillsauth-install.log 2>&1 || {
-              echo "SKILLSAUTH_INSTALL_FAILED" | tee -a ../skillsauth-install.log
-              exit 1
-            }
-          cat ../skillsauth-install.log
-
-          # Find the installed skill directory (skillsauth writes under
-          # .agents/skills/ or ~/.skillsauth). Search both.
-          BRIDGE_RULE_DIR=""
-          for base in . .agents "$HOME/.skillsauth" "$HOME/.agents"; do
-            [ -d "$base" ] || continue
-            found=$(find "$base" -type d -name "cross-chain-bridge-vulnerabilities" 2>/dev/null | head -1 || true)
-            if [ -n "$found" ]; then BRIDGE_RULE_DIR="$found"; break; fi
-          done
-
-          if [ -z "$BRIDGE_RULE_DIR" ]; then
-            echo "BRIDGE_RULE_DIR_NOT_FOUND" | tee -a ../bridge-semgrep.log
-            exit 1
+          # Prefer the repo's bridge-rules.yml; write a fallback if missing.
+          if [ -f "$GITHUB_WORKSPACE/bridge-rules.yml" ]; then
+            cp "$GITHUB_WORKSPACE/bridge-rules.yml" bridge-rules.yml
+          elif [ ! -f bridge-rules.yml ]; then
+            cat > bridge-rules.yml << 'RULES'
+          rules:
+            - id: bridge-missing-chain-id
+              patterns:
+                - pattern: |
+                    function $FUNC(...) ... {
+                      ...
+                      ecrecover(...)
+                      ...
+                    }
+              message: "Potential missing chainId in signature verification."
+              languages: [solidity]
+              severity: ERROR
+            - id: bridge-replay-no-nonce
+              patterns:
+                - pattern: |
+                    function $FUNC(...) ... {
+                      ...
+                      $CALL(...)
+                      ...
+                    }
+                - pattern-not: |
+                    function $FUNC(...) ... {
+                      ...
+                      require($PROCESSED[$ID] == false);
+                      ...
+                    }
+              message: "Potential replay: no processed-message check."
+              languages: [solidity]
+              severity: ERROR
+            - id: bridge-hardcoded-bridge-address
+              patterns:
+                - pattern: |
+                    address constant $NAME = $ADDR;
+                - metavariable-regex:
+                    metavariable: $NAME
+                    regex: (?i)(bridge|relay|messenger|endpoint)
+              message: "Hardcoded bridge/relay address."
+              languages: [solidity]
+              severity: WARNING
+          RULES
           fi
-          echo "Bridge rules: $BRIDGE_RULE_DIR"
 
           SOL_DIRS=$(find . -maxdepth 2 -type d \( -name src -o -name contracts \) \
             -not -path "*/node_modules/*" -not -path "*/lib/*" \
             -not -path "*/dependencies/*" -not -path "*/out/*" | tr '\n' ' ')
           [ -z "$SOL_DIRS" ] && SOL_DIRS="."
-          /tmp/venv-semgrep/bin/semgrep --config "$BRIDGE_RULE_DIR" \
+          /tmp/venv-semgrep/bin/semgrep --config bridge-rules.yml \
             --include="*.sol" --sarif --output ../bridge-semgrep.sarif \
             $SOL_DIRS 2>&1 | tee ../bridge-semgrep.log || true
           [ -s ../bridge-semgrep.sarif ] || {
@@ -284,7 +308,7 @@ jobs:
           }
 
       # ================================================================
-      # STEP 7 — WAKE DETECT
+      # STEP 7 — WAKE DETECT (uses wake.toml from Step 2)
       # ================================================================
       - name: Wake Detect
         working-directory: target
@@ -292,7 +316,8 @@ jobs:
         run: |
           python3 -m venv /tmp/venv-wake
           /tmp/venv-wake/bin/pip install -q eth-wake
-          /tmp/venv-wake/bin/wake detect all --output ../wake-report.json \
+          /tmp/venv-wake/bin/wake detect all \
+            --output ../wake-report.json \
             2>&1 | tee ../wake.log
           [ -s ../wake-report.json ] || { echo "FATAL: wake-report.json empty" >&2; exit 1; }
 
@@ -317,23 +342,25 @@ jobs:
           fi
 
       # ================================================================
-      # STEP 9 — MYTHRIL (reuse Foundry solc, --solc-json remappings)
+      # STEP 9 — MYTHRIL (reuse Foundry solc-* + --solc-json remappings)
       # ================================================================
       - name: Mythril
         working-directory: target
         continue-on-error: true
         run: |
           : > ../mythril.log
-          SOLC_BIN=$(find ~/.svm -name solc -type f 2>/dev/null | head -1)
+
+          # SVM stores binaries as solc-<version>, not "solc".
+          SOLC_BIN=$(find ~/.svm -type f -name "solc-*" 2>/dev/null | head -1)
           echo "Foundry solc: ${SOLC_BIN:-NOT FOUND}" | tee -a ../mythril.log
           if [ -z "$SOLC_BIN" ] || [ ! -x "$SOLC_BIN" ]; then
-            echo "MYTHRIL_NO_SOLC — forge build did not provide solc" >> ../mythril.log
+            echo "MYTHRIL_NO_SOLC — forge build did not provide a solc binary" >> ../mythril.log
             exit 1
           fi
           cp "$SOLC_BIN" /tmp/solc && chmod +x /tmp/solc
           /tmp/solc --version | tee -a ../mythril.log
 
-          # Mythril accepts remappings via --solc-json.
+          # Mythril understands remappings only via --solc-json.
           if [ -s remappings.txt ]; then
             python3 - << 'PY'
           import json, pathlib
@@ -376,7 +403,7 @@ jobs:
           cat ../mythril.log
 
       # ================================================================
-      # STEP 10 — AUTO-TRIAGE (generic + bridge-specific)
+      # STEP 10 — AUTO-TRIAGE
       # ================================================================
       - name: Auto-Triage
         run: |
@@ -393,7 +420,7 @@ jobs:
           project = pathlib.Path("project.txt").read_text().strip().split("=")[1] \
                     if pathlib.Path("project.txt").exists() else "unknown"
 
-          # --- Slither ---
+          # Slither
           slither_high = slither_med = 0
           d = read_json("slither.json")
           slither_ok = d is not None
@@ -403,7 +430,7 @@ jobs:
                   if imp == "high": slither_high += 1
                   elif imp == "medium": slither_med += 1
 
-          # --- Semgrep generic (security rules only) ---
+          # Generic Semgrep (security rules only)
           semgrep_high = semgrep_med = semgrep_low = 0
           d = read_json("semgrep.sarif")
           semgrep_ok = d is not None
@@ -416,7 +443,7 @@ jobs:
                           semgrep_low += 1
                       else: semgrep_med += 1
 
-          # --- SolAST bridge/generic AST findings ---
+          # SolAST bridge findings
           solast_high = solast_med = 0
           d = read_json("solast.sarif")
           solast_ok = d is not None
@@ -425,16 +452,12 @@ jobs:
                   for r in run.get("results", []):
                       lvl = str(r.get("level", "")).lower()
                       rid = str(r.get("ruleId", "")).lower()
-                      if lvl == "error" or lvl == "high":
-                          solast_high += 1
-                      elif lvl == "warning" or lvl == "medium":
-                          solast_med += 1
-                      elif "bridge" in rid or "cross-chain" in rid or "replay" in rid:
+                      if lvl in ("error", "high") or "bridge" in rid or "replay" in rid:
                           solast_high += 1
                       else:
                           solast_med += 1
 
-          # --- SkillsAuth bridge Semgrep findings ---
+          # Custom bridge Semgrep
           bridge_high = bridge_med = 0
           d = read_json("bridge-semgrep.sarif")
           bridge_semgrep_ok = d is not None
@@ -444,9 +467,9 @@ jobs:
                       lvl = str(r.get("level", "")).lower()
                       if lvl in ("error", "high"): bridge_high += 1
                       elif lvl in ("warning", "medium"): bridge_med += 1
-                      else: bridge_high += 1   # security bridge rules default HIGH
+                      else: bridge_high += 1
 
-          # --- Wake ---
+          # Wake
           wake_high = 0
           d = read_json("wake-report.json")
           wake_ok = d is not None
@@ -455,7 +478,7 @@ jobs:
               wake_high = len(re.findall(r'"severity"\s*:\s*"high"', txt)) + \
                           len(re.findall(r'"impact"\s*:\s*"high"', txt))
 
-          # --- Halmos ---
+          # Halmos
           halmos_fail = halmos_ok = halmos_skipped = False
           hp = pathlib.Path("halmos.log")
           if hp.exists():
@@ -468,7 +491,7 @@ jobs:
                   halmos_ok = True
                   halmos_fail = "counterexample" in txt.lower()
 
-          # --- Mythril ---
+          # Mythril
           mythril_fail = mythril_ok = False
           mp = pathlib.Path("mythril.log")
           if mp.exists():
@@ -502,7 +525,7 @@ jobs:
               f.write(f"| Slither | {slither_high} | {slither_med} | {'OK' if slither_ok else 'FAILED'} |\n")
               f.write(f"| Semgrep (security) | {semgrep_high} | {semgrep_med} | {'OK' if semgrep_ok else 'FAILED'} |\n")
               f.write(f"| SolAST (bridge AST) | {solast_high} | {solast_med} | {'OK' if solast_ok else 'FAILED'} |\n")
-              f.write(f"| Bridge Semgrep (SkillsAuth) | {bridge_high} | {bridge_med} | {'OK' if bridge_semgrep_ok else 'FAILED'} |\n")
+              f.write(f"| Bridge Semgrep (custom) | {bridge_high} | {bridge_med} | {'OK' if bridge_semgrep_ok else 'FAILED'} |\n")
               f.write(f"| Wake | {wake_high} | — | {'OK' if wake_ok else 'FAILED'} |\n")
               f.write(f"| Halmos | {'YES' if halmos_fail else 'NO'} | — | {'SKIPPED' if halmos_skipped else 'OK' if halmos_ok else 'FAILED'} |\n")
               f.write(f"| Mythril | {'YES' if mythril_fail else 'NO'} | — | {'OK' if mythril_ok else 'FAILED'} |\n\n")
@@ -531,7 +554,6 @@ jobs:
             solast.log
             bridge-semgrep.sarif
             bridge-semgrep.log
-            skillsauth-install.log
             wake-report.json
             halmos.log
             mythril.log
@@ -541,3 +563,4 @@ jobs:
             wake.log
             project.txt
             remappings.backup.txt
+            bridge-rules.yml
