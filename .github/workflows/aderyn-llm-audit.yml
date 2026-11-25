@@ -122,7 +122,7 @@ jobs:
             else
               npm ci || npm install
             fi
-            ./node_modules/.bin/hardhat compile 2>&1 | tee ../forge-build.log
+            ./node_modules/.bipipefail2>&1 | tee ../forge-build.log
 
           elif [ -f package.json ]; then
             npm ci || npm install
@@ -359,112 +359,16 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-
-          # BridgeGuard is an MCP server launched with npx; the client script
-          # sends an initialize, tools/list, then tools/call(bridge_scan_contract).
-          # The response JSON is saved for the LLM phase.
-          cat > ../bridgeguard-client.mjs << 'EOF'
-          import { spawn } from 'child_process';
-          import fs from 'fs';
-          import path from 'path';
-
-          const server = spawn('npx', ['-y', 'bridgeguard-mcp'], {
-            stdio: ['pipe', 'pipe', 'inherit']
-          });
-
-          let buffer = '';
-          let msgId = 1;
-          const pending = new Map();
-
-          server.stdout.on('data', (data) => {
-            buffer += data.toString();
-            let idx;
-            while ((idx = buffer.indexOf('\n')) !== -1) {
-              const line = buffer.slice(0, idx).trim();
-              buffer = buffer.slice(idx + 1);
-              if (!line) continue;
-              try {
-                const msg = JSON.parse(line);
-                if (msg.id && pending.has(msg.id)) {
-                  pending.get(msg.id)(msg);
-                  pending.delete(msg.id);
-                }
-              } catch {}
-            }
-          });
-
-          function send(method, params = {}) {
-            return new Promise((resolve) => {
-              const id = msgId++;
-              pending.set(id, resolve);
-              server.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
-            });
-          }
-
-          (async () => {
-            await send('initialize', {
-              protocolVersion: '2024-11-05',
-              capabilities: {},
-              clientInfo: { name: 'audit-workflow', version: '1.0.0' }
-            });
-
-            // Locate a representative bridge contract to scan.
-            const candidates = [];
-            for (const dir of ['src/contracts/adapters', 'src', 'contracts']) {
-              const abs = path.resolve(dir);
-              if (!fs.existsSync(abs)) continue;
-              for (const f of fs.readdirSync(abs)) {
-                if (f.endsWith('.sol') && !f.endsWith('.t.sol')) {
-                  candidates.push(path.join(dir, f));
-                }
-              }
-              if (candidates.length) break;
-            }
-
-            const targetFile = process.argv[2] || candidates[0];
-            if (!targetFile || !fs.existsSync(targetFile)) {
-              console.error('No target file found');
-              server.kill();
-              process.exit(1);
-            }
-
-            const source = fs.readFileSync(targetFile, 'utf8');
-            console.error(`Scanning: ${targetFile}`);
-
-            // Try `source` first; fall back to `contractPath` if needed.
-            let result = await send('tools/call', {
-              name: 'bridge_scan_contract',
-              arguments: { source }
-            });
-
-            if (result.error || (result.result && result.result.isError)) {
-              result = await send('tools/call', {
-                name: 'bridge_scan_contract',
-                arguments: { contractPath: targetFile }
-              });
-            }
-
-            fs.writeFileSync('../bridgeguard-report.json',
-              JSON.stringify(result, null, 2), 'utf8');
-            console.error('BridgeGuard report saved');
-
-            server.kill();
-            process.exit(0);
-          })().catch((e) => {
-            console.error(e);
-            server.kill();
-            process.exit(1);
-          });
-          EOF
-
-          node ../bridgeguard-client.mjs || {
-            echo "BRIDGEGUARD_CLIENT_FAILED" | tee ../bridgeguard.log
+          if [ ! -f "$GITHUB_WORKSPACE/.github/mcp/bridgeguard-client.mjs" ]; then
+            echo "MISSING .github/mcp/bridgeguard-client.mjs" | tee ../bridgeguard.log
             exit 1
-          }
-          [ -s ../bridgeguard-report.json ] || {
+          fi
+          cp "$GITHUB_WORKSPACE/.github/mcp/bridgeguard-client.mjs" ../bridgeguard-client.mjs
+          node ../bridgeguard-client.mjs || { echo "BRIDGEGUARD_CLIENT_FAILED" | tee -a ../bridgeguard.log; exit 1; }
+          if [ ! -s ../bridgeguard-report.json ]; then
             echo "BRIDGEGUARD_REPORT_EMPTY" | tee -a ../bridgeguard.log
             exit 1
-          }
+          fi
 
       # ================================================================
       # STEP 11 — AUTO-TRIAGE
