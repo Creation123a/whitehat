@@ -141,7 +141,31 @@ jobs:
           head -30 ../sol-files.txt || true
 
       # ================================================================
-      # STEP 2 — WAKE CONFIGURATION (ignore_paths, not exclude_paths)
+      # STEP 1b — BUILD STATUS GATE (new — makes UNKNOWN impossible)
+      # ================================================================
+      - name: Build status gate
+        working-directory: target
+        run: |
+          set -euo pipefail
+          BUILD_OK=false
+          if [ -f foundry.toml ]; then
+            [ -d out ] && [ -n "$(find out -name '*.json' -print -quit 2>/dev/null)" ] && BUILD_OK=true
+          elif [ -f hardhat.config.js ] || [ -f hardhat.config.ts ]; then
+            [ -d artifacts ] && [ -n "$(find artifacts -name '*.json' -print -quit 2>/dev/null)" ] && BUILD_OK=true
+          else
+            BUILD_OK=true   # plain / unknown project — let downstream tools decide
+          fi
+          if [ "$BUILD_OK" = false ]; then
+            echo "BUILD_FAILED" > build-status.txt
+            echo "## ⚠️ Build Failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "The project did not produce build artifacts. All tool results are unreliable." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "BUILD_OK" > build-status.txt
+          echo "Build gate passed" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ================================================================
+      # STEP 2 — WAKE CONFIGURATION (exclude_paths, not ignore_paths)
       # ================================================================
       - name: Prepare Wake configuration
         working-directory: target
@@ -151,7 +175,7 @@ jobs:
 
           cat > wake.toml << 'WAKE'
           [compiler.solc]
-          ignore_paths = [
+          exclude_paths = [
             "dependencies",
             "node_modules",
             "lib",
@@ -226,56 +250,149 @@ jobs:
         working-directory: target
         continue-on-error: true
         run: |
-          SOLAST_TARGETS=""
-          for d in src contracts; do [ -d "$d" ] && SOLAST_TARGETS="$SOLAST_TARGETS $d"; done
-          [ -z "$SOLAST_TARGETS" ] && SOLAST_TARGETS="."
-          npx --yes @snovon/solast scan --format sarif --dedup $SOLAST_TARGETS \
+          SOLAST_DIRS="."
+          [ -d src ] && SOLAST_DIRS="src"
+          [ -d contracts ] && SOLAST_DIRS="contracts"
+          [ -d src ] && [ -d contracts ] && SOLAST_DIRS="src contracts"
+
+          npx --yes @snovon/solast scan \
+            --format sarif --dedup $SOLAST_DIRS \
             > ../solast.sarif 2> ../solast.log || true
-          if [ ! -s ../solast.sarif ]; then
-            echo "SOLAST_EMPTY_OR_FAILED" | tee -a ../solast.log
-            exit 1
-          fi
-          echo "SolAST SARIF written: $(wc -c < ../solast.sarif) bytes"
+
+          python3 - << 'PY'
+          import json, pathlib, sys
+          p = pathlib.Path("../solast.sarif")
+          if not p.exists() or p.stat().st_size == 0:
+              print("SOLAST_SARIF_EMPTY", file=sys.stderr)
+              sys.exit(1)
+          try:
+              d = json.loads(p.read_text())
+              if "runs" not in d or not isinstance(d["runs"], list):
+                  print("SOLAST_SARIF_INVALID — missing runs[]", file=sys.stderr)
+                  sys.exit(1)
+              print(f"SolAST SARIF valid: {len(d['runs'])} run(s)")
+          except Exception as e:
+              print(f"SOLAST_SARIF_PARSE_ERROR: {e}", file=sys.stderr)
+              sys.exit(1)
+          PY
 
       # ================================================================
-      # STEP 6 — BRIDGE SEMGREP (custom rules from .github/semgrep/)
+      # STEP 6 — BRIDGE SEMGREP (validated custom rules + fallback)
       # ================================================================
       - name: Semgrep — custom bridge rules
         working-directory: target
         continue-on-error: true
         run: |
           set -euo pipefail
-          if [ ! -f "$GITHUB_WORKSPACE/.github/semgrep/bridge-rules.yml" ]; then
-            echo "MISSING .github/semgrep/bridge-rules.yml" | tee ../bridge-semgrep.log
-            exit 1
-          fi
-          cp "$GITHUB_WORKSPACE/.github/semgrep/bridge-rules.yml" bridge-rules.yml
-          DIRS=""
-          if [ -d src ]; then DIRS="$DIRS src"; fi
-          if [ -d contracts ]; then DIRS="$DIRS contracts"; fi
-          if [ -z "$DIRS" ]; then DIRS="."; fi
-          /tmp/venv-semgrep/bin/semgrep --config bridge-rules.yml --include="*.sol" --sarif --output ../bridge-semgrep.sarif $DIRS 2>&1 | tee -a ../bridge-semgrep.log || true
-          if [ ! -s ../bridge-semgrep.sarif ]; then
-            echo "BRIDGE_SEMGREP_EMPTY" | tee -a ../bridge-semgrep.log
-            exit 1
+
+          BRIDGE_RULES=""
+          for candidate in \
+            "$GITHUB_WORKSPACE/.github/semgrep/bridge-rules.yml" \
+            "$GITHUB_WORKSPACE/.semgrep/bridge-rules.yml" \
+            "$GITHUB_WORKSPACE/bridge-rules.yml"; do
+            if [ -f "$candidate" ]; then
+              BRIDGE_RULES="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$BRIDGE_RULES" ]; then
+            echo "BRIDGE_RULES_NOT_FOUND — writing minimal fallback" | tee ../bridge-semgrep.log
+            cat > bridge-rules.yml << 'RULES'
+          rules:
+            - id: bridge-ecrecover-no-chainid
+              patterns:
+                - pattern: ecrecover(...)
+                - pattern-not-inside: |
+                    function $F(...) {
+                      ...
+                      block.chainid
+                      ...
+                    }
+              message: "ecrecover without chainid binding — replay risk"
+              languages: [solidity]
+              severity: ERROR
+            - id: bridge-replay-no-processed-check
+              patterns:
+                - pattern: |
+                    function $F(...) ... {
+                      ...
+                      $CALL(...)
+                      ...
+                    }
+                - pattern-not-inside: |
+                    function $F(...) ... {
+                      ...
+                      require($PROCESSED[$ID] == false);
+                      ...
+                    }
+              message: "Replay risk: no processed-message check"
+              languages: [solidity]
+              severity: ERROR
+            - id: bridge-hardcoded-bridge-address
+              patterns:
+                - pattern: |
+                    address constant $NAME = $ADDR;
+                - metavariable-regex:
+                    metavariable: $NAME
+                    regex: (?i)(bridge|relay|messenger|endpoint)
+              message: "Hardcoded bridge/relay address"
+              languages: [solidity]
+              severity: WARNING
+          RULES
+            BRIDGE_RULES="bridge-rules.yml"
+          else
+            cp "$BRIDGE_RULES" bridge-rules.yml
+            echo "Using bridge rules from: $BRIDGE_RULES" | tee ../bridge-semgrep.log
           fi
 
+          # Validate rules before scanning — catches YAML/AST errors early
+          /tmp/venv-semgrep/bin/semgrep --validate --config bridge-rules.yml \
+            2>&1 | tee -a ../bridge-semgrep.log || {
+            echo "BRIDGE_RULES_INVALID" | tee -a ../bridge-semgrep.log
+            exit 1
+          }
+
+          DIRS="."
+          [ -d src ] && DIRS="src"
+          [ -d contracts ] && DIRS="contracts"
+          [ -d src ] && [ -d contracts ] && DIRS="src contracts"
+
+          /tmp/venv-semgrep/bin/semgrep --config bridge-rules.yml \
+            --include="*.sol" --sarif --output ../bridge-semgrep.sarif \
+            $DIRS 2>&1 | tee -a ../bridge-semgrep.log || true
+
+          [ -s ../bridge-semgrep.sarif ] || {
+            echo "BRIDGE_SEMGREP_EMPTY" | tee -a ../bridge-semgrep.log
+            exit 1
+          }
+
       # ================================================================
-      # STEP 7 — WAKE DETECT
+      # STEP 7 — WAKE DETECT (init project, use modern eth-wake, text log)
       # ================================================================
       - name: Wake Detect
         working-directory: target
         continue-on-error: true
         run: |
           python3 -m venv /tmp/venv-wake
-          /tmp/venv-wake/bin/pip install -q eth-wake
+          /tmp/venv-wake/bin/pip install -q 'eth-wake>=4.0'
+
+          if [ ! -f wake.toml ]; then
+            /tmp/venv-wake/bin/wake init 2>&1 | tee ../wake-init.log || {
+              echo "WAKE_INIT_FAILED" | tee -a ../wake.log
+              exit 1
+            }
+          fi
+
           /tmp/venv-wake/bin/wake detect all \
-            --output ../wake-report.json \
             2>&1 | tee ../wake.log
-          [ -s ../wake-report.json ] || { echo "FATAL: wake-report.json empty" >&2; exit 1; }
+
+          if ! grep -qiE 'detector|finding|issue|vulnerability|detection' ../wake.log 2>/dev/null; then
+            echo "WAKE_NO_FINDINGS_OR_EMPTY_OUTPUT" | tee -a ../wake.log
+          fi
 
       # ================================================================
-      # STEP 8 — HALMOS (Foundry only)
+      # STEP 8 — HALMOS (detect check_ / invariant_ before invoking)
       # ================================================================
       - name: Halmos
         working-directory: target
@@ -286,30 +403,51 @@ jobs:
             echo "HALMOS_SKIPPED — not a Foundry project" > ../halmos.log
             exit 0
           fi
+
+          CHECK_COUNT=$(grep -rE 'function\s+(check_|invariant_)' \
+            --include="*.sol" src test 2>/dev/null | wc -l)
+          if [ "$CHECK_COUNT" -eq 0 ]; then
+            echo "HALMOS_NO_TESTS — no check_ or invariant_ functions found" > ../halmos.log
+            exit 0
+          fi
+
           python3 -m venv /tmp/venv-halmos
-          /tmp/venv-halmos/bin/pip install -q halmos
+          /tmp/venv-halmos/bin/pip install -q 'halmos>=0.3.3'
           /tmp/venv-halmos/bin/halmos --function check_ --loop 5 \
             > ../halmos.log 2>&1 || true
+
           if grep -qi "Build failed\|Compiler run failed" ../halmos.log; then
             echo "HALMOS_BUILD_FAILED" >> ../halmos.log
           fi
 
       # ================================================================
-      # STEP 9 — MYTHRIL (reuse Foundry solc-* + --solc-json remappings)
+      # STEP 9 — MYTHRIL (solc-select + --solv + mythril.config.json)
       # ================================================================
       - name: Mythril
         working-directory: target
         continue-on-error: true
         run: |
           : > ../mythril.log
-          SOLC_BIN=$(find ~/.svm -type f -name "solc-*" 2>/dev/null | head -1)
-          echo "Foundry solc: ${SOLC_BIN:-NOT FOUND}" | tee -a ../mythril.log
-          if [ -z "$SOLC_BIN" ] || [ ! -x "$SOLC_BIN" ]; then
-            echo "MYTHRIL_NO_SOLC — forge build did not provide a solc binary" >> ../mythril.log
+
+          SRC_FILE=$(find src contracts -maxdepth 3 -name "*.sol" 2>/dev/null | head -1)
+          [ -z "$SRC_FILE" ] && SRC_FILE=$(find . -maxdepth 3 -name "*.sol" 2>/dev/null \
+            | grep -v node_modules | grep -v '/lib/' | grep -v '/dependencies/' | head -1)
+
+          if [ -z "$SRC_FILE" ]; then
+            echo "MYTHRIL_NO_SOURCE_FILE" | tee -a ../mythril.log
             exit 1
           fi
-          cp "$SOLC_BIN" /tmp/solc && chmod +x /tmp/solc
-          /tmp/solc --version | tee -a ../mythril.log
+
+          PRAGMA=$(grep -oP 'pragma solidity\s+\K[^;]+' "$SRC_FILE" 2>/dev/null | head -1)
+          echo "Pragma: $PRAGMA  (file: $SRC_FILE)" | tee -a ../mythril.log
+
+          SOLC_VERSION=$(echo "$PRAGMA" | grep -oP '\d+\.\d+\.\d+' | head -1)
+          [ -z "$SOLC_VERSION" ] && SOLC_VERSION="0.8.20"
+
+          pip install -q solc-select
+          solc-select install "$SOLC_VERSION" 2>&1 | tee -a ../mythril.log
+          solc-select use "$SOLC_VERSION"
+          echo "solc version: $(solc --version)" | tee -a ../mythril.log
 
           if [ -s remappings.txt ]; then
             python3 - << 'PY'
@@ -326,34 +464,31 @@ jobs:
               else:
                   prefix, target = line.split("=", 1)
                   remaps.append(f"{prefix}={target}")
-          json.dump({"remappings": remaps}, open("mythril.json", "w"), indent=2)
-          print(f"Wrote mythril.json with {len(remaps)} remappings")
+          json.dump({"remappings": remaps}, open("mythril.config.json", "w"), indent=2)
+          print(f"Wrote mythril.config.json with {len(remaps)} remappings")
           PY
-            SOLC_JSON="--solc-json mythril.json"
-          else
-            SOLC_JSON=""
           fi
 
           python3 -m venv /tmp/venv-mythril
           /tmp/venv-mythril/bin/pip install -q mythril
 
-          FILES=$(find src contracts . -maxdepth 3 -name "*.sol" 2>/dev/null \
-            | grep -v node_modules | grep -v "/lib/" | grep -v "/dependencies/" \
-            | grep -v "/test/" | grep -v "/script/" | grep -v "/out/" \
-            | head -2 || true)
-          [ -z "$FILES" ] && { echo "No source files for Mythril" >> ../mythril.log; exit 1; }
-
-          for f in $FILES; do
+          for f in $SRC_FILE; do
             echo "=== Mythril $f ===" >> ../mythril.log
-            PATH="/tmp:$PATH" SOLC=/tmp/solc timeout 300 \
-              /tmp/venv-mythril/bin/myth analyze "$f" $SOLC_JSON \
-                --execution-timeout 280 --max-depth 30 \
-                >> ../mythril.log 2>&1 || true
+            timeout 300 /tmp/venv-mythril/bin/myth analyze "$f" \
+              --solv "$SOLC_VERSION" \
+              --config mythril.config.json \
+              --execution-timeout 280 --max-depth 30 \
+              >> ../mythril.log 2>&1 || true
           done
+
+          if grep -qiE 'Compiler not found|solc.*not found|no compiler|solc experienced a fatal error' ../mythril.log; then
+            echo "MYTHRIL_SOLC_MISMATCH" >> ../mythril.log
+            exit 1
+          fi
           cat ../mythril.log
 
       # ================================================================
-      # STEP 10 — BRIDGEGUARD MCP (scripted stdio client)
+      # STEP 10 — BRIDGEGUARD MCP (correct handshake in JS client)
       # ================================================================
       - name: BridgeGuard MCP — scripted scan
         working-directory: target
@@ -372,7 +507,7 @@ jobs:
           fi
 
       # ================================================================
-      # STEP 11 — AUTO-TRIAGE
+      # STEP 11 — AUTO-TRIAGE (build gate + wake text + halmos NO_TESTS)
       # ================================================================
       - name: Auto-Triage
         run: |
@@ -388,6 +523,9 @@ jobs:
 
           project = pathlib.Path("project.txt").read_text().strip().split("=")[1] \
                     if pathlib.Path("project.txt").exists() else "unknown"
+
+          build = pathlib.Path("build-status.txt").read_text().strip() \
+                  if pathlib.Path("build-status.txt").exists() else "UNKNOWN"
 
           slither_high = slither_med = 0
           d = read_json("slither.json")
@@ -435,19 +573,24 @@ jobs:
                       else: bridge_high += 1
 
           wake_high = 0
-          d = read_json("wake-report.json")
-          wake_ok = d is not None
-          if d:
-              txt = pathlib.Path("wake-report.json").read_text(errors="ignore").lower()
-              wake_high = len(re.findall(r'"severity"\s*:\s*"high"', txt)) + \
-                          len(re.findall(r'"impact"\s*:\s*"high"', txt))
+          wake_ok = False
+          wp = pathlib.Path("wake.log")
+          if wp.exists() and wp.stat().st_size > 0:
+              txt = wp.read_text(errors="ignore")
+              if "WAKE_INIT_FAILED" not in txt and "WAKE_NO_FINDINGS_OR_EMPTY_OUTPUT" not in txt:
+                  wake_ok = True
+                  wake_high = len(re.findall(r'(?i)(high|critical|severity:\s*high)', txt))
 
           halmos_fail = halmos_ok = halmos_skipped = False
+          halmos_no_tests = False
           hp = pathlib.Path("halmos.log")
           if hp.exists():
               txt = hp.read_text(errors="ignore")
               if "HALMOS_SKIPPED" in txt:
                   halmos_skipped = halmos_ok = True
+              elif "HALMOS_NO_TESTS" in txt:
+                  halmos_no_tests = True
+                  halmos_ok = True
               elif "HALMOS_BUILD_FAILED" in txt or "build failed" in txt.lower():
                   halmos_ok = False
               else:
@@ -458,7 +601,8 @@ jobs:
           mp = pathlib.Path("mythril.log")
           if mp.exists():
               txt = mp.read_text(errors="ignore")
-              if "MYTHRIL_NO_SOLC" in txt or "Compiler not found" in txt:
+              if "MYTHRIL_NO_SOLC" in txt or "MYTHRIL_SOLC_MISMATCH" in txt \
+                 or "Compiler not found" in txt:
                   mythril_ok = False
               else:
                   mythril_ok = True
@@ -481,8 +625,10 @@ jobs:
                             (1 if halmos_fail else 0) + (1 if mythril_fail else 0))
           total_medium = slither_med + semgrep_med + solast_med + bridge_med
 
-          if not all_ran:
-              verdict = "UNKNOWN"
+          if "BUILD_FAILED" in build:
+              verdict = "BUILD-FAILED"
+          elif not all_ran:
+              verdict = "TOOL-FAILURE"
           elif total_critical > 0:
               verdict = "DEEP-DIVE"
           elif total_medium > 0:
@@ -492,13 +638,14 @@ jobs:
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write(f"## Audit: {os.environ.get('TARGET_REPO','?')} ({project})\n\n")
+              f.write(f"**Build gate:** `{build}`\n\n")
               f.write("| Tool | HIGH | MEDIUM | Status |\n|---|---|---|---|\n")
               f.write(f"| Slither | {slither_high} | {slither_med} | {'OK' if slither_ok else 'FAILED'} |\n")
               f.write(f"| Semgrep (security) | {semgrep_high} | {semgrep_med} | {'OK' if semgrep_ok else 'FAILED'} |\n")
               f.write(f"| SolAST (bridge AST) | {solast_high} | {solast_med} | {'OK' if solast_ok else 'FAILED'} |\n")
               f.write(f"| Bridge Semgrep (custom) | {bridge_high} | {bridge_med} | {'OK' if bridge_semgrep_ok else 'FAILED'} |\n")
               f.write(f"| Wake | {wake_high} | — | {'OK' if wake_ok else 'FAILED'} |\n")
-              f.write(f"| Halmos | {'YES' if halmos_fail else 'NO'} | — | {'SKIPPED' if halmos_skipped else 'OK' if halmos_ok else 'FAILED'} |\n")
+              f.write(f"| Halmos | {'YES' if halmos_fail else 'NO'} | — | {'SKIPPED' if halmos_skipped else 'NO-TESTS' if halmos_no_tests else 'OK' if halmos_ok else 'FAILED'} |\n")
               f.write(f"| Mythril | {'YES' if mythril_fail else 'NO'} | — | {'OK' if mythril_ok else 'FAILED'} |\n")
               f.write(f"| BridgeGuard MCP | {bridgeguard_high} | — | {'OK' if bridgeguard_ok else 'OPTIONAL (not run)'} |\n\n")
               f.write(f"**Verdict: `{verdict}`**\n")
@@ -528,13 +675,14 @@ jobs:
             bridge-semgrep.log
             bridgeguard-report.json
             bridgeguard.log
-            wake-report.json
+            wake.log
+            wake-init.log
             halmos.log
             mythril.log
             verdict.txt
+            build-status.txt
             forge-build.log
             slither.log
-            wake.log
             project.txt
             remappings.backup.txt
             bridge-rules.yml
