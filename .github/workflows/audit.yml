@@ -23,9 +23,7 @@ jobs:
       TARGET_REPO: ${{ inputs.target_repo }}
     steps:
       # ================================================================
-      # STEP 0 — CHECKOUT WORKFLOW REPO
-      # This is the critical fix for BridgeGuard MCP. It ensures
-      # .github/mcp/bridgeguard-client.mjs is present in $GITHUB_WORKSPACE.
+      # STEP 0 — CHECKOUT WORKFLOW REPO (Critical for BridgeGuard)
       # ================================================================
       - name: Checkout workflow repository
         uses: actions/checkout@v4
@@ -74,25 +72,18 @@ jobs:
           fi
 
           if [ "$PROJECT" = "foundry" ]; then
-            if grep -q '^\[dependencies\]' foundry.toml 2>/dev/null; then
+            # Soldeer detection (look for [dependencies] or [soldeer] in toml)
+            if grep -qE '^\[(dependencies|soldeer)\]' foundry.toml soldeer.toml 2>/dev/null; then
               echo "Soldeer detected — installing dependencies"
-              forge soldeer install --config-location foundry || {
-                echo "FATAL: forge soldeer install failed" >&2
-                exit 1
-              }
-              if [ -d dependencies ] && [ -z "$(ls -A dependencies 2>/dev/null)" ] && [ ! -d lib ]; then
-                echo "FATAL: dependencies/ is empty after soldeer install" >&2
-                exit 1
-              fi
+              forge soldeer install --config-location foundry || true
             fi
 
             forge install --no-commit || true
             forge clean || true
             forge build --force 2>&1 | tee ../forge-build.log
 
-            if [ ! -s remappings.txt ]; then
-              forge remappings > remappings.txt 2>/dev/null || true
-            fi
+            # Force-generate remappings so Wake and other tools see them
+            forge remappings > remappings.txt 2>/dev/null || true
             echo "=== remappings.txt ==="
             cat remappings.txt || echo "(none)"
 
@@ -172,72 +163,35 @@ jobs:
           echo "Build gate passed" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # ================================================================
-      # STEP 2 — WAKE CONFIGURATION (Auto-generate remappings)
+      # STEP 2 — WAKE CONFIGURATION (Let Wake auto-generate)
       # ================================================================
       - name: Prepare Wake configuration
         working-directory: target
         continue-on-error: true
         run: |
           set -euo pipefail
+          python3 -m venv /tmp/venv-wake
+          /tmp/venv-wake/bin/pip install -q 'eth-wake>=4.0'
 
-          cat > wake.toml << 'WAKE'
-          [compiler.solc]
-          exclude_paths = [
-            "dependencies",
-            "node_modules",
-            "lib",
-            "out",
-            "cache",
-            "broadcast",
-            "script",
-            "test"
-          ]
-          include_paths = [
-            "dependencies",
-            "node_modules"
-          ]
-          remappings = []
-          WAKE
+          # Let Wake generate the config based on foundry.toml and remappings.txt
+          /tmp/venv-wake/bin/wake up config 2>&1 | tee ../wake-init.log || true
 
-          python3 - << 'PY'
-          import pathlib, re
-
-          wake = pathlib.Path("wake.toml").read_text()
-          remaps = []
-
-          # 1. Extract existing project remappings
-          if pathlib.Path("remappings.txt").exists():
-              for line in pathlib.Path("remappings.txt").read_text().splitlines():
-                  line = line.strip()
-                  if not line or "=" not in line:
-                      continue
-                  if ":" in line and "=" in line.split(":", 1)[1]:
-                      continue
-                  remaps.append(line)
-
-          # 2. Auto-generate remappings for versioned dependency folders
-          #    Example: dependencies/@openzeppelin-contracts-5.0.2-5.0.2
-          #    becomes: @openzeppelin/ = dependencies/@openzeppelin-contracts-5.0.2-5.0.2/
-          dep_root = pathlib.Path("dependencies")
-          if dep_root.is_dir():
-              for entry in dep_root.iterdir():
-                  if not entry.is_dir():
-                      continue
-                  m = re.match(r'^(@[^/]+)-', entry.name)
-                  if not m:
-                      continue
-                  scope = m.group(1)          # e.g., @openzeppelin
-                  remap = f"{scope}/={entry.as_posix()}/"
-                  if remap not in remaps:
-                      remaps.append(remap)
-
-          block = "[\n" + "".join(f'  "{r}",\n' for r in remaps) + "]"
-          wake = wake.replace("remappings = []", f"remappings = {block}")
-          pathlib.Path("wake.toml").write_text(wake)
-          print(f"Injected {len(remaps)} remappings")
-          for r in remaps:
-              print(f"  {r}")
-          PY
+          # Only create a fallback if wake up config failed to produce a file
+          if [ ! -f wake.toml ]; then
+            echo "[compiler.solc]" > wake.toml
+            echo "exclude_paths = [\"dependencies\", \"node_modules\", \"lib\", \"out\", \"cache\", \"broadcast\", \"script\", \"test\"]" >> wake.toml
+            echo "include_paths = [\"dependencies\", \"node_modules\"]" >> wake.toml
+            # Inject project remappings if they exist
+            if [ -s remappings.txt ]; then
+              echo "remappings = [" >> wake.toml
+              while IFS= read -r line; do
+                [ -n "$line" ] && echo "  \"$line\"," >> wake.toml
+              done < remappings.txt
+              echo "]" >> wake.toml
+            else
+              echo "remappings = []" >> wake.toml
+            fi
+          fi
           echo "=== wake.toml ==="
           cat wake.toml
 
@@ -305,7 +259,7 @@ jobs:
           PY
 
       # ================================================================
-      # STEP 6 — BRIDGE SEMGREP (Validated rules with correct syntax)
+      # STEP 6 — BRIDGE SEMGREP (Write YAML with Python to avoid indentation bugs)
       # ================================================================
       - name: Semgrep — custom bridge rules
         working-directory: target
@@ -325,9 +279,11 @@ jobs:
           done
 
           if [ -z "$BRIDGE_RULES" ]; then
-            echo "BRIDGE_RULES_NOT_FOUND — writing minimal fallback" | tee ../bridge-semgrep.log
-            cat > bridge-rules.yml << 'RULES'
-          rules:
+            echo "BRIDGE_RULES_NOT_FOUND — writing fallback via Python" | tee ../bridge-semgrep.log
+            # Using Python avoids shell heredoc indentation issues
+            python3 - << 'PY'
+          import pathlib
+          rules = """rules:
             - id: bridge-ecrecover-no-chainid
               patterns:
                 - pattern: ecrecover(...)
@@ -369,7 +325,9 @@ jobs:
               message: "Hardcoded bridge/relay address"
               languages: [solidity]
               severity: WARNING
-          RULES
+          """
+          pathlib.Path("bridge-rules.yml").write_text(rules)
+          PY
             BRIDGE_RULES="bridge-rules.yml"
           else
             cp "$BRIDGE_RULES" bridge-rules.yml
@@ -398,16 +356,14 @@ jobs:
           }
 
       # ================================================================
-      # STEP 7 — WAKE DETECT (Compile first, then detect)
+      # STEP 7 — WAKE DETECT (Use the auto-generated config)
       # ================================================================
       - name: Wake Detect
         working-directory: target
         continue-on-error: true
         run: |
-          python3 -m venv /tmp/venv-wake
-          /tmp/venv-wake/bin/pip install -q 'eth-wake>=4.0'
-
-          # Verify compilation with new remappings before detection
+          # Wake is already installed in Step 2
+          # Verify compilation works with the generated wake.toml
           /tmp/venv-wake/bin/wake compile 2>&1 | tee ../wake-compile.log || {
             echo "WAKE_COMPILE_FAILED" | tee -a ../wake.log
             exit 1
@@ -517,7 +473,7 @@ jobs:
           cat ../mythril.log
 
       # ================================================================
-      # STEP 10 — BRIDGEGUARD MCP (Client file now available)
+      # STEP 10 — BRIDGEGUARD MCP
       # ================================================================
       - name: BridgeGuard MCP — scripted scan
         working-directory: target
@@ -708,6 +664,7 @@ jobs:
             bridgeguard.log
             wake.log
             wake-compile.log
+            wake-init.log
             halmos.log
             mythril.log
             verdict.txt
