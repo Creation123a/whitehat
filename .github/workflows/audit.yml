@@ -81,6 +81,7 @@ jobs:
             forge clean || true
             forge build --force 2>&1 | tee ../forge-build.log
 
+            # Force-generate remappings. This is the absolute source of truth.
             forge remappings > remappings.txt 2>/dev/null || true
             echo "=== remappings.txt ==="
             cat remappings.txt || echo "(none)"
@@ -190,12 +191,13 @@ jobs:
                           line = rest
                   remaps.append(line)
 
+          # Write a wake.toml that mirrors Foundry exactly.
+          # Include 'lib' in include_paths so Wake can find dependencies installed via forge.
           lines = [
               "[compiler.solc]",
               'exclude_paths = [',
               '  "dependencies",',
               '  "node_modules",',
-              '  "lib",',
               '  "out",',
               '  "cache",',
               '  "broadcast",',
@@ -204,7 +206,8 @@ jobs:
               ']',
               'include_paths = [',
               '  "dependencies",',
-              '  "node_modules"',
+              '  "node_modules",',
+              '  "lib"',
               ']',
               "remappings = [",
           ]
@@ -285,7 +288,7 @@ jobs:
           PY
 
       # ================================================================
-      # STEP 6 — BRIDGE SEMGREP (your working rules, written via Python)
+      # STEP 6 — BRIDGE SEMGREP (Sanitize YAML in Python)
       # ================================================================
       - name: Semgrep — custom bridge rules
         working-directory: target
@@ -356,7 +359,22 @@ jobs:
             echo "Using bridge rules from: $BRIDGE_RULES" | tee ../bridge-semgrep.log
           fi
 
-          # Validate before scanning — this is what surfaces "was not a mapping"
+          # Strip BOM, leading whitespace, and ensure 'rules:' starts at column 0
+          python3 - << 'PY'
+          import pathlib
+          p = pathlib.Path("bridge-rules.yml")
+          if p.exists():
+              content = p.read_text(encoding="utf-8-sig").strip()
+              # Ensure it starts with 'rules:' at column 0
+              if not content.startswith("rules:"):
+                  if "rules:" in content:
+                      content = content[content.index("rules:"):]
+                  else:
+                      content = "rules:\n" + content
+              p.write_text(content + "\n")
+          PY
+
+          # Validate rules before scanning
           /tmp/venv-semgrep/bin/semgrep --validate --config bridge-rules.yml \
             2>&1 | tee -a ../bridge-semgrep.log || {
             echo "BRIDGE_RULES_INVALID" | tee -a ../bridge-semgrep.log
