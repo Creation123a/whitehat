@@ -22,13 +22,13 @@ jobs:
     env:
       TARGET_REPO: ${{ inputs.target_repo }}
     steps:
-      # ----------------------------------------------------------------
-      # STEP 0 — CHECKOUT WORKFLOW REPO (so .github/mcp/ is available)
-      # ----------------------------------------------------------------
+      # ================================================================
+      # STEP 0 — CHECKOUT WORKFLOW REPO
+      # This is the critical fix for BridgeGuard MCP. It ensures
+      # .github/mcp/bridgeguard-client.mjs is present in $GITHUB_WORKSPACE.
+      # ================================================================
       - name: Checkout workflow repository
         uses: actions/checkout@v4
-        # No 'repository' input means it defaults to the repo running the workflow.
-        # No 'path' means it checks out into $GITHUB_WORKSPACE.
 
       - name: Clone target repo
         uses: actions/checkout@v4
@@ -172,7 +172,7 @@ jobs:
           echo "Build gate passed" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # ================================================================
-      # STEP 2 — WAKE CONFIGURATION (auto-generate remappings for versioned deps)
+      # STEP 2 — WAKE CONFIGURATION (Auto-generate remappings)
       # ================================================================
       - name: Prepare Wake configuration
         working-directory: target
@@ -205,7 +205,7 @@ jobs:
           wake = pathlib.Path("wake.toml").read_text()
           remaps = []
 
-          # 1. Existing remappings from the project
+          # 1. Extract existing project remappings
           if pathlib.Path("remappings.txt").exists():
               for line in pathlib.Path("remappings.txt").read_text().splitlines():
                   line = line.strip()
@@ -215,17 +215,18 @@ jobs:
                       continue
                   remaps.append(line)
 
-          # 2. Wake-specific remappings for versioned dependency folders
+          # 2. Auto-generate remappings for versioned dependency folders
+          #    Example: dependencies/@openzeppelin-contracts-5.0.2-5.0.2
+          #    becomes: @openzeppelin/ = dependencies/@openzeppelin-contracts-5.0.2-5.0.2/
           dep_root = pathlib.Path("dependencies")
           if dep_root.is_dir():
               for entry in dep_root.iterdir():
                   if not entry.is_dir():
                       continue
-                  # @openzeppelin-contracts-5.0.2 -> @openzeppelin/
                   m = re.match(r'^(@[^/]+)-', entry.name)
                   if not m:
                       continue
-                  scope = m.group(1)          # @openzeppelin
+                  scope = m.group(1)          # e.g., @openzeppelin
                   remap = f"{scope}/={entry.as_posix()}/"
                   if remap not in remaps:
                       remaps.append(remap)
@@ -304,7 +305,7 @@ jobs:
           PY
 
       # ================================================================
-      # STEP 6 — BRIDGE SEMGREP (validated custom rules, semicolons fixed)
+      # STEP 6 — BRIDGE SEMGREP (Validated rules with correct syntax)
       # ================================================================
       - name: Semgrep — custom bridge rules
         working-directory: target
@@ -375,7 +376,7 @@ jobs:
             echo "Using bridge rules from: $BRIDGE_RULES" | tee ../bridge-semgrep.log
           fi
 
-          # Validate rules before scanning — catches YAML/AST errors early
+          # Validate rules before scanning — catches YAML structure errors
           /tmp/venv-semgrep/bin/semgrep --validate --config bridge-rules.yml \
             2>&1 | tee -a ../bridge-semgrep.log || {
             echo "BRIDGE_RULES_INVALID" | tee -a ../bridge-semgrep.log
@@ -397,7 +398,7 @@ jobs:
           }
 
       # ================================================================
-      # STEP 7 — WAKE DETECT (compile first, then detect)
+      # STEP 7 — WAKE DETECT (Compile first, then detect)
       # ================================================================
       - name: Wake Detect
         working-directory: target
@@ -406,7 +407,7 @@ jobs:
           python3 -m venv /tmp/venv-wake
           /tmp/venv-wake/bin/pip install -q 'eth-wake>=4.0'
 
-          # Fail fast if remappings are still wrong
+          # Verify compilation with new remappings before detection
           /tmp/venv-wake/bin/wake compile 2>&1 | tee ../wake-compile.log || {
             echo "WAKE_COMPILE_FAILED" | tee -a ../wake.log
             exit 1
@@ -516,7 +517,7 @@ jobs:
           cat ../mythril.log
 
       # ================================================================
-      # STEP 10 — BRIDGEGUARD MCP (file now in workspace root)
+      # STEP 10 — BRIDGEGUARD MCP (Client file now available)
       # ================================================================
       - name: BridgeGuard MCP — scripted scan
         working-directory: target
