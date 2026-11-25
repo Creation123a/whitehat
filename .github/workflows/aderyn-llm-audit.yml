@@ -245,79 +245,20 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-
-          BRIDGE_RULES=""
-          for candidate in \
-            "$GITHUB_WORKSPACE/.github/semgrep/bridge-rules.yml" \
-            "$GITHUB_WORKSPACE/.semgrep/bridge-rules.yml" \
-            "$GITHUB_WORKSPACE/bridge-rules.yml"; do
-            if [ -f "$candidate" ]; then
-              BRIDGE_RULES="$candidate"
-              break
-            fi
-          done
-
-          if [ -z "$BRIDGE_RULES" ]; then
-            echo "BRIDGE_RULES_NOT_FOUND — writing fallback" | tee ../bridge-semgrep.log
-            cat > bridge-rules.yml << 'RULES'
-          rules:
-            - id: bridge-missing-chain-id
-              patterns:
-                - pattern: |
-                    function $FUNC(...) ... {
-                      ...
-                      ecrecover(...)
-                      ...
-                    }
-              message: "Potential missing chainId in signature verification."
-              languages: [solidity]
-              severity: ERROR
-            - id: bridge-replay-no-nonce
-              patterns:
-                - pattern: |
-                    function $FUNC(...) ... {
-                      ...
-                      $CALL(...)
-                      ...
-                    }
-                - pattern-not: |
-                    function $FUNC(...) ... {
-                      ...
-                      require($PROCESSED[$ID] == false);
-                      ...
-                    }
-              message: "Potential replay: no processed-message check."
-              languages: [solidity]
-              severity: ERROR
-            - id: bridge-hardcoded-bridge-address
-              patterns:
-                - pattern: |
-                    address constant $NAME = $ADDR;
-                - metavariable-regex:
-                    metavariable: $NAME
-                    regex: (?i)(bridge|relay|messenger|endpoint)
-              message: "Hardcoded bridge/relay address."
-              languages: [solidity]
-              severity: WARNING
-          RULES
-            BRIDGE_RULES="bridge-rules.yml"
-          else
-            cp "$BRIDGE_RULES" bridge-rules.yml
-            echo "Using bridge rules: $BRIDGE_RULES" | tee ../bridge-semgrep.log
+          if [ ! -f "$GITHUB_WORKSPACE/.github/semgrep/bridge-rules.yml" ]; then
+            echo "MISSING .github/semgrep/bridge-rules.yml" | tee ../bridge-semgrep.log
+            exit 1
           fi
-
-          SOL_DIRS=$(find . -maxdepth 2 -type d \( -name src -o -name contracts \) \
-            -not -path "*/node_modules/*" -not -path "*/lib/*" \
-            -not -path "*/dependencies/*" -not -path "*/out/*" | tr '\n' ' ')
-          [ -z "$SOL_DIRS" ] && SOL_DIRS="."
-          /tmp/venv-semgrep/bin/semgrep --config bridge-rules.yml \
-            --include="*.sol" --sarif --output ../bridge-semgrep.sarif \
-            $SOL_DIRS 2>&1 | tee ../bridge-semgrep.log || true
-          [ -s ../bridge-semgrep.sarif ] || {
+          cp "$GITHUB_WORKSPACE/.github/semgrep/bridge-rules.yml" bridge-rules.yml
+          DIRS=""
+          if [ -d src ]; then DIRS="$DIRS src"; fi
+          if [ -d contracts ]; then DIRS="$DIRS contracts"; fi
+          if [ -z "$DIRS" ]; then DIRS="."; fi
+          /tmp/venv-semgrep/bin/semgrep --config bridge-rules.yml --include="*.sol" --sarif --output ../bridge-semgrep.sarif $DIRS 2>&1 | tee -a ../bridge-semgrep.log || true
+          if [ ! -s ../bridge-semgrep.sarif ]; then
             echo "BRIDGE_SEMGREP_EMPTY" | tee -a ../bridge-semgrep.log
             exit 1
-          }
-
+          fi
       # ================================================================
       # STEP 7 — WAKE DETECT
       # ================================================================
