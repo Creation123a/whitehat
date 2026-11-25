@@ -22,6 +22,14 @@ jobs:
     env:
       TARGET_REPO: ${{ inputs.target_repo }}
     steps:
+      # ----------------------------------------------------------------
+      # STEP 0 — CHECKOUT WORKFLOW REPO (so .github/mcp/ is available)
+      # ----------------------------------------------------------------
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+        # No 'repository' input means it defaults to the repo running the workflow.
+        # No 'path' means it checks out into $GITHUB_WORKSPACE.
+
       - name: Clone target repo
         uses: actions/checkout@v4
         with:
@@ -141,7 +149,7 @@ jobs:
           head -30 ../sol-files.txt || true
 
       # ================================================================
-      # STEP 1b — BUILD STATUS GATE (new — makes UNKNOWN impossible)
+      # STEP 1b — BUILD STATUS GATE
       # ================================================================
       - name: Build status gate
         working-directory: target
@@ -153,19 +161,18 @@ jobs:
           elif [ -f hardhat.config.js ] || [ -f hardhat.config.ts ]; then
             [ -d artifacts ] && [ -n "$(find artifacts -name '*.json' -print -quit 2>/dev/null)" ] && BUILD_OK=true
           else
-            BUILD_OK=true   # plain / unknown project — let downstream tools decide
+            BUILD_OK=true
           fi
           if [ "$BUILD_OK" = false ]; then
             echo "BUILD_FAILED" > build-status.txt
             echo "## ⚠️ Build Failed" >> "$GITHUB_STEP_SUMMARY"
-            echo "The project did not produce build artifacts. All tool results are unreliable." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           echo "BUILD_OK" > build-status.txt
           echo "Build gate passed" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # ================================================================
-      # STEP 2 — WAKE CONFIGURATION (exclude_paths, not ignore_paths)
+      # STEP 2 — WAKE CONFIGURATION (auto-generate remappings for versioned deps)
       # ================================================================
       - name: Prepare Wake configuration
         working-directory: target
@@ -192,24 +199,44 @@ jobs:
           remappings = []
           WAKE
 
-          if [ -s remappings.txt ]; then
-            python3 - << 'PY'
-          import pathlib
+          python3 - << 'PY'
+          import pathlib, re
+
           wake = pathlib.Path("wake.toml").read_text()
           remaps = []
-          for line in pathlib.Path("remappings.txt").read_text().splitlines():
-              line = line.strip()
-              if not line or "=" not in line:
-                  continue
-              if ":" in line and "=" in line.split(":", 1)[1]:
-                  continue
-              remaps.append(line)
+
+          # 1. Existing remappings from the project
+          if pathlib.Path("remappings.txt").exists():
+              for line in pathlib.Path("remappings.txt").read_text().splitlines():
+                  line = line.strip()
+                  if not line or "=" not in line:
+                      continue
+                  if ":" in line and "=" in line.split(":", 1)[1]:
+                      continue
+                  remaps.append(line)
+
+          # 2. Wake-specific remappings for versioned dependency folders
+          dep_root = pathlib.Path("dependencies")
+          if dep_root.is_dir():
+              for entry in dep_root.iterdir():
+                  if not entry.is_dir():
+                      continue
+                  # @openzeppelin-contracts-5.0.2 -> @openzeppelin/
+                  m = re.match(r'^(@[^/]+)-', entry.name)
+                  if not m:
+                      continue
+                  scope = m.group(1)          # @openzeppelin
+                  remap = f"{scope}/={entry.as_posix()}/"
+                  if remap not in remaps:
+                      remaps.append(remap)
+
           block = "[\n" + "".join(f'  "{r}",\n' for r in remaps) + "]"
           wake = wake.replace("remappings = []", f"remappings = {block}")
           pathlib.Path("wake.toml").write_text(wake)
           print(f"Injected {len(remaps)} remappings")
+          for r in remaps:
+              print(f"  {r}")
           PY
-          fi
           echo "=== wake.toml ==="
           cat wake.toml
 
@@ -277,7 +304,7 @@ jobs:
           PY
 
       # ================================================================
-      # STEP 6 — BRIDGE SEMGREP (validated custom rules + fallback)
+      # STEP 6 — BRIDGE SEMGREP (validated custom rules, semicolons fixed)
       # ================================================================
       - name: Semgrep — custom bridge rules
         working-directory: target
@@ -306,18 +333,19 @@ jobs:
                 - pattern-not-inside: |
                     function $F(...) {
                       ...
-                      block.chainid
+                      block.chainid;
                       ...
                     }
               message: "ecrecover without chainid binding — replay risk"
               languages: [solidity]
               severity: ERROR
+
             - id: bridge-replay-no-processed-check
               patterns:
                 - pattern: |
                     function $F(...) ... {
                       ...
-                      $CALL(...)
+                      $CALL(...);
                       ...
                     }
                 - pattern-not-inside: |
@@ -329,6 +357,7 @@ jobs:
               message: "Replay risk: no processed-message check"
               languages: [solidity]
               severity: ERROR
+
             - id: bridge-hardcoded-bridge-address
               patterns:
                 - pattern: |
@@ -368,7 +397,7 @@ jobs:
           }
 
       # ================================================================
-      # STEP 7 — WAKE DETECT (init project, use modern eth-wake, text log)
+      # STEP 7 — WAKE DETECT (compile first, then detect)
       # ================================================================
       - name: Wake Detect
         working-directory: target
@@ -377,12 +406,11 @@ jobs:
           python3 -m venv /tmp/venv-wake
           /tmp/venv-wake/bin/pip install -q 'eth-wake>=4.0'
 
-          if [ ! -f wake.toml ]; then
-            /tmp/venv-wake/bin/wake init 2>&1 | tee ../wake-init.log || {
-              echo "WAKE_INIT_FAILED" | tee -a ../wake.log
-              exit 1
-            }
-          fi
+          # Fail fast if remappings are still wrong
+          /tmp/venv-wake/bin/wake compile 2>&1 | tee ../wake-compile.log || {
+            echo "WAKE_COMPILE_FAILED" | tee -a ../wake.log
+            exit 1
+          }
 
           /tmp/venv-wake/bin/wake detect all \
             2>&1 | tee ../wake.log
@@ -392,7 +420,7 @@ jobs:
           fi
 
       # ================================================================
-      # STEP 8 — HALMOS (detect check_ / invariant_ before invoking)
+      # STEP 8 — HALMOS
       # ================================================================
       - name: Halmos
         working-directory: target
@@ -421,7 +449,7 @@ jobs:
           fi
 
       # ================================================================
-      # STEP 9 — MYTHRIL (solc-select + --solv + mythril.config.json)
+      # STEP 9 — MYTHRIL
       # ================================================================
       - name: Mythril
         working-directory: target
@@ -488,18 +516,19 @@ jobs:
           cat ../mythril.log
 
       # ================================================================
-      # STEP 10 — BRIDGEGUARD MCP (correct handshake in JS client)
+      # STEP 10 — BRIDGEGUARD MCP (file now in workspace root)
       # ================================================================
       - name: BridgeGuard MCP — scripted scan
         working-directory: target
         continue-on-error: true
         run: |
           set -euo pipefail
-          if [ ! -f "$GITHUB_WORKSPACE/.github/mcp/bridgeguard-client.mjs" ]; then
-            echo "MISSING .github/mcp/bridgeguard-client.mjs" | tee ../bridgeguard.log
+          CLIENT="$GITHUB_WORKSPACE/.github/mcp/bridgeguard-client.mjs"
+          if [ ! -f "$CLIENT" ]; then
+            echo "MISSING $CLIENT" | tee ../bridgeguard.log
             exit 1
           fi
-          cp "$GITHUB_WORKSPACE/.github/mcp/bridgeguard-client.mjs" ../bridgeguard-client.mjs
+          cp "$CLIENT" ../bridgeguard-client.mjs
           node ../bridgeguard-client.mjs || { echo "BRIDGEGUARD_CLIENT_FAILED" | tee -a ../bridgeguard.log; exit 1; }
           if [ ! -s ../bridgeguard-report.json ]; then
             echo "BRIDGEGUARD_REPORT_EMPTY" | tee -a ../bridgeguard.log
@@ -507,7 +536,7 @@ jobs:
           fi
 
       # ================================================================
-      # STEP 11 — AUTO-TRIAGE (build gate + wake text + halmos NO_TESTS)
+      # STEP 11 — AUTO-TRIAGE
       # ================================================================
       - name: Auto-Triage
         run: |
@@ -577,7 +606,8 @@ jobs:
           wp = pathlib.Path("wake.log")
           if wp.exists() and wp.stat().st_size > 0:
               txt = wp.read_text(errors="ignore")
-              if "WAKE_INIT_FAILED" not in txt and "WAKE_NO_FINDINGS_OR_EMPTY_OUTPUT" not in txt:
+              if "WAKE_INIT_FAILED" not in txt and "WAKE_NO_FINDINGS_OR_EMPTY_OUTPUT" not in txt \
+                 and "WAKE_COMPILE_FAILED" not in txt:
                   wake_ok = True
                   wake_high = len(re.findall(r'(?i)(high|critical|severity:\s*high)', txt))
 
@@ -676,7 +706,7 @@ jobs:
             bridgeguard-report.json
             bridgeguard.log
             wake.log
-            wake-init.log
+            wake-compile.log
             halmos.log
             mythril.log
             verdict.txt
