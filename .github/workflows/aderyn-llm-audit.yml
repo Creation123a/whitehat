@@ -141,21 +141,17 @@ jobs:
           head -30 ../sol-files.txt || true
 
       # ================================================================
-      # STEP 2 — WAKE CONFIGURATION (exclude dependencies, real remappings)
+      # STEP 2 — WAKE CONFIGURATION (ignore_paths, not exclude_paths)
       # ================================================================
       - name: Prepare Wake configuration
         working-directory: target
         continue-on-error: true
         run: |
           set -euo pipefail
-          PROJECT=$(cut -d= -f2 ../project.txt)
 
-          # The correct schema is [compiler.solc] with exclude_paths and remappings.
-          # dependencies MUST be excluded — otherwise Wake compiles OpenZeppelin
-          # test/certora files and throws ParserError.
           cat > wake.toml << 'WAKE'
           [compiler.solc]
-          exclude_paths = [
+          ignore_paths = [
             "dependencies",
             "node_modules",
             "lib",
@@ -182,11 +178,12 @@ jobs:
               if not line or "=" not in line:
                   continue
               if ":" in line and "=" in line.split(":", 1)[1]:
-                  continue  # skip contextual remappings for Wake
+                  continue
               remaps.append(line)
           block = "[\n" + "".join(f'  "{r}",\n' for r in remaps) + "]"
           wake = wake.replace("remappings = []", f"remappings = {block}")
           pathlib.Path("wake.toml").write_text(wake)
+          print(f"Injected {len(remaps)} remappings")
           PY
           fi
           echo "=== wake.toml ==="
@@ -223,7 +220,7 @@ jobs:
           [ -s ../semgrep.sarif ] || { echo "FATAL: semgrep.sarif empty" >&2; exit 1; }
 
       # ================================================================
-      # STEP 5 — SOLAST (bridge-specific AST scan, no solc required)
+      # STEP 5 — SOLAST (bridge-specific AST scan)
       # ================================================================
       - name: SolAST — bridge AST scan
         working-directory: target
@@ -241,17 +238,27 @@ jobs:
           echo "SolAST SARIF written: $(wc -c < ../solast.sarif) bytes"
 
       # ================================================================
-      # STEP 6 — BRIDGE SEMGREP (your custom bridge-rules.yml)
+      # STEP 6 — BRIDGE SEMGREP (custom rules)
       # ================================================================
       - name: Semgrep — custom bridge rules
         working-directory: target
         continue-on-error: true
         run: |
           set -euo pipefail
-          # Prefer the repo's bridge-rules.yml; write a fallback if missing.
-          if [ -f "$GITHUB_WORKSPACE/bridge-rules.yml" ]; then
-            cp "$GITHUB_WORKSPACE/bridge-rules.yml" bridge-rules.yml
-          elif [ ! -f bridge-rules.yml ]; then
+
+          BRIDGE_RULES=""
+          for candidate in \
+            "$GITHUB_WORKSPACE/.github/semgrep/bridge-rules.yml" \
+            "$GITHUB_WORKSPACE/.semgrep/bridge-rules.yml" \
+            "$GITHUB_WORKSPACE/bridge-rules.yml"; do
+            if [ -f "$candidate" ]; then
+              BRIDGE_RULES="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$BRIDGE_RULES" ]; then
+            echo "BRIDGE_RULES_NOT_FOUND — writing fallback" | tee ../bridge-semgrep.log
             cat > bridge-rules.yml << 'RULES'
           rules:
             - id: bridge-missing-chain-id
@@ -266,6 +273,432 @@ jobs:
               languages: [solidity]
               severity: ERROR
             - id: bridge-replay-no-nonce
+              patterns:
+                - pattern: |
+                    function $FUNC(...) ... {
+                      ...
+                      $CALL(...)
+                      ...
+                    }
+                - pattern-not: |
+                    function $FUNC(...) ... {
+                      ...
+                      require($PROCESSED[$ID] == false);
+                      ...
+                    }
+              message: "Potential replay: no processed-message check."
+              languages: [solidity]
+              severity: ERROR
+            - id: bridge-hardcoded-bridge-address
+              patterns:
+                - pattern: |
+                    address constant $NAME = $ADDR;
+                - metavariable-regex:
+                    metavariable: $NAME
+                    regex: (?i)(bridge|relay|messenger|endpoint)
+              message: "Hardcoded bridge/relay address."
+              languages: [solidity]
+              severity: WARNING
+          RULES
+            BRIDGE_RULES="bridge-rules.yml"
+          else
+            cp "$BRIDGE_RULES" bridge-rules.yml
+            echo "Using bridge rules: $BRIDGE_RULES" | tee ../bridge-semgrep.log
+          fi
+
+          SOL_DIRS=$(find . -maxdepth 2 -type d \( -name src -o -name contracts \) \
+            -not -path "*/node_modules/*" -not -path "*/lib/*" \
+            -not -path "*/dependencies/*" -not -path "*/out/*" | tr '\n' ' ')
+          [ -z "$SOL_DIRS" ] && SOL_DIRS="."
+          /tmp/venv-semgrep/bin/semgrep --config bridge-rules.yml \
+            --include="*.sol" --sarif --output ../bridge-semgrep.sarif \
+            $SOL_DIRS 2>&1 | tee ../bridge-semgrep.log || true
+          [ -s ../bridge-semgrep.sarif ] || {
+            echo "BRIDGE_SEMGREP_EMPTY" | tee -a ../bridge-semgrep.log
+            exit 1
+          }
+
+      # ================================================================
+      # STEP 7 — WAKE DETECT
+      # ================================================================
+      - name: Wake Detect
+        working-directory: target
+        continue-on-error: true
+        run: |
+          python3 -m venv /tmp/venv-wake
+          /tmp/venv-wake/bin/pip install -q eth-wake
+          /tmp/venv-wake/bin/wake detect all \
+            --output ../wake-report.json \
+            2>&1 | tee ../wake.log
+          [ -s ../wake-report.json ] || { echo "FATAL: wake-report.json empty" >&2; exit 1; }
+
+      # ================================================================
+      # STEP 8 — HALMOS (Foundry only)
+      # ================================================================
+      - name: Halmos
+        working-directory: target
+        continue-on-error: true
+        run: |
+          PROJECT=$(cut -d= -f2 ../project.txt)
+          if [ "$PROJECT" != "foundry" ]; then
+            echo "HALMOS_SKIPPED — not a Foundry project" > ../halmos.log
+            exit 0
+          fi
+          python3 -m venv /tmp/venv-halmos
+          /tmp/venv-halmos/bin/pip install -q halmos
+          /tmp/venv-halmos/bin/halmos --function check_ --loop 5 \
+            > ../halmos.log 2>&1 || true
+          if grep -qi "Build failed\|Compiler run failed" ../halmos.log; then
+            echo "HALMOS_BUILD_FAILED" >> ../halmos.log
+          fi
+
+      # ================================================================
+      # STEP 9 — MYTHRIL
+      # ================================================================
+      - name: Mythril
+        working-directory: target
+        continue-on-error: true
+        run: |
+          : > ../mythril.log
+          SOLC_BIN=$(find ~/.svm -type f -name "solc-*" 2>/dev/null | head -1)
+          echo "Foundry solc: ${SOLC_BIN:-NOT FOUND}" | tee -a ../mythril.log
+          if [ -z "$SOLC_BIN" ] || [ ! -x "$SOLC_BIN" ]; then
+            echo "MYTHRIL_NO_SOLC — forge build did not provide solc" >> ../mythril.log
+            exit 1
+          fi
+          cp "$SOLC_BIN" /tmp/solc && chmod +x /tmp/solc
+          /tmp/solc --version | tee -a ../mythril.log
+
+          if [ -s remappings.txt ]; then
+            python3 - << 'PY'
+          import json, pathlib
+          remaps = []
+          for line in pathlib.Path("remappings.txt").read_text().splitlines():
+              line = line.strip()
+              if not line or "=" not in line:
+                  continue
+              if ":" in line and "=" in line.split(":", 1)[1]:
+                  dep, rest = line.split(":", 1)
+                  prefix, target = rest.split("=", 1)
+                  remaps.append(f"{dep}:{prefix}={target}")
+              else:
+                  prefix, target = line.split("=", 1)
+                  remaps.append(f"{prefix}={target}")
+          json.dump({"remappings": remaps}, open("mythril.json", "w"), indent=2)
+          print(f"Wrote mythril.json with {len(remaps)} remappings")
+          PY
+            SOLC_JSON="--solc-json mythril.json"
+          else
+            SOLC_JSON=""
+          fi
+
+          python3 -m venv /tmp/venv-mythril
+          /tmp/venv-mythril/bin/pip install -q mythril
+
+          FILES=$(find src contracts . -maxdepth 3 -name "*.sol" 2>/dev/null \
+            | grep -v node_modules | grep -v "/lib/" | grep -v "/dependencies/" \
+            | grep -v "/test/" | grep -v "/script/" | grep -v "/out/" \
+            | head -2 || true)
+          [ -z "$FILES" ] && { echo "No source files for Mythril" >> ../mythril.log; exit 1; }
+
+          for f in $FILES; do
+            echo "=== Mythril $f ===" >> ../mythril.log
+            PATH="/tmp:$PATH" SOLC=/tmp/solc timeout 300 \
+              /tmp/venv-mythril/bin/myth analyze "$f" $SOLC_JSON \
+                --execution-timeout 280 --max-depth 30 \
+                >> ../mythril.log 2>&1 || true
+          done
+          cat ../mythril.log
+
+      # ================================================================
+      # STEP 10 — BRIDGEGUARD MCP (scripted stdio client)
+      # ================================================================
+      - name: BridgeGuard MCP — scripted scan
+        working-directory: target
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          # BridgeGuard is an MCP server launched with npx; the client script
+          # sends an initialize, tools/list, then tools/call(bridge_scan_contract).
+          # The response JSON is saved for the LLM phase.
+          cat > ../bridgeguard-client.mjs << 'EOF'
+          import { spawn } from 'child_process';
+          import fs from 'fs';
+          import path from 'path';
+
+          const server = spawn('npx', ['-y', 'bridgeguard-mcp'], {
+            stdio: ['pipe', 'pipe', 'inherit']
+          });
+
+          let buffer = '';
+          let msgId = 1;
+          const pending = new Map();
+
+          server.stdout.on('data', (data) => {
+            buffer += data.toString();
+            let idx;
+            while ((idx = buffer.indexOf('\n')) !== -1) {
+              const line = buffer.slice(0, idx).trim();
+              buffer = buffer.slice(idx + 1);
+              if (!line) continue;
+              try {
+                const msg = JSON.parse(line);
+                if (msg.id && pending.has(msg.id)) {
+                  pending.get(msg.id)(msg);
+                  pending.delete(msg.id);
+                }
+              } catch {}
+            }
+          });
+
+          function send(method, params = {}) {
+            return new Promise((resolve) => {
+              const id = msgId++;
+              pending.set(id, resolve);
+              server.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+            });
+          }
+
+          (async () => {
+            await send('initialize', {
+              protocolVersion: '2024-11-05',
+              capabilities: {},
+              clientInfo: { name: 'audit-workflow', version: '1.0.0' }
+            });
+
+            // Locate a representative bridge contract to scan.
+            const candidates = [];
+            for (const dir of ['src/contracts/adapters', 'src', 'contracts']) {
+              const abs = path.resolve(dir);
+              if (!fs.existsSync(abs)) continue;
+              for (const f of fs.readdirSync(abs)) {
+                if (f.endsWith('.sol') && !f.endsWith('.t.sol')) {
+                  candidates.push(path.join(dir, f));
+                }
+              }
+              if (candidates.length) break;
+            }
+
+            const targetFile = process.argv[2] || candidates[0];
+            if (!targetFile || !fs.existsSync(targetFile)) {
+              console.error('No target file found');
+              server.kill();
+              process.exit(1);
+            }
+
+            const source = fs.readFileSync(targetFile, 'utf8');
+            console.error(`Scanning: ${targetFile}`);
+
+            // Try `source` first; fall back to `contractPath` if needed.
+            let result = await send('tools/call', {
+              name: 'bridge_scan_contract',
+              arguments: { source }
+            });
+
+            if (result.error || (result.result && result.result.isError)) {
+              result = await send('tools/call', {
+                name: 'bridge_scan_contract',
+                arguments: { contractPath: targetFile }
+              });
+            }
+
+            fs.writeFileSync('../bridgeguard-report.json',
+              JSON.stringify(result, null, 2), 'utf8');
+            console.error('BridgeGuard report saved');
+
+            server.kill();
+            process.exit(0);
+          })().catch((e) => {
+            console.error(e);
+            server.kill();
+            process.exit(1);
+          });
+          EOF
+
+          node ../bridgeguard-client.mjs || {
+            echo "BRIDGEGUARD_CLIENT_FAILED" | tee ../bridgeguard.log
+            exit 1
+          }
+          [ -s ../bridgeguard-report.json ] || {
+            echo "BRIDGEGUARD_REPORT_EMPTY" | tee -a ../bridgeguard.log
+            exit 1
+          }
+
+      # ================================================================
+      # STEP 11 — AUTO-TRIAGE
+      # ================================================================
+      - name: Auto-Triage
+        run: |
+          python3 - << 'PY'
+          import json, os, re, pathlib
+
+          def read_json(p):
+              p = pathlib.Path(p)
+              if p.exists() and p.stat().st_size > 0:
+                  try: return json.loads(p.read_text())
+                  except Exception: return None
+              return None
+
+          project = pathlib.Path("project.txt").read_text().strip().split("=")[1] \
+                    if pathlib.Path("project.txt").exists() else "unknown"
+
+          # Slither
+          slither_high = slither_med = 0
+          d = read_json("slither.json")
+          slither_ok = d is not None
+          if d:
+              for x in d.get("results", {}).get("detectors", []):
+                  imp = str(x.get("impact", "")).lower()
+                  if imp == "high": slither_high += 1
+                  elif imp == "medium": slither_med += 1
+
+          # Semgrep generic
+          semgrep_high = semgrep_med = semgrep_low = 0
+          d = read_json("semgrep.sarif")
+          semgrep_ok = d is not None
+          if d:
+              for run in d.get("runs", []):
+                  for r in run.get("results", []):
+                      rid = str(r.get("ruleId", ""))
+                      if "solidity.security." in rid: semgrep_high += 1
+                      elif "solidity.performance." in rid or "solidity.best-practice." in rid:
+                          semgrep_low += 1
+                      else: semgrep_med += 1
+
+          # SolAST
+          solast_high = solast_med = 0
+          d = read_json("solast.sarif")
+          solast_ok = d is not None
+          if d:
+              for run in d.get("runs", []):
+                  for r in run.get("results", []):
+                      lvl = str(r.get("level", "")).lower()
+                      rid = str(r.get("ruleId", "")).lower()
+                      if lvl in ("error", "high") or "bridge" in rid or "replay" in rid:
+                          solast_high += 1
+                      else: solast_med += 1
+
+          # Bridge Semgrep
+          bridge_high = bridge_med = 0
+          d = read_json("bridge-semgrep.sarif")
+          bridge_semgrep_ok = d is not None
+          if d:
+              for run in d.get("runs", []):
+                  for r in run.get("results", []):
+                      lvl = str(r.get("level", "")).lower()
+                      if lvl in ("error", "high"): bridge_high += 1
+                      elif lvl in ("warning", "medium"): bridge_med += 1
+                      else: bridge_high += 1
+
+          # Wake
+          wake_high = 0
+          d = read_json("wake-report.json")
+          wake_ok = d is not None
+          if d:
+              txt = pathlib.Path("wake-report.json").read_text(errors="ignore").lower()
+              wake_high = len(re.findall(r'"severity"\s*:\s*"high"', txt)) + \
+                          len(re.findall(r'"impact"\s*:\s*"high"', txt))
+
+          # Halmos
+          halmos_fail = halmos_ok = halmos_skipped = False
+          hp = pathlib.Path("halmos.log")
+          if hp.exists():
+              txt = hp.read_text(errors="ignore")
+              if "HALMOS_SKIPPED" in txt:
+                  halmos_skipped = halmos_ok = True
+              elif "HALMOS_BUILD_FAILED" in txt or "build failed" in txt.lower():
+                  halmos_ok = False
+              else:
+                  halmos_ok = True
+                  halmos_fail = "counterexample" in txt.lower()
+
+          # Mythril
+          mythril_fail = mythril_ok = False
+          mp = pathlib.Path("mythril.log")
+          if mp.exists():
+              txt = mp.read_text(errors="ignore")
+              if "MYTHRIL_NO_SOLC" in txt or "Compiler not found" in txt:
+                  mythril_ok = False
+              else:
+                  mythril_ok = True
+                  mythril_fail = "SWC-" in txt
+
+          # BridgeGuard (optional — not required for a valid verdict)
+          bridgeguard_ok = pathlib.Path("bridgeguard-report.json").exists()
+          bridgeguard_high = 0
+          if bridgeguard_ok:
+              try:
+                  txt = pathlib.Path("bridgeguard-report.json").read_text(errors="ignore").lower()
+                  bridgeguard_high = txt.count('"severity":"high"') + txt.count('"severity": "high"')
+              except Exception:
+                  bridgeguard_ok = False
+
+          all_ran = all([slither_ok, semgrep_ok, solast_ok,
+                         bridge_semgrep_ok, wake_ok, halmos_ok, mythril_ok])
+
+          total_critical = (slither_high + semgrep_high + solast_high +
+                            bridge_high + wake_high + bridgeguard_high +
+                            (1 if halmos_fail else 0) + (1 if mythril_fail else 0))
+          total_medium = slither_med + semgrep_med + solast_med + bridge_med
+
+          if not all_ran:
+              verdict = "UNKNOWN"
+          elif total_critical > 0:
+              verdict = "DEEP-DIVE"
+          elif total_medium > 0:
+              verdict = "REVIEW-MEDIUM"
+          else:
+              verdict = "SKIP"
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"## Audit: {os.environ.get('TARGET_REPO','?')} ({project})\n\n")
+              f.write("| Tool | HIGH | MEDIUM | Status |\n|---|---|---|---|\n")
+              f.write(f"| Slither | {slither_high} | {slither_med} | {'OK' if slither_ok else 'FAILED'} |\n")
+              f.write(f"| Semgrep (security) | {semgrep_high} | {semgrep_med} | {'OK' if semgrep_ok else 'FAILED'} |\n")
+              f.write(f"| SolAST (bridge AST) | {solast_high} | {solast_med} | {'OK' if solast_ok else 'FAILED'} |\n")
+              f.write(f"| Bridge Semgrep (custom) | {bridge_high} | {bridge_med} | {'OK' if bridge_semgrep_ok else 'FAILED'} |\n")
+              f.write(f"| Wake | {wake_high} | — | {'OK' if wake_ok else 'FAILED'} |\n")
+              f.write(f"| Halmos | {'YES' if halmos_fail else 'NO'} | — | {'SKIPPED' if halmos_skipped else 'OK' if halmos_ok else 'FAILED'} |\n")
+              f.write(f"| Mythril | {'YES' if mythril_fail else 'NO'} | — | {'OK' if mythril_ok else 'FAILED'} |\n")
+              f.write(f"| BridgeGuard MCP | {bridgeguard_high} | — | {'OK' if bridgeguard_ok else 'OPTIONAL (not run)'} |\n\n")
+              f.write(f"**Verdict: `{verdict}`**\n")
+              if semgrep_low:
+                  f.write(f"\n(Semgrep generic produced {semgrep_low} gas/style findings, excluded.)\n")
+
+          pathlib.Path("verdict.txt").write_text(verdict)
+          print(f"VERDICT={verdict}")
+          PY
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+
+      # ================================================================
+      # STEP 12 — ARTIFACTS
+      # ================================================================
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audit-${{ github.run_number }}
+          path: |
+            slither.json
+            semgrep.sarif
+            solast.sarif
+            solast.log
+            bridge-semgrep.sarif
+            bridge-semgrep.log
+            bridgeguard-report.json
+            bridgeguard.log
+            wake-report.json
+            halmos.log
+            mythril.log
+            verdict.txt
+            forge-build.log
+            slither.log
+            wake.log
+            project.txt
+            remappings.backup.txt
+            bridge-rules.yml           - id: bridge-replay-no-nonce
               patterns:
                 - pattern: |
                     function $FUNC(...) ... {
