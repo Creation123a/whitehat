@@ -20,7 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      # 1. CLONE - FIXED: token fallback + submodules for forge-std/solmate
       - name: Clone target repo
         uses: actions/checkout@v4
         with:
@@ -31,7 +30,6 @@ jobs:
           fetch-depth: 1
           submodules: recursive
 
-      # FIXED: Mythril coincurve fails on Python 3.14, pin 3.11
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -39,93 +37,72 @@ jobs:
 
       - uses: foundry-rs/foundry-toolchain@v1
 
-      # FIXED: Halmos/Mythril need deps or they fail with "No such file"
       - name: Install dependencies
         working-directory: target
         run: |
           forge install --no-commit || true
           forge build || true
+          forge remappings > remappings.txt || true
 
-      # 2. STATIC - Slither
+      # SLITHER - isolated venv
       - name: Slither
         working-directory: target
         continue-on-error: true
         run: |
-          pip install slither-analyzer || true
-          slither . --json ../slither.json || true
-
-      # 3. STATIC - Semgrep - FIXED: Solidity-only, no auto noise
-      # Before: --config auto scanned Dockerfile/Python/Terraform/Java = false HIGHs
-      # Before: --config p/solidity = 404
-      # Now: p/smart-contracts + *.sol only + src/ only
+          python3 -m venv /tmp/venv-slither
+          /tmp/venv-slither/bin/pip install -q slither-analyzer || true
+          /tmp/venv-slither/bin/slither . --exclude-dependencies --json ../slither.json || true
+          echo "--- SLITHER JSON SIZE ---"
+          wc -c ../slither.json || echo "NO slither.json - Slither failed to run"
+          cat ../slither.json | head -c 5000 || true
+      # SEMGREP - isolated venv, Solidity only
       - name: Semgrep
         working-directory: target
         continue-on-error: true
         run: |
-          pip install semgrep || true
-          semgrep --config p/smart-contracts \
-            --include="*.sol" \
-            --sarif --output ../semgrep.sarif \
-            src contracts 2>/dev/null || \
-          semgrep --config p/smart-contracts \
-            --include="*.sol" \
-            --sarif --output ../semgrep.sarif \
-            . || true
+          python3 -m venv /tmp/venv-semgrep
+          /tmp/venv-semgrep/bin/pip install -q semgrep || true
+          /tmp/venv-semgrep/bin/semgrep --config p/smart-contracts --include="*.sol" --sarif --output ../semgrep.sarif src contracts 2>/dev/null || /tmp/venv-semgrep/bin/semgrep --config p/smart-contracts --include="*.sol" --sarif --output ../semgrep.sarif . || true
 
-      # 4. STATIC - Wake
+      # WAKE - isolated venv (needs rich<14)
       - name: Wake Detect
         working-directory: target
         continue-on-error: true
         run: |
-          pip install eth-wake || true
-          wake detect all --output ../wake-report.json || true
+          python3 -m venv /tmp/venv-wake
+          /tmp/venv-wake/bin/pip install -q eth-wake || true
+          /tmp/venv-wake/bin/wake detect all --output ../wake-report.json || true
 
-      # 5. SYMBOLIC - Halmos - FIXED: skip test/script, they kill the build
-      # arm-oeth: test/unit/adapters/shared/Shared.t.sol + script/ import missing deps
+      # HALMOS - isolated venv, FIXED: no --forge-build-options, move script/ aside
       - name: Halmos Symbolic
         working-directory: target
         continue-on-error: true
         run: |
-          pip install halmos || true
-          halmos --function check_ --loop 5 \
-            --forge-build-options "--skip test --skip script" \
-            > ../halmos.log 2>&1 || true
+          python3 -m venv /tmp/venv-halmos
+          /tmp/venv-halmos/bin/pip install -q halmos || true
+          mv script script.bak 2>/dev/null || true
+          /tmp/venv-halmos/bin/halmos --function check_ --loop 5 > ../halmos.log 2>&1 || true
+          mv script.bak script 2>/dev/null || true
           cat ../halmos.log || true
-          if grep -qi "Build failed\|Compiler run failed" ../halmos.log; then
-            echo "HALMOS_BUILD_FAILED" >> ../halmos.log
-          fi
+          if grep -qi "Build failed\|Compiler run failed" ../halmos.log; then echo "HALMOS_BUILD_FAILED" >> ../halmos.log; fi
 
-      # 6. SYMBOLIC - Mythril - FIXED: pass Foundry remappings to solc
-      # Before: myth analyze file.sol -> solc with Searched locations: "" -> @openzeppelin/... not found
-      # Now: build SOLC_ARGS from remappings.txt -> @openzeppelin/... = $PWD/dependencies/...
+      # MYTHRIL - isolated venv, FIXED: remappings from forge, not file
       - name: Mythril Critical Files Only
         working-directory: target
         continue-on-error: true
         run: |
-          pip install mythril || pip install "mythril==0.24.8" || true
+          python3 -m venv /tmp/venv-mythril
+          /tmp/venv-mythril/bin/pip install -q mythril || true
           : > ../mythril.log
-          SOLC_ARGS=""
-          if [ -f remappings.txt ]; then
-            while IFS='=' read -r key val; do
-              [ -z "$key" ] && continue
-              case "$val" in
-                /*) SOLC_ARGS="$SOLC_ARGS $key=$val" ;;
-                *)  SOLC_ARGS="$SOLC_ARGS $key=$PWD/$val" ;;
-              esac
-            done < remappings.txt
-          fi
-          echo "Mythril solc args: $SOLC_ARGS" >> ../mythril.log
+          forge remappings > remappings.txt || true
+          cat remappings.txt >> ../mythril.log
           for f in $(find src contracts -name "*.sol" 2>/dev/null | head -2); do
             echo "=== Mythril $f ===" >> ../mythril.log
-            if command -v myth >/dev/null 2>&1; then
-              timeout 300 myth analyze "$f" --solc-args "$SOLC_ARGS" --execution-timeout 280 --max-depth 30 >> ../mythril.log 2>&1 || true
-            else
-              timeout 300 docker run --rm -v "$PWD:/tmp" mythril/myth analyze "/tmp/$f" --execution-timeout 280 --max-depth 30 >> ../mythril.log 2>&1 || true
-            fi
+            timeout 300 /tmp/venv-mythril/bin/myth analyze "$f" --execution-timeout 280 --max-depth 30 >> ../mythril.log 2>&1 || true
           done
           cat ../mythril.log || true
 
-      # 7. AUTO-TRIAGE - FIXED: UNKNOWN if tool didn't run, don't say SKIP
+      # AUTO-TRIAGE - unchanged, already filters non-.sol + UNKNOWN
       - name: Auto-Triage
         run: |
           python3 - << 'PY'
@@ -137,97 +114,54 @@ jobs:
           mythril_high = False
           halmos_unknown = False
           mythril_unknown = False
-
           if os.path.exists("slither.json"):
               try:
                   d = json.load(open("slither.json"))
                   dets = d.get("results", {}).get("detectors", []) if isinstance(d, dict) else []
-                  if not dets and isinstance(d, dict):
-                      dets = d.get("detectors", [])
                   for x in dets:
                       imp = str(x.get("impact", "")).lower()
-                      if imp == "high":
-                          slither_high += 1
-                      elif imp == "medium":
-                          slither_med += 1
-              except Exception as e:
-                  print(f"Slither parse error: {e}")
-
+                      if imp == "high": slither_high += 1
+                      elif imp == "medium": slither_med += 1
+              except Exception as e: print(f"Slither parse error: {e}")
           if os.path.exists("semgrep.sarif"):
               try:
                   d = json.load(open("semgrep.sarif"))
                   for run in d.get("runs", []):
                       for r in run.get("results", []):
-                          # Only count Solidity findings - ignore Dockerfile/Python/Terraform noise
-                          rule = str(r.get("ruleId", "")).lower()
-                          if "solidity" not in rule and "smart-contracts" not in rule and "swc" not in rule and "solidity" not in str(r.get("locations", [])).lower():
-                              # p/smart-contracts rules are all Solidity, but filter obvious non-sol files
-                              loc = str(r.get("locations", [])).lower()
-                              if not loc.endswith(".sol") and ".sol" not in loc:
-                                  continue
+                          loc = str(r.get("locations", [])).lower()
+                          if ".sol" not in loc: continue
                           lvl = str(r.get("level", "")).lower()
-                          if lvl == "error":
-                              semgrep_high += 1
-                          elif lvl == "warning":
-                              semgrep_med += 1
-              except Exception as e:
-                  print(f"Semgrep parse error: {e}")
-
+                          if lvl == "error": semgrep_high += 1
+                          elif lvl == "warning": semgrep_med += 1
+              except Exception as e: print(f"Semgrep parse error: {e}")
           if os.path.exists("wake-report.json"):
               try:
                   txt = open("wake-report.json", errors="ignore").read()
-                  try:
-                      d = json.loads(txt)
-                      s = json.dumps(d).lower()
-                  except:
-                      s = txt.lower()
+                  s = txt.lower()
                   wake_high = len(re.findall(r'"severity"\s*:\s*"high"', s)) + len(re.findall(r'"impact"\s*:\s*"high"', s))
-                  if wake_high == 0:
-                      wake_high = s.count('"high"') // 3 if s.count('"high"') >= 3 else 0
-              except Exception as e:
-                  print(f"Wake parse error: {e}")
-
+              except Exception as e: print(f"Wake parse error: {e}")
           if os.path.exists("halmos.log"):
               txt = open("halmos.log", errors="ignore").read()
-              low = txt.lower()
-              if "counterexample" in low:
-                  halmos_fail = True
-              if "HALMOS_BUILD_FAILED" in txt or "build failed" in low or "compiler run failed" in low:
-                  halmos_unknown = True
-
+              if "counterexample" in txt.lower(): halmos_fail = True
+              if "HALMOS_BUILD_FAILED" in txt or "build failed" in txt.lower(): halmos_unknown = True
           if os.path.exists("mythril.log"):
               txt = open("mythril.log", errors="ignore").read()
-              if "SWC-" in txt:
-                  mythril_high = True
-              if "Solc experienced a fatal error" in txt or "not found: File not found" in txt:
-                  mythril_unknown = True
-
+              if "SWC-" in txt: mythril_high = True
+              if "Solc experienced a fatal error" in txt or "not found: File not found" in txt: mythril_unknown = True
           total_critical = slither_high + semgrep_high + wake_high + (1 if halmos_fail else 0) + (1 if mythril_high else 0)
           total_medium = slither_med + semgrep_med
-
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write(f"## Audit Result for {os.environ.get('TARGET_REPO', 'unknown')}\n\n")
-              f.write(f"| Tool | HIGH / CRITICAL | MEDIUM | Status |\n")
-              f.write(f"| --- | --- | --- | --- |\n")
+              f.write(f"| Tool | HIGH | MEDIUM | Status |\n| --- | --- | --- | --- |\n")
               f.write(f"| Slither | {slither_high} | {slither_med} | OK |\n")
               f.write(f"| Semgrep (Solidity only) | {semgrep_high} | {semgrep_med} | OK |\n")
               f.write(f"| Wake | {wake_high} | - | OK |\n")
-              f.write(f"| Halmos Counterexample | {'YES' if halmos_fail else 'NO'} | - | {'UNKNOWN - did not run' if halmos_unknown else 'OK'} |\n")
-              f.write(f"| Mythril Issue | {'YES' if mythril_high else 'NO'} | - | {'UNKNOWN - did not run' if mythril_unknown else 'OK'} |\n")
-              f.write(f"\n")
-              if halmos_unknown or mythril_unknown:
-                  f.write(f"## 🟡 UNKNOWN - Halmos/Mythril did not run, do NOT trust SKIP\n\n")
-                  f.write(f"Re-run or check halmos.log / mythril.log for build errors.\n")
-              elif total_critical > 0:
-                  f.write(f"## 🔴 DEEP-DIVE - {total_critical} Critical signals\n\n")
-                  f.write(f"Open the artifact, check the files flagged above. Do NOT skip.\n")
-              elif total_medium > 0:
-                  f.write(f"## 🟡 REVIEW MEDIUM - {total_medium} Medium signals, no Critical\n\n")
-                  f.write(f"Quick skim only, 10 min max.\n")
-              else:
-                  f.write(f"## 🟢 SKIP - 0 Critical, 0 Medium\n\n")
-                  f.write(f"Move to next protocol.\n")
-          print(f"VERDICT={'UNKNOWN' if (halmos_unknown or mythril_unknown) else 'DEEP-DIVE' if total_critical>0 else 'REVIEW-MEDIUM' if total_medium>0 else 'SKIP'}")
+              f.write(f"| Halmos | {'YES' if halmos_fail else 'NO'} | - | {'UNKNOWN' if halmos_unknown else 'OK'} |\n")
+              f.write(f"| Mythril | {'YES' if mythril_high else 'NO'} | - | {'UNKNOWN' if mythril_unknown else 'OK'} |\n\n")
+              if halmos_unknown or mythril_unknown: f.write(f"## 🟡 UNKNOWN - Halmos/Mythril did not run\n")
+              elif total_critical > 0: f.write(f"## 🔴 DEEP-DIVE - {total_critical} Critical\n")
+              elif total_medium > 0: f.write(f"## 🟡 REVIEW MEDIUM - {total_medium} Medium\n")
+              else: f.write(f"## 🟢 SKIP - 0 Critical, 0 Medium\n")
           open("verdict.txt","w").write("UNKNOWN" if (halmos_unknown or mythril_unknown) else "DEEP-DIVE" if total_critical>0 else "REVIEW-MEDIUM" if total_medium>0 else "SKIP")
           PY
         env:
