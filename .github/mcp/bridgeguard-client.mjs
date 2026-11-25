@@ -23,7 +23,7 @@ server.stdout.on('data', (d) => {
         pending.get(m.id)(m);
         pending.delete(m.id);
       }
-    } catch {}
+    } catch (_) {}
   }
 });
 
@@ -35,13 +35,31 @@ function send(method, params = {}) {
   });
 }
 
+function notify(method, params = {}) {
+  server.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
+}
+
 (async () => {
-  await send('initialize', {
+  // ── 1. Handshake ────────────────────────────────────────────────
+  const init = await send('initialize', {
     protocolVersion: '2024-11-05',
     capabilities: {},
     clientInfo: { name: 'audit-workflow', version: '1.0.0' },
   });
 
+  if (!init || !init.result) {
+    console.error('BRIDGEGUARD_INIT_FAILED — no result from initialize');
+    server.kill();
+    process.exit(1);
+  }
+
+  // MCP requires this one-way notification AFTER the initialize response
+  notify('notifications/initialized', {});
+
+  // Give the server a moment to register the initialized state
+  await new Promise((r) => setTimeout(r, 500));
+
+  // ── 2. Find a Solidity target ───────────────────────────────────
   const candidates = [];
   for (const dir of ['src/contracts/adapters', 'src', 'contracts']) {
     const abs = path.resolve(dir);
@@ -64,6 +82,7 @@ function send(method, params = {}) {
   const source = fs.readFileSync(targetFile, 'utf8');
   console.error(`Scanning: ${targetFile}`);
 
+  // ── 3. Call the tool (source first, fallback to contractPath) ───
   let result = await send('tools/call', {
     name: 'bridge_scan_contract',
     arguments: { source },
@@ -76,12 +95,15 @@ function send(method, params = {}) {
     });
   }
 
-  fs.writeFileSync('../bridgeguard-report.json', JSON.stringify(result, null, 2));
-  console.error('BridgeGuard report saved');
+  // ── 4. Write report (absolute path to avoid cwd ambiguity) ──────
+  const outPath = path.resolve(process.cwd(), '..', 'bridgeguard-report.json');
+  fs.writeFileSync(outPath, JSON.stringify(result, null, 2));
+  console.error(`BridgeGuard report saved: ${outPath}`);
+
   server.kill();
   process.exit(0);
 })().catch((e) => {
-  console.error(e);
+  console.error('BRIDGEGUARD_CLIENT_FATAL', e);
   server.kill();
   process.exit(1);
 });
