@@ -72,7 +72,6 @@ jobs:
           fi
 
           if [ "$PROJECT" = "foundry" ]; then
-            # Soldeer detection (look for [dependencies] or [soldeer] in toml)
             if grep -qE '^\[(dependencies|soldeer)\]' foundry.toml soldeer.toml 2>/dev/null; then
               echo "Soldeer detected — installing dependencies"
               forge soldeer install --config-location foundry || true
@@ -82,7 +81,6 @@ jobs:
             forge clean || true
             forge build --force 2>&1 | tee ../forge-build.log
 
-            # Force-generate remappings so Wake and other tools see them
             forge remappings > remappings.txt 2>/dev/null || true
             echo "=== remappings.txt ==="
             cat remappings.txt || echo "(none)"
@@ -163,35 +161,63 @@ jobs:
           echo "Build gate passed" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # ================================================================
-      # STEP 2 — WAKE CONFIGURATION (Let Wake auto-generate)
+      # STEP 2 — WAKE CONFIGURATION (forge remappings → wake.toml)
       # ================================================================
       - name: Prepare Wake configuration
         working-directory: target
         continue-on-error: true
         run: |
           set -euo pipefail
-          python3 -m venv /tmp/venv-wake
-          /tmp/venv-wake/bin/pip install -q 'eth-wake>=4.0'
 
-          # Let Wake generate the config based on foundry.toml and remappings.txt
-          /tmp/venv-wake/bin/wake up config 2>&1 | tee ../wake-init.log || true
+          # Ask forge for the exact remappings it uses
+          forge remappings > forge-remappings.txt 2>/dev/null || true
 
-          # Only create a fallback if wake up config failed to produce a file
-          if [ ! -f wake.toml ]; then
-            echo "[compiler.solc]" > wake.toml
-            echo "exclude_paths = [\"dependencies\", \"node_modules\", \"lib\", \"out\", \"cache\", \"broadcast\", \"script\", \"test\"]" >> wake.toml
-            echo "include_paths = [\"dependencies\", \"node_modules\"]" >> wake.toml
-            # Inject project remappings if they exist
-            if [ -s remappings.txt ]; then
-              echo "remappings = [" >> wake.toml
-              while IFS= read -r line; do
-                [ -n "$line" ] && echo "  \"$line\"," >> wake.toml
-              done < remappings.txt
-              echo "]" >> wake.toml
-            else
-              echo "remappings = []" >> wake.toml
-            fi
-          fi
+          python3 - << 'PY'
+          import pathlib
+
+          remaps = []
+          p = pathlib.Path("forge-remappings.txt")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if not line or "=" not in line:
+                      continue
+                  # Solc treats remappings as exact prefix replacements.
+                  # forge output is already in that form; drop context: prefixes.
+                  if ":" in line and "=" in line.split(":", 1)[1]:
+                      _, rest = line.split(":", 1)
+                      if "=" in rest:
+                          line = rest
+                  remaps.append(line)
+
+          lines = [
+              "[compiler.solc]",
+              'exclude_paths = [',
+              '  "dependencies",',
+              '  "node_modules",',
+              '  "lib",',
+              '  "out",',
+              '  "cache",',
+              '  "broadcast",',
+              '  "script",',
+              '  "test"',
+              ']',
+              'include_paths = [',
+              '  "dependencies",',
+              '  "node_modules"',
+              ']',
+              "remappings = [",
+          ]
+          for r in remaps:
+              lines.append(f'  "{r}",')
+          lines.append("]")
+
+          pathlib.Path("wake.toml").write_text("\n".join(lines) + "\n")
+          print(f"Wrote wake.toml with {len(remaps)} forge remappings")
+          for r in remaps:
+              print(f"  {r}")
+          PY
+
           echo "=== wake.toml ==="
           cat wake.toml
 
@@ -259,7 +285,7 @@ jobs:
           PY
 
       # ================================================================
-      # STEP 6 — BRIDGE SEMGREP (Write YAML with Python to avoid indentation bugs)
+      # STEP 6 — BRIDGE SEMGREP (your working rules, written via Python)
       # ================================================================
       - name: Semgrep — custom bridge rules
         working-directory: target
@@ -280,41 +306,37 @@ jobs:
 
           if [ -z "$BRIDGE_RULES" ]; then
             echo "BRIDGE_RULES_NOT_FOUND — writing fallback via Python" | tee ../bridge-semgrep.log
-            # Using Python avoids shell heredoc indentation issues
             python3 - << 'PY'
           import pathlib
           rules = """rules:
-            - id: bridge-ecrecover-no-chainid
-              patterns:
-                - pattern: ecrecover(...)
-                - pattern-not-inside: |
-                    function $F(...) {
-                      ...
-                      block.chainid;
-                      ...
-                    }
-              message: "ecrecover without chainid binding — replay risk"
-              languages: [solidity]
-              severity: ERROR
-
-            - id: bridge-replay-no-processed-check
+            - id: bridge-missing-chain-id
               patterns:
                 - pattern: |
-                    function $F(...) ... {
+                    function $FUNC(...) ... {
                       ...
-                      $CALL(...);
+                      ecrecover(...)
                       ...
                     }
-                - pattern-not-inside: |
-                    function $F(...) ... {
+              message: "Potential missing chainId in signature verification."
+              languages: [solidity]
+              severity: ERROR
+            - id: bridge-replay-no-nonce
+              patterns:
+                - pattern: |
+                    function $FUNC(...) ... {
+                      ...
+                      $CALL(...)
+                      ...
+                    }
+                - pattern-not: |
+                    function $FUNC(...) ... {
                       ...
                       require($PROCESSED[$ID] == false);
                       ...
                     }
-              message: "Replay risk: no processed-message check"
+              message: "Potential replay: no processed-message check."
               languages: [solidity]
               severity: ERROR
-
             - id: bridge-hardcoded-bridge-address
               patterns:
                 - pattern: |
@@ -322,7 +344,7 @@ jobs:
                 - metavariable-regex:
                     metavariable: $NAME
                     regex: (?i)(bridge|relay|messenger|endpoint)
-              message: "Hardcoded bridge/relay address"
+              message: "Hardcoded bridge/relay address."
               languages: [solidity]
               severity: WARNING
           """
@@ -334,7 +356,7 @@ jobs:
             echo "Using bridge rules from: $BRIDGE_RULES" | tee ../bridge-semgrep.log
           fi
 
-          # Validate rules before scanning — catches YAML structure errors
+          # Validate before scanning — this is what surfaces "was not a mapping"
           /tmp/venv-semgrep/bin/semgrep --validate --config bridge-rules.yml \
             2>&1 | tee -a ../bridge-semgrep.log || {
             echo "BRIDGE_RULES_INVALID" | tee -a ../bridge-semgrep.log
@@ -356,14 +378,15 @@ jobs:
           }
 
       # ================================================================
-      # STEP 7 — WAKE DETECT (Use the auto-generated config)
+      # STEP 7 — WAKE DETECT (compile first, then detect)
       # ================================================================
       - name: Wake Detect
         working-directory: target
         continue-on-error: true
         run: |
-          # Wake is already installed in Step 2
-          # Verify compilation works with the generated wake.toml
+          python3 -m venv /tmp/venv-wake
+          /tmp/venv-wake/bin/pip install -q 'eth-wake>=4.22'
+
           /tmp/venv-wake/bin/wake compile 2>&1 | tee ../wake-compile.log || {
             echo "WAKE_COMPILE_FAILED" | tee -a ../wake.log
             exit 1
@@ -664,7 +687,6 @@ jobs:
             bridgeguard.log
             wake.log
             wake-compile.log
-            wake-init.log
             halmos.log
             mythril.log
             verdict.txt
