@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       target_repo:
-        description: "Paste repo like: Morpho-Organization/morpho-blue"
+        description: "Paste repo like: Morpho-Organization/morpho-blue or OpenZeppelin/openzeppelin-contracts"
         required: true
         default: "Creation123a/whitehat"
       target_branch:
@@ -35,74 +35,153 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Setup Node (for Hardhat / npm projects)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - uses: foundry-rs/foundry-toolchain@v1
 
-      - name: Install dependencies
+      # ===== UNIVERSAL DETECT + INSTALL =====
+      - name: Detect project type + install deps
         working-directory: target
         run: |
-          forge install --no-commit || true
-          forge build || true
-          forge remappings > remappings.txt || true
+          echo "=== DETECT ==="
+          PROJECT="plain"
+          if [ -f foundry.toml ]; then PROJECT="foundry"; fi
+          if [ -f hardhat.config.js ] || [ -f hardhat.config.ts ]; then PROJECT="hardhat"; fi
+          if [ -f truffle-config.js ]; then PROJECT="truffle"; fi
+          if [ -f brownie-config.yaml ]; then PROJECT="brownie"; fi
+          echo "PROJECT=$PROJECT" | tee ../project.txt
+          echo "PROJECT=$PROJECT"
+          ls -la | head -30
+          echo "=== INSTALL ==="
+          if [ "$PROJECT" = "foundry" ]; then
+            if grep -q "\[dependencies\]" foundry.toml 2>/dev/null; then
+              echo "Foundry + Soldeer detected"
+              forge soldeer install || true
+            fi
+            forge install --no-commit || true
+            forge clean || true
+            forge build --force 2>&1 | tee ../forge-build.log || true
+            forge remappings > remappings.txt 2>/dev/null || true
+          elif [ "$PROJECT" = "hardhat" ] || [ "$PROJECT" = "truffle" ]; then
+            echo "Hardhat/Truffle detected - npm install"
+            npm ci 2>&1 | tail -20 || npm install 2>&1 | tail -20 || true
+            npx hardhat compile 2>&1 | tee ../forge-build.log || true
+            # Hardhat remappings = node_modules
+            echo "@openzeppelin/=node_modules/@openzeppelin/" > remappings.txt || true
+            ls node_modules/@openzeppelin 2>&1 | head -5 || true
+          elif [ -f package.json ]; then
+            echo "package.json detected - npm install for deps"
+            npm ci 2>&1 | tail -20 || npm install 2>&1 | tail -20 || true
+          fi
+          echo "=== remappings.txt ==="
+          cat remappings.txt 2>/dev/null || echo "(no remappings.txt)"
+          echo "=== sol files ==="
+          find . -name "*.sol" -not -path "*/node_modules/*" -not -path "*/dependencies/*" -not -path "*/lib/*" | head -20
+          echo "=== src dirs ==="
+          ls -d src contracts contracts/* 2>/dev/null || true
 
-      # SLITHER - isolated venv
+      # SLITHER - works on Foundry, Hardhat, Truffle, plain
       - name: Slither
         working-directory: target
         continue-on-error: true
         run: |
           python3 -m venv /tmp/venv-slither
           /tmp/venv-slither/bin/pip install -q slither-analyzer || true
-          /tmp/venv-slither/bin/slither . --exclude-dependencies --json ../slither.json || true
-          echo "--- SLITHER JSON SIZE ---"
-          wc -c ../slither.json || echo "NO slither.json - Slither failed to run"
-          cat ../slither.json | head -c 5000 || true
-      # SEMGREP - isolated venv, Solidity only
+          /tmp/venv-slither/bin/slither . --exclude-dependencies --json ../slither.json 2>&1 | tee ../slither.log || true
+          wc -c ../slither.json || echo "NO slither.json"
+
+      # SEMGREP - works on everything, Solidity only
       - name: Semgrep
         working-directory: target
         continue-on-error: true
         run: |
           python3 -m venv /tmp/venv-semgrep
           /tmp/venv-semgrep/bin/pip install -q semgrep || true
-          /tmp/venv-semgrep/bin/semgrep --config p/smart-contracts --include="*.sol" --sarif --output ../semgrep.sarif src contracts 2>/dev/null || /tmp/venv-semgrep/bin/semgrep --config p/smart-contracts --include="*.sol" --sarif --output ../semgrep.sarif . || true
+          # Find all .sol dirs, don't hardcode src/
+          SOL_DIRS=$(find . -maxdepth 2 -type d \( -name src -o -name contracts -o -name src-contracts \) -not -path "*/node_modules/*" -not -path "*/lib/*" -not -path "*/dependencies/*" | tr '\n' ' ')
+          echo "SOL_DIRS=$SOL_DIRS"
+          if [ -z "$SOL_DIRS" ]; then SOL_DIRS="."; fi
+          /tmp/venv-semgrep/bin/semgrep --config p/smart-contracts --include="*.sol" --sarif --output ../semgrep.sarif $SOL_DIRS || true
 
-      # WAKE - isolated venv (needs rich<14)
+      # WAKE - needs wake.toml remappings, built from whatever the project uses
       - name: Wake Detect
         working-directory: target
         continue-on-error: true
         run: |
           python3 -m venv /tmp/venv-wake
           /tmp/venv-wake/bin/pip install -q eth-wake || true
-          /tmp/venv-wake/bin/wake detect all --output ../wake-report.json || true
+          python3 - << 'PY'
+          import pathlib, os
+          rem = []
+          # 1. remappings.txt (Foundry / Soldeer)
+          p = pathlib.Path("remappings.txt")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line=line.strip()
+                  if not line or "=" not in line: continue
+                  if ":" in line and "=" in line:
+                      _, rest = line.split(":", 1)
+                      if "=" in rest: line=rest
+                  rem.append(line)
+          # 2. Hardhat / npm fallback - node_modules
+          if pathlib.Path("node_modules/@openzeppelin").exists():
+              rem.append("@openzeppelin/=node_modules/@openzeppelin/")
+          # 3. Dedupe, keep order
+          seen=set(); rem=[r for r in rem if not (r in seen or seen.add(r))]
+          toml='[compiler]\nremappings = [\n'
+          for r in rem: toml+=f'  "{r}",\n'
+          toml+=']\nallow_paths = ["dependencies", "lib", "node_modules", "."]\n'
+          pathlib.Path("wake.toml").write_text(toml)
+          print(toml)
+          PY
+          cat wake.toml
+          /tmp/venv-wake/bin/wake detect all --output ../wake-report.json 2>&1 | tee ../wake.log || true
+          wc -c ../wake-report.json || echo "NO wake-report.json"
 
-      # HALMOS - isolated venv, FIXED: no --forge-build-options, move script/ aside
+      # HALMOS - Foundry ONLY. On Hardhat/plain, skip cleanly, don't mark UNKNOWN
       - name: Halmos Symbolic
         working-directory: target
         continue-on-error: true
         run: |
+          if [ ! -f foundry.toml ]; then
+            echo "HALMOS_SKIPPED - not a Foundry project" | tee ../halmos.log
+            exit 0
+          fi
           python3 -m venv /tmp/venv-halmos
           /tmp/venv-halmos/bin/pip install -q halmos || true
-          mv script script.bak 2>/dev/null || true
           /tmp/venv-halmos/bin/halmos --function check_ --loop 5 > ../halmos.log 2>&1 || true
-          mv script.bak script 2>/dev/null || true
           cat ../halmos.log || true
           if grep -qi "Build failed\|Compiler run failed" ../halmos.log; then echo "HALMOS_BUILD_FAILED" >> ../halmos.log; fi
 
-      # MYTHRIL - isolated venv, FIXED: remappings from forge, not file
+      # MYTHRIL - works on everything, solc version from pragma, not hardcoded
       - name: Mythril Critical Files Only
         working-directory: target
         continue-on-error: true
         run: |
           python3 -m venv /tmp/venv-mythril
-          /tmp/venv-mythril/bin/pip install -q mythril || true
+          /tmp/venv-mythril/bin/pip install -q mythril py-solc-x || true
+          # Detect solc version from first .sol pragma, fallback to forge / 0.8.28
+          SOLC_VER=$(grep -rhoE "pragma solidity [^;]+" --include="*.sol" src contracts . 2>/dev/null | head -1 | grep -oE "0\.[0-9]+\.[0-9]+" | head -1 || echo "")
+          if [ -z "$SOLC_VER" ]; then SOLC_VER="0.8.28"; fi
+          echo "Detected solc: $SOLC_VER"
+          /tmp/venv-mythril/bin/python -c "from solcx import install_solc; install_solc('$SOLC_VER')" || true
+          SOLC_BIN=$(find ~/.solcx -name "solc-v$SOLC_VER" -type f 2>/dev/null | head -1)
+          if [ -n "$SOLC_BIN" ]; then cp "$SOLC_BIN" /tmp/solc && chmod +x /tmp/solc; fi
           : > ../mythril.log
-          forge remappings > remappings.txt || true
-          cat remappings.txt >> ../mythril.log
-          for f in $(find src contracts -name "*.sol" 2>/dev/null | head -2); do
+          echo "SOLC_VER=$SOLC_VER SOLC_BIN=$SOLC_BIN" >> ../mythril.log
+          cat remappings.txt 2>/dev/null >> ../mythril.log || true
+          SOLC_ARGS=$(paste -sd "," remappings.txt 2>/dev/null || echo "")
+          # Find .sol files anywhere, not just src/ - exclude deps/test/script
+          for f in $(find src contracts . -maxdepth 3 -name "*.sol" 2>/dev/null | grep -v node_modules | grep -v "/lib/" | grep -v "/dependencies/" | grep -v "/test/" | grep -v "/script/" | head -2); do
             echo "=== Mythril $f ===" >> ../mythril.log
-            timeout 300 /tmp/venv-mythril/bin/myth analyze "$f" --execution-timeout 280 --max-depth 30 >> ../mythril.log 2>&1 || true
+            PATH="/tmp:$PATH" SOLC=/tmp/solc timeout 300 /tmp/venv-mythril/bin/myth analyze "$f" --solc-args "$SOLC_ARGS" --execution-timeout 280 --max-depth 30 >> ../mythril.log 2>&1 || true
           done
           cat ../mythril.log || true
 
-      # AUTO-TRIAGE - unchanged, already filters non-.sol + UNKNOWN
+      # AUTO-TRIAGE - Halmos SKIPPED != UNKNOWN
       - name: Auto-Triage
         run: |
           python3 - << 'PY'
@@ -114,6 +193,10 @@ jobs:
           mythril_high = False
           halmos_unknown = False
           mythril_unknown = False
+          wake_unknown = False
+          slither_unknown = False
+          halmos_skipped = False
+          project = open("project.txt").read().strip() if os.path.exists("project.txt") else "unknown"
           if os.path.exists("slither.json"):
               try:
                   d = json.load(open("slither.json"))
@@ -122,7 +205,9 @@ jobs:
                       imp = str(x.get("impact", "")).lower()
                       if imp == "high": slither_high += 1
                       elif imp == "medium": slither_med += 1
-              except Exception as e: print(f"Slither parse error: {e}")
+              except Exception as e:
+                  print(f"Slither parse error: {e}"); slither_unknown = True
+          else: slither_unknown = True
           if os.path.exists("semgrep.sarif"):
               try:
                   d = json.load(open("semgrep.sarif"))
@@ -139,33 +224,43 @@ jobs:
                   txt = open("wake-report.json", errors="ignore").read()
                   s = txt.lower()
                   wake_high = len(re.findall(r'"severity"\s*:\s*"high"', s)) + len(re.findall(r'"impact"\s*:\s*"high"', s))
-              except Exception as e: print(f"Wake parse error: {e}")
+                  if "parsererror" in s or "not found" in s: wake_unknown = True
+              except Exception as e:
+                  print(f"Wake parse error: {e}"); wake_unknown = True
+          else: wake_unknown = True
           if os.path.exists("halmos.log"):
               txt = open("halmos.log", errors="ignore").read()
+              if "HALMOS_SKIPPED" in txt: halmos_skipped = True
               if "counterexample" in txt.lower(): halmos_fail = True
               if "HALMOS_BUILD_FAILED" in txt or "build failed" in txt.lower(): halmos_unknown = True
           if os.path.exists("mythril.log"):
               txt = open("mythril.log", errors="ignore").read()
               if "SWC-" in txt: mythril_high = True
-              if "Solc experienced a fatal error" in txt or "not found: File not found" in txt: mythril_unknown = True
+              if "Solc experienced a fatal error" in txt or "not found: File not found" in txt or "Compiler not found" in txt: mythril_unknown = True
           total_critical = slither_high + semgrep_high + wake_high + (1 if halmos_fail else 0) + (1 if mythril_high else 0)
           total_medium = slither_med + semgrep_med
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write(f"## Audit Result for {os.environ.get('TARGET_REPO', 'unknown')}\n\n")
+              f.write(f"## Audit Result for {os.environ.get('TARGET_REPO', 'unknown')} - Project: {project}\n\n")
               f.write(f"| Tool | HIGH | MEDIUM | Status |\n| --- | --- | --- | --- |\n")
-              f.write(f"| Slither | {slither_high} | {slither_med} | OK |\n")
+              f.write(f"| Slither | {slither_high} | {slither_med} | {'UNKNOWN' if slither_unknown else 'OK'} |\n")
               f.write(f"| Semgrep (Solidity only) | {semgrep_high} | {semgrep_med} | OK |\n")
-              f.write(f"| Wake | {wake_high} | - | OK |\n")
-              f.write(f"| Halmos | {'YES' if halmos_fail else 'NO'} | - | {'UNKNOWN' if halmos_unknown else 'OK'} |\n")
+              f.write(f"| Wake | {wake_high} | - | {'UNKNOWN' if wake_unknown else 'OK'} |\n")
+              f.write(f"| Halmos | {'YES' if halmos_fail else 'NO'} | - | {'SKIPPED - not Foundry' if halmos_skipped else 'UNKNOWN' if halmos_unknown else 'OK'} |\n")
               f.write(f"| Mythril | {'YES' if mythril_high else 'NO'} | - | {'UNKNOWN' if mythril_unknown else 'OK'} |\n\n")
-              if halmos_unknown or mythril_unknown: f.write(f"## 🟡 UNKNOWN - Halmos/Mythril did not run\n")
+              if slither_unknown or wake_unknown or halmos_unknown or mythril_unknown: f.write(f"## 🟡 UNKNOWN - a tool did not run, do NOT trust SKIP\n")
               elif total_critical > 0: f.write(f"## 🔴 DEEP-DIVE - {total_critical} Critical\n")
               elif total_medium > 0: f.write(f"## 🟡 REVIEW MEDIUM - {total_medium} Medium\n")
               else: f.write(f"## 🟢 SKIP - 0 Critical, 0 Medium\n")
-          open("verdict.txt","w").write("UNKNOWN" if (halmos_unknown or mythril_unknown) else "DEEP-DIVE" if total_critical>0 else "REVIEW-MEDIUM" if total_medium>0 else "SKIP")
+          open("verdict.txt","w").write("UNKNOWN" if (slither_unknown or wake_unknown or halmos_unknown or mythril_unknown) else "DEEP-DIVE" if total_critical>0 else "REVIEW-MEDIUM" if total_medium>0 else "SKIP")
           PY
         env:
           TARGET_REPO: ${{ inputs.target_repo }}
+
+      - name: Ensure all reports exist
+        if: always()
+        run: |
+          touch slither.json semgrep.sarif wake-report.json halmos.log mythril.log verdict.txt forge-build.log slither.log wake.log project.txt
+          ls -lh slither.json semgrep.sarif wake-report.json halmos.log mythril.log verdict.txt forge-build.log project.txt || true
 
       - name: Upload All Reports
         uses: actions/upload-artifact@v4
@@ -179,3 +274,7 @@ jobs:
             halmos.log
             mythril.log
             verdict.txt
+            forge-build.log
+            slither.log
+            wake.log
+            project.txt
