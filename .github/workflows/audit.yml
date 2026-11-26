@@ -66,7 +66,9 @@ jobs:
           fi
           echo "PROJECT=$PROJECT" | tee ../project.txt
 
-          # FIX: Handle missing lockfiles and peer dependency conflicts
+          # =========================================================
+          # 1. NODE DEPENDENCY INSTALLATION (Hardened for peer conflicts)
+          # =========================================================
           if [ -f package.json ]; then
             echo "package.json found — installing node dependencies"
             if [ -f pnpm-lock.yaml ]; then
@@ -74,38 +76,62 @@ jobs:
             elif [ -f yarn.lock ]; then
               yarn install || true
             else
-              # Try npm ci first, fallback to legacy-peer-deps, then force
-              npm ci || npm install --legacy-peer-deps || npm install --force || true
+              # FIX: Attempt strict install, fallback to --legacy-peer-deps
+              # This solves @chainlink vs @layerzerolabs peer conflicts.
+              npm ci --no-audit --no-fund || \
+              npm ci --no-audit --no-fund --legacy-peer-deps || \
+              npm install --no-audit --no-fund --legacy-peer-deps || true
             fi
           fi
 
+          # =========================================================
+          # 2. FOUNDRY DEPENDENCY INSTALLATION
+          # =========================================================
           if [ "$PROJECT" = "foundry" ]; then
+            # FIX: Soldeer is incompatible with forge install. 
+            # Must run soldeer install if [dependencies] exists.
             if grep -q '^\[dependencies\]' foundry.toml 2>/dev/null; then
               echo "Soldeer detected — installing dependencies"
-              forge soldeer install --config-location foundry || true
+              forge soldeer install --config-location foundry || {
+                echo "FATAL: forge soldeer install failed" >&2
+                exit 1
+              }
             fi
-            
+
+            # Standard git submodules (lib/)
             forge install --no-commit || true
 
+            # FIX: Foundry must search node_modules for hybrid npm/Foundry projects.
             if [ -d node_modules ]; then
               export FOUNDRY_LIBS="lib,node_modules"
               echo "FOUNDRY_LIBS set to: $FOUNDRY_LIBS"
             fi
 
             forge clean || true
-            # FIX: Add || true so the build gate can catch the failure cleanly
-            forge build --force 2>&1 | tee ../forge-build.log || true
+            
+            # FIX: Use --skip test --skip script to prevent 0x-settler-style 
+            # solc version conflicts from test files with mismatched pragmas.
+            # The || true ensures the build gate can catch the failure cleanly.
+            echo "Running: forge build --force --skip test --skip script"
+            forge build --force --skip test --skip script 2>&1 | tee ../forge-build.log || true
 
+            # Generate remappings if missing
             if [ ! -s remappings.txt ]; then
               forge remappings > remappings.txt 2>/dev/null || true
             fi
             echo "=== remappings.txt ==="
             cat remappings.txt || echo "(none)"
 
+          # =========================================================
+          # 3. HARDHAT / TRUFFLE
+          # =========================================================
           elif [ "$PROJECT" = "hardhat" ] || [ "$PROJECT" = "truffle" ]; then
             ./node_modules/.bin/hardhat compile 2>&1 | tee ../forge-build.log || true
           fi
 
+          # =========================================================
+          # 4. SOURCE FILE DISCOVERY
+          # =========================================================
           find . -name "*.sol" \
             -not -path "*/node_modules/*" \
             -not -path "*/dependencies/*" \
