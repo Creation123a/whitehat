@@ -79,7 +79,6 @@ jobs:
             elif [ -f yarn.lock ]; then
               yarn install || true
             else
-              # Fallback: Try npm ci, then legacy-peer-deps, then force
               npm ci --no-audit --no-fund || \
               npm install --no-audit --no-fund --legacy-peer-deps || \
               npm install --no-audit --no-fund --force || true
@@ -87,40 +86,34 @@ jobs:
           fi
 
           # =========================================================
-          # 2. FOUNDRY BUILD (Respects project-specific solc and exclusions)
+          # 2. FOUNDRY BUILD
           # =========================================================
           if [ "$PROJECT" = "foundry" ]; then
-            # Soldeer dependencies
             if grep -q '^\[dependencies\]' foundry.toml 2>/dev/null; then
               echo "Soldeer detected — installing dependencies"
               forge soldeer install --config-location foundry || true
             fi
 
-            # Git submodules
             forge install --no-commit || true
 
-            # Let Foundry search node_modules for hybrid projects
+            # FIX: FOUNDRY_LIBS must be a JSON array, not a comma-separated string.
             if [ -d node_modules ]; then
-              export FOUNDRY_LIBS="lib,node_modules"
+              export FOUNDRY_LIBS='["lib", "node_modules"]'
               echo "FOUNDRY_LIBS set to: $FOUNDRY_LIBS"
             fi
 
             forge clean || true
 
-            # FIX: Force the solc version if foundry.toml specifies one.
-            # This solves 0x-settler's 0.8.25 requirement.
+            # Force the solc version if foundry.toml specifies one.
             SOLC_VER=$(grep -E '^solc_version\s*=' foundry.toml | head -1 | cut -d'"' -f2 || echo "")
             if [ -n "$SOLC_VER" ]; then
               echo "Foundry.toml specifies solc $SOLC_VER — forcing this version"
               export FOUNDRY_SOLC_VERSION="$SOLC_VER"
             fi
 
-            # FIX: Run forge build and let it respect no_match_path.
-            # We add || true so the Build Gate step can catch the exit code cleanly.
             echo "Running: forge build --force"
             forge build --force 2>&1 | tee ../forge-build.log || true
 
-            # Generate remappings if missing
             if [ ! -s remappings.txt ]; then
               forge remappings > remappings.txt 2>/dev/null || true
             fi
