@@ -67,53 +67,58 @@ jobs:
           echo "PROJECT=$PROJECT" | tee ../project.txt
 
           # =========================================================
-          # 1. NODE DEPENDENCY INSTALLATION (Hardened for peer conflicts)
+          # 1. NODE DEPENDENCY INSTALLATION (Handles Bun and npm conflicts)
           # =========================================================
           if [ -f package.json ]; then
             echo "package.json found — installing node dependencies"
-            if [ -f pnpm-lock.yaml ]; then
+            if [ -f bun.lockb ]; then
+              echo "Bun detected — running bun install"
+              bun install || true
+            elif [ -f pnpm-lock.yaml ]; then
               corepack enable && pnpm install || true
             elif [ -f yarn.lock ]; then
               yarn install || true
             else
-              # FIX: Attempt strict install, fallback to --legacy-peer-deps
-              # This solves @chainlink vs @layerzerolabs peer conflicts.
+              # Fallback: Try npm ci, then legacy-peer-deps, then force
               npm ci --no-audit --no-fund || \
-              npm ci --no-audit --no-fund --legacy-peer-deps || \
-              npm install --no-audit --no-fund --legacy-peer-deps || true
+              npm install --no-audit --no-fund --legacy-peer-deps || \
+              npm install --no-audit --no-fund --force || true
             fi
           fi
 
           # =========================================================
-          # 2. FOUNDRY DEPENDENCY INSTALLATION
+          # 2. FOUNDRY BUILD (Respects project-specific solc and exclusions)
           # =========================================================
           if [ "$PROJECT" = "foundry" ]; then
-            # FIX: Soldeer is incompatible with forge install. 
-            # Must run soldeer install if [dependencies] exists.
+            # Soldeer dependencies
             if grep -q '^\[dependencies\]' foundry.toml 2>/dev/null; then
               echo "Soldeer detected — installing dependencies"
-              forge soldeer install --config-location foundry || {
-                echo "FATAL: forge soldeer install failed" >&2
-                exit 1
-              }
+              forge soldeer install --config-location foundry || true
             fi
 
-            # Standard git submodules (lib/)
+            # Git submodules
             forge install --no-commit || true
 
-            # FIX: Foundry must search node_modules for hybrid npm/Foundry projects.
+            # Let Foundry search node_modules for hybrid projects
             if [ -d node_modules ]; then
               export FOUNDRY_LIBS="lib,node_modules"
               echo "FOUNDRY_LIBS set to: $FOUNDRY_LIBS"
             fi
 
             forge clean || true
-            
-            # FIX: Use --skip test --skip script to prevent 0x-settler-style 
-            # solc version conflicts from test files with mismatched pragmas.
-            # The || true ensures the build gate can catch the failure cleanly.
-            echo "Running: forge build --force --skip test --skip script"
-            forge build --force --skip test --skip script 2>&1 | tee ../forge-build.log || true
+
+            # FIX: Force the solc version if foundry.toml specifies one.
+            # This solves 0x-settler's 0.8.25 requirement.
+            SOLC_VER=$(grep -E '^solc_version\s*=' foundry.toml | head -1 | cut -d'"' -f2 || echo "")
+            if [ -n "$SOLC_VER" ]; then
+              echo "Foundry.toml specifies solc $SOLC_VER — forcing this version"
+              export FOUNDRY_SOLC_VERSION="$SOLC_VER"
+            fi
+
+            # FIX: Run forge build and let it respect no_match_path.
+            # We add || true so the Build Gate step can catch the exit code cleanly.
+            echo "Running: forge build --force"
+            forge build --force 2>&1 | tee ../forge-build.log || true
 
             # Generate remappings if missing
             if [ ! -s remappings.txt ]; then
