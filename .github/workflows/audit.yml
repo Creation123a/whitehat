@@ -57,32 +57,47 @@ jobs:
           set -euo pipefail
 
           PROJECT="plain"
-          if [ -f foundry.toml ]; then
-            PROJECT="foundry"
-          elif [ -f hardhat.config.js ] || [ -f hardhat.config.ts ]; then
-            PROJECT="hardhat"
-          elif [ -f truffle-config.js ]; then
-            PROJECT="truffle"
-          fi
-          echo "PROJECT=$PROJECT" | tee ../project.txt
-
-          if [ -f remappings.txt ]; then
-            cp remappings.txt ../remappings.backup.txt
-            echo "Backed up existing remappings.txt"
-          fi
-
           if [ "$PROJECT" = "foundry" ]; then
-            if grep -qE '^\[(dependencies|soldeer)\]' foundry.toml soldeer.toml 2>/dev/null; then
+            # 1. Install npm dependencies if package.json exists
+            if [ -f package.json ]; then
+              echo "package.json found — installing node dependencies"
+              if [ -f pnpm-lock.yaml ]; then
+                corepack enable && pnpm install
+              elif [ -f yarn.lock ]; then
+                yarn install
+              else
+                npm ci || npm install
+              fi
+            fi
+
+            # 2. Soldeer / git submodule dependencies (existing logic)
+            if grep -q '^\[dependencies\]' foundry.toml 2>/dev/null; then
               echo "Soldeer detected — installing dependencies"
-              forge soldeer install --config-location foundry || true
+              forge soldeer install --config-location foundry || {
+                echo "FATAL: forge soldeer install failed" >&2
+                exit 1
+              }
+              if [ -d dependencies ] && [ -z "$(ls -A dependencies 2>/dev/null)" ] && [ ! -d lib ]; then
+                echo "FATAL: dependencies/ is empty after soldeer install" >&2
+                exit 1
+              fi
             fi
 
             forge install --no-commit || true
+
+            # 3. Tell Foundry to search node_modules as a library path
+            if [ -d node_modules ]; then
+              export FOUNDRY_LIBS="lib,node_modules"
+              echo "FOUNDRY_LIBS set to: $FOUNDRY_LIBS"
+            fi
+
             forge clean || true
             forge build --force 2>&1 | tee ../forge-build.log
 
-            # Force-generate remappings. This is the absolute source of truth.
-            forge remappings > remappings.txt 2>/dev/null || true
+            # 4. Regenerate remappings only if missing, then verify
+            if [ ! -s remappings.txt ]; then
+              forge remappings > remappings.txt 2>/dev/null || true
+            fi
             echo "=== remappings.txt ==="
             cat remappings.txt || echo "(none)"
 
