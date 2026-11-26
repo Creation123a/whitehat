@@ -67,12 +67,11 @@ jobs:
           echo "PROJECT=$PROJECT" | tee ../project.txt
 
           # =========================================================
-          # 1. NODE DEPENDENCY INSTALLATION (Handles Bun and npm conflicts)
+          # 1. NODE DEPENDENCY INSTALLATION
           # =========================================================
           if [ -f package.json ]; then
             echo "package.json found — installing node dependencies"
             if [ -f bun.lockb ]; then
-              echo "Bun detected — running bun install"
               bun install || true
             elif [ -f pnpm-lock.yaml ]; then
               corepack enable && pnpm install || true
@@ -83,6 +82,13 @@ jobs:
               npm install --no-audit --no-fund --legacy-peer-deps || \
               npm install --no-audit --no-fund --force || true
             fi
+
+            # FIX 1: Fetch git submodules inside node_modules (for LayerZero's toolbox)
+            echo "Fetching nested git submodules in node_modules..."
+            find node_modules -name ".git" -type d 2>/dev/null | while read -r gitdir; do
+              repo_dir=$(dirname "$gitdir")
+              (cd "$repo_dir" && git submodule update --init --recursive || true)
+            done
           fi
 
           # =========================================================
@@ -90,46 +96,34 @@ jobs:
           # =========================================================
           if [ "$PROJECT" = "foundry" ]; then
             if grep -q '^\[dependencies\]' foundry.toml 2>/dev/null; then
-              echo "Soldeer detected — installing dependencies"
               forge soldeer install --config-location foundry || true
             fi
-
             forge install --no-commit || true
 
-            # FIX: FOUNDRY_LIBS must be a JSON array, not a comma-separated string.
             if [ -d node_modules ]; then
               export FOUNDRY_LIBS='["lib", "node_modules"]'
-              echo "FOUNDRY_LIBS set to: $FOUNDRY_LIBS"
             fi
 
             forge clean || true
 
-            # Force the solc version if foundry.toml specifies one.
-            SOLC_VER=$(grep -E '^solc_version\s*=' foundry.toml | head -1 | cut -d'"' -f2 || echo "")
-            if [ -n "$SOLC_VER" ]; then
-              echo "Foundry.toml specifies solc $SOLC_VER — forcing this version"
-              export FOUNDRY_SOLC_VERSION="$SOLC_VER"
+            # Do not force a single solc version, let Foundry handle multiple versions.
+            unset FOUNDRY_SOLC_VERSION || true
+
+            # FIX 2: Only build the src/ directory to avoid compiling massive test suites
+            # This solves the 0x-settler timeout and version-mismatch issues.
+            if [ -d src ]; then
+              echo "Running: forge build --force src/"
+              forge build --force src/ 2>&1 | tee ../forge-build.log || true
+            else
+              echo "Running: forge build --force"
+              forge build --force 2>&1 | tee ../forge-build.log || true
             fi
 
-            echo "Running: forge build --force"
-            forge build --force 2>&1 | tee ../forge-build.log || true
-
-            if [ ! -s remappings.txt ]; then
-              forge remappings > remappings.txt 2>/dev/null || true
-            fi
-            echo "=== remappings.txt ==="
-            cat remappings.txt || echo "(none)"
-
-          # =========================================================
-          # 3. HARDHAT / TRUFFLE
-          # =========================================================
           elif [ "$PROJECT" = "hardhat" ] || [ "$PROJECT" = "truffle" ]; then
             ./node_modules/.bin/hardhat compile 2>&1 | tee ../forge-build.log || true
           fi
 
-          # =========================================================
           # 4. SOURCE FILE DISCOVERY
-          # =========================================================
           find . -name "*.sol" \
             -not -path "*/node_modules/*" \
             -not -path "*/dependencies/*" \
